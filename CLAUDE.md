@@ -54,14 +54,17 @@ cargo test -p datafusion-sqllogictest
 DataFusion uses sqllogictest files (`.slt`) extensively for integration testing. Test files are located in `datafusion/sqllogictest/test_files/`.
 
 ```bash
-# Run all sqllogictests
-cargo run -p datafusion-sqllogictest
+# Run all tests
+cargo test --test sqllogictests
 
-# Run specific test file
-cargo run -p datafusion-sqllogictest -- test_files/select.slt
+# Run all tests, with debug logging enabled
+RUST_LOG=debug cargo test --test sqllogictests
+
+# Run only the tests in `information_schema.slt`
+cargo test --test sqllogictests -- information_schema
 ```
 
-To add a new SLT test, first add add the setup and queries you want to run to a .slt file (my_awesome_test.slt in this example) using the following format:
+To add a new SLT test, first add add the setup and queries you want to run to a .slt file (`my_awesome_test.slt` in this example) using the following format:
 
 ```
 query
@@ -71,7 +74,7 @@ query
 SELECT * from foo;
 ```
 
-Running the following command will update my_awesome_test.slt with the expected output:
+Running the following command will update `my_awesome_test.slt` with the expected output:
 
 ```bash
 cargo test --test sqllogictests -- my_awesome_test --complete

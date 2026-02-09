@@ -18,13 +18,14 @@
 use std::any::Any;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, GenericStringBuilder, OffsetSizeTrait};
+use arrow::array::{ArrayRef, GenericStringBuilder, OffsetSizeTrait, StringArrayType};
 use arrow::datatypes::DataType;
 
 use crate::utils::{make_scalar_function, utf8_to_str_type};
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
 use datafusion_common::types::logical_string;
-use datafusion_common::{Result, exec_err};
+use datafusion_common::utils::take_function_args;
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::type_coercion::binary::{
     binary_to_string_coercion, string_coercion,
 };
@@ -108,56 +109,195 @@ impl ScalarUDFImpl for ReplaceFunc {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        let data_types = args
-            .args
-            .iter()
-            .map(|arg| arg.data_type())
-            .collect::<Vec<_>>();
+        let number_rows = args.number_rows;
+        let return_type = args.return_type().clone();
+        let [string_arg, from_arg, to_arg] =
+            take_function_args(self.name(), args.args)?;
 
-        if let Some(coercion_type) = string_coercion(&data_types[0], &data_types[1])
-            .and_then(|dt| string_coercion(&dt, &data_types[2]))
-            .or_else(|| {
-                binary_to_string_coercion(&data_types[0], &data_types[1])
-                    .and_then(|dt| binary_to_string_coercion(&dt, &data_types[2]))
-            })
-        {
-            let mut converted_args = Vec::with_capacity(args.args.len());
-            for arg in &args.args {
-                if arg.data_type() == coercion_type {
-                    converted_args.push(arg.clone());
-                } else {
-                    let converted = arg.cast_to(&coercion_type, None)?;
-                    converted_args.push(converted);
+        // Try to extract scalar from/to strings (the common case: literal arguments)
+        let from_scalar = extract_scalar_str(&from_arg);
+        let to_scalar = extract_scalar_str(&to_arg);
+
+        match (&string_arg, from_scalar, to_scalar) {
+            // All three are scalar
+            (ColumnarValue::Scalar(string_sv), Some(from_opt), Some(to_opt)) => {
+                match (string_sv.try_as_str(), from_opt, to_opt) {
+                    (Some(Some(s)), Some(from), Some(to)) => {
+                        let mut buf = String::new();
+                        replace_into_string(&mut buf, s, &from, &to);
+                        Ok(ColumnarValue::Scalar(make_scalar_value(
+                            buf,
+                            &return_type,
+                        )?))
+                    }
+                    // Any null scalar → null result
+                    _ => Ok(ColumnarValue::Scalar(ScalarValue::try_from(
+                        &return_type,
+                    )?)),
                 }
             }
 
-            match coercion_type {
-                DataType::Utf8 => {
-                    make_scalar_function(replace::<i32>, vec![])(&converted_args)
-                }
-                DataType::LargeUtf8 => {
-                    make_scalar_function(replace::<i64>, vec![])(&converted_args)
-                }
-                DataType::Utf8View => {
-                    make_scalar_function(replace_view, vec![])(&converted_args)
-                }
-                other => exec_err!(
-                    "Unsupported coercion data type {other:?} for function replace"
-                ),
+            // String is array, from/to are scalar non-null → fast path
+            (ColumnarValue::Array(string_arr), Some(Some(from)), Some(Some(to))) => {
+                replace_scalar_from_to(string_arr, &from, &to, &return_type)
             }
-        } else {
-            exec_err!(
-                "Unsupported data type {}, {:?}, {:?} for function replace.",
-                data_types[0],
-                data_types[1],
-                data_types[2]
-            )
+
+            // from or to is a null scalar → entire result is null
+            (_, Some(None), _) | (_, _, Some(None)) => {
+                let string_arr = string_arg.to_array(number_rows)?;
+                let null_scalar = ScalarValue::try_from(&return_type)?;
+                Ok(ColumnarValue::Array(null_scalar.to_array_of_size(
+                    string_arr.len(),
+                )?))
+            }
+
+            // Fallback: from and/or to are arrays; use existing array-based impl
+            _ => {
+                let converted_args =
+                    coerce_args(&[string_arg, from_arg, to_arg])?;
+                let coercion_type = converted_args[0].data_type();
+                match coercion_type {
+                    DataType::Utf8 => make_scalar_function(
+                        replace::<i32>,
+                        vec![],
+                    )(&converted_args),
+                    DataType::LargeUtf8 => make_scalar_function(
+                        replace::<i64>,
+                        vec![],
+                    )(&converted_args),
+                    DataType::Utf8View => {
+                        make_scalar_function(replace_view, vec![])(&converted_args)
+                    }
+                    other => exec_err!(
+                        "Unsupported coercion data type {other:?} for function replace"
+                    ),
+                }
+            }
         }
     }
 
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
     }
+}
+
+/// Extract a scalar string value from a ColumnarValue.
+/// Returns `Some(Some(string))` for non-null scalar strings,
+/// `Some(None)` for null scalar strings, and `None` for arrays.
+fn extract_scalar_str(cv: &ColumnarValue) -> Option<Option<String>> {
+    match cv {
+        ColumnarValue::Scalar(s) => match s.try_as_str() {
+            Some(Some(v)) => Some(Some(v.to_owned())),
+            Some(None) => Some(None),
+            None => None,
+        },
+        ColumnarValue::Array(_) => None,
+    }
+}
+
+/// Create a ScalarValue of the appropriate string type.
+fn make_scalar_value(s: String, data_type: &DataType) -> Result<ScalarValue> {
+    Ok(match data_type {
+        DataType::Utf8 => ScalarValue::Utf8(Some(s)),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(s)),
+        other => {
+            return exec_err!(
+                "Unsupported return type {other:?} for function replace"
+            )
+        }
+    })
+}
+
+/// Coerce arguments to a common string type for the fallback array path.
+fn coerce_args(args: &[ColumnarValue]) -> Result<Vec<ColumnarValue>> {
+    let data_types: Vec<_> = args.iter().map(|a| a.data_type()).collect();
+    let coercion_type = string_coercion(&data_types[0], &data_types[1])
+        .and_then(|dt| string_coercion(&dt, &data_types[2]))
+        .or_else(|| {
+            binary_to_string_coercion(&data_types[0], &data_types[1])
+                .and_then(|dt| binary_to_string_coercion(&dt, &data_types[2]))
+        });
+
+    match coercion_type {
+        Some(ct) => {
+            let mut converted = Vec::with_capacity(args.len());
+            for arg in args {
+                if arg.data_type() == ct {
+                    converted.push(arg.clone());
+                } else {
+                    converted.push(arg.cast_to(&ct, None)?);
+                }
+            }
+            Ok(converted)
+        }
+        None => exec_err!(
+            "Unsupported data type {}, {:?}, {:?} for function replace.",
+            data_types[0],
+            data_types[1],
+            data_types[2]
+        ),
+    }
+}
+
+/// Fast path for `replace(string_array, scalar_from, scalar_to)`.
+/// Iterates only the string array, avoiding expansion of scalar from/to into arrays.
+fn replace_scalar_from_to(
+    string_arr: &ArrayRef,
+    from: &str,
+    to: &str,
+    return_type: &DataType,
+) -> Result<ColumnarValue> {
+    match string_arr.data_type() {
+        DataType::Utf8 => {
+            let arr = as_generic_string_array::<i32>(string_arr)?;
+            Ok(ColumnarValue::Array(replace_scalar_from_to_iter::<_, i32>(
+                arr, from, to,
+            )))
+        }
+        DataType::LargeUtf8 => {
+            let arr = as_generic_string_array::<i64>(string_arr)?;
+            Ok(ColumnarValue::Array(replace_scalar_from_to_iter::<_, i64>(
+                arr, from, to,
+            )))
+        }
+        DataType::Utf8View => {
+            // Utf8View input → Utf8 output (i32 offsets)
+            let arr = as_string_view_array(string_arr)?;
+            Ok(ColumnarValue::Array(replace_scalar_from_to_iter::<_, i32>(
+                arr, from, to,
+            )))
+        }
+        other => {
+            exec_err!(
+                "Unsupported string array type {other:?} for function replace; expected {return_type:?}"
+            )
+        }
+    }
+}
+
+/// Core loop for scalar from/to replacement over any StringArrayType,
+/// parameterized on the output offset size (i32 for Utf8, i64 for LargeUtf8).
+#[expect(clippy::needless_pass_by_value)] // S is instantiated as a reference type
+fn replace_scalar_from_to_iter<'a, S: StringArrayType<'a>, O: OffsetSizeTrait>(
+    string_array: S,
+    from: &str,
+    to: &str,
+) -> ArrayRef {
+    let mut builder = GenericStringBuilder::<O>::new();
+    let mut buffer = String::new();
+
+    for val in string_array.iter() {
+        match val {
+            Some(s) => {
+                buffer.clear();
+                replace_into_string(&mut buffer, s, from, to);
+                builder.append_value(&buffer);
+            }
+            None => builder.append_null(),
+        }
+    }
+
+    Arc::new(builder.finish())
 }
 
 fn replace_view(args: &[ArrayRef]) -> Result<ArrayRef> {

@@ -21,8 +21,10 @@ use std::sync::Arc;
 use crate::utils::{make_scalar_function, utf8_to_str_type};
 use DataType::{LargeUtf8, Utf8, Utf8View};
 use arrow::array::{
-    Array, ArrayRef, AsArray, GenericStringBuilder, OffsetSizeTrait, StringArrayType,
+    Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
+    StringArrayType,
 };
+use arrow::buffer::Buffer;
 use arrow::datatypes::DataType;
 use datafusion_common::{Result, exec_err};
 use datafusion_expr::{
@@ -108,13 +110,47 @@ impl ScalarUDFImpl for ReverseFunc {
 /// The implementation uses UTF-8 code points as characters
 fn reverse<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
     if args[0].data_type() == &Utf8View {
-        reverse_impl::<T, _>(&args[0].as_string_view())
+        reverse_row_by_row::<T, _>(&args[0].as_string_view())
     } else {
-        reverse_impl::<T, _>(&args[0].as_string::<T>())
+        let string_array = args[0].as_string::<T>();
+        if string_array.value_data().is_ascii() {
+            reverse_ascii_array(string_array)
+        } else {
+            reverse_row_by_row::<T, _>(&string_array)
+        }
     }
 }
 
-fn reverse_impl<'a, T: OffsetSizeTrait, V: StringArrayType<'a>>(
+/// Fast path for all-ASCII `GenericStringArray`: copy the contiguous value
+/// buffer then reverse bytes in-place within each string's offset span. We can
+/// also avoid recomputing the input offsets and nulls buffers.
+fn reverse_ascii_array<T: OffsetSizeTrait>(
+    string_array: &GenericStringArray<T>,
+) -> Result<ArrayRef> {
+    let value_data = string_array.value_data();
+    let mut reversed = value_data.to_vec();
+
+    let offsets = string_array.offsets();
+    for i in 0..string_array.len() {
+        let start = offsets[i].as_usize();
+        let end = offsets[i + 1].as_usize();
+        reversed[start..end].reverse();
+    }
+
+    let values = Buffer::from_vec(reversed);
+    // SAFETY: We only reversed bytes within each string's offset span.
+    // Since all bytes are ASCII, reversing preserves valid UTF-8.
+    // Offsets and nulls are unchanged from the input array.
+    Ok(Arc::new(unsafe {
+        GenericStringArray::<T>::new_unchecked(
+            offsets.clone(),
+            values,
+            string_array.nulls().cloned(),
+        )
+    }))
+}
+
+fn reverse_row_by_row<'a, T: OffsetSizeTrait, V: StringArrayType<'a>>(
     string_array: &V,
 ) -> Result<ArrayRef> {
     let mut builder = GenericStringBuilder::<T>::with_capacity(string_array.len(), 1024);
@@ -124,7 +160,6 @@ fn reverse_impl<'a, T: OffsetSizeTrait, V: StringArrayType<'a>>(
     for string in string_array.iter() {
         if let Some(s) = string {
             if s.is_ascii() {
-                // reverse bytes directly since ASCII characters are single bytes
                 byte_buf.extend(s.as_bytes());
                 byte_buf.reverse();
                 // SAFETY: Since the original string was ASCII, reversing the bytes still results in valid UTF-8.

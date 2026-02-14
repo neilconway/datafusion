@@ -26,7 +26,7 @@ use arrow::datatypes::{ArrowNativeType, DataType, Int32Type, Int64Type};
 
 use crate::utils::utf8_to_int_type;
 use datafusion_common::{
-    Result, ScalarValue, exec_err, internal_err, utils::take_function_args,
+    HashMap, Result, ScalarValue, exec_err, internal_err, utils::take_function_args,
 };
 use datafusion_expr::TypeSignature::Exact;
 use datafusion_expr::{
@@ -328,16 +328,33 @@ where
     T::Native: OffsetSizeTrait,
     V: ArrayAccessor<Item = &'a str>,
 {
+    // Build a lookup from byte length -> candidates (1-indexed position, element).
+    // This lets us skip string comparisons entirely when no set element has the
+    // same byte length as the input. We hash a usize (trivially cheap) rather
+    // than the full input string (expensive for long strings).
+    let by_length: HashMap<usize, Vec<(usize, &str)>> = {
+        let mut map: HashMap<usize, Vec<(usize, &str)>> = HashMap::new();
+        for (idx, &elem) in str_list.iter().enumerate() {
+            map.entry(elem.len()).or_default().push((idx + 1, elem));
+        }
+        map
+    };
+
     let mut builder = PrimitiveArray::<T>::builder(string_array.len());
 
     let string_iter = ArrayIter::new(string_array);
 
     string_iter.for_each(|string_opt| match string_opt {
         Some(string) => {
-            let position = str_list
-                .iter()
-                .position(|s| *s == string)
-                .map_or(0, |idx| idx + 1);
+            let position = by_length
+                .get(&string.len())
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .find(|(_, s)| *s == string)
+                        .map(|(pos, _)| *pos)
+                })
+                .unwrap_or(0);
             builder.append_value(T::Native::from_usize(position).unwrap());
         }
         None => builder.append_null(),

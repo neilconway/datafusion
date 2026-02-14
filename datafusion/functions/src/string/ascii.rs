@@ -73,6 +73,21 @@ impl AsciiFunc {
     }
 }
 
+/// Returns the Unicode code point of the first character of `s`, or 0 for
+/// an empty string.
+#[inline]
+fn first_code_point(s: &str) -> i32 {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        0
+    } else if bytes[0] < 0x80 {
+        // ASCII: we can avoid doing UTF-8 decode and just take the first byte
+        bytes[0] as i32
+    } else {
+        s.chars().next().unwrap() as i32
+    }
+}
+
 impl ScalarUDFImpl for AsciiFunc {
     fn as_any(&self) -> &dyn Any {
         self
@@ -102,10 +117,9 @@ impl ScalarUDFImpl for AsciiFunc {
                 match scalar {
                     ScalarValue::Utf8(Some(s))
                     | ScalarValue::LargeUtf8(Some(s))
-                    | ScalarValue::Utf8View(Some(s)) => {
-                        let result = s.chars().next().map_or(0, |c| c as i32);
-                        Ok(ColumnarValue::Scalar(ScalarValue::Int32(Some(result))))
-                    }
+                    | ScalarValue::Utf8View(Some(s)) => Ok(ColumnarValue::Scalar(
+                        ScalarValue::Int32(Some(first_code_point(&s))),
+                    )),
                     _ => {
                         internal_err!(
                             "Unexpected data type {:?} for function ascii",
@@ -132,8 +146,7 @@ where
             if array.is_null(i) {
                 0
             } else {
-                let s = array.value(i);
-                s.chars().next().map_or(0, |c| c as i32)
+                first_code_point(array.value(i))
             }
         })
         .collect();

@@ -22,9 +22,9 @@ use crate::utils::{make_scalar_function, utf8_to_str_type};
 use DataType::{LargeUtf8, Utf8, Utf8View};
 use arrow::array::{
     Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
-    StringArrayType,
+    StringArrayType, StringViewArray,
 };
-use arrow::buffer::Buffer;
+use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::datatypes::DataType;
 use datafusion_common::{Result, exec_err};
 use datafusion_expr::{
@@ -110,7 +110,12 @@ impl ScalarUDFImpl for ReverseFunc {
 /// The implementation uses UTF-8 code points as characters
 fn reverse<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
     if args[0].data_type() == &Utf8View {
-        reverse_row_by_row::<T, _>(&args[0].as_string_view())
+        let string_view_array = args[0].as_string_view();
+        if string_view_array.is_ascii() {
+            reverse_ascii_string_view(string_view_array)
+        } else {
+            reverse_row_by_row::<T, _>(&string_view_array)
+        }
     } else {
         let string_array = args[0].as_string::<T>();
         if string_array.value_data().is_ascii() {
@@ -147,6 +152,44 @@ fn reverse_ascii_array<T: OffsetSizeTrait>(
             values,
             string_array.nulls().cloned(),
         )
+    }))
+}
+
+/// Fast path for all-ASCII `StringViewArray`: pre-allocate the exact output
+/// size and copy+reverse each string, bypassing `GenericStringBuilder`.
+fn reverse_ascii_string_view(string_view_array: &StringViewArray) -> Result<ArrayRef> {
+    let len = string_view_array.len();
+
+    // Compute total output byte size from the views.
+    let total_bytes: usize = (0..len)
+        .map(|i| string_view_array.value(i).len())
+        .sum();
+
+    let mut values = Vec::<u8>::with_capacity(total_bytes);
+    let mut offsets = Vec::<i32>::with_capacity(len + 1);
+    offsets.push(0);
+
+    for i in 0..len {
+        if string_view_array.is_null(i) {
+            offsets.push(*offsets.last().unwrap());
+        } else {
+            let s = string_view_array.value(i);
+            let start = values.len();
+            values.extend_from_slice(s.as_bytes());
+            values[start..].reverse();
+            offsets.push(values.len() as i32);
+        }
+    }
+
+    let values = Buffer::from_vec(values);
+    // SAFETY: offsets are monotonically increasing and within bounds of values.
+    let offsets =
+        unsafe { OffsetBuffer::new_unchecked(Buffer::from_vec(offsets).into()) };
+    let nulls = string_view_array.nulls().cloned();
+
+    // SAFETY: reversed ASCII bytes are valid UTF-8. Offsets and nulls are correct.
+    Ok(Arc::new(unsafe {
+        GenericStringArray::<i32>::new_unchecked(offsets, values, nulls)
     }))
 }
 

@@ -31,14 +31,14 @@ use std::any::Any;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, GenericListArray, ListArray, OffsetSizeTrait, UInt64Array,
+    Array, ArrayRef, GenericListArray, ListArray, OffsetSizeTrait, Scalar, UInt64Array,
     types::UInt64Type,
 };
 use datafusion_common::cast::{
     as_generic_list_array, as_int64_array, as_large_list_array, as_list_array,
 };
 use datafusion_common::{
-    Result, assert_or_internal_err, exec_err, utils::take_function_args,
+    Result, ScalarValue, assert_or_internal_err, exec_err, utils::take_function_args,
 };
 use itertools::Itertools;
 
@@ -129,6 +129,14 @@ impl ScalarUDFImpl for ArrayPosition {
         &self,
         args: datafusion_expr::ScalarFunctionArgs,
     ) -> Result<ColumnarValue> {
+        // When the search element is a scalar (constant for all rows),
+        // use a fast path with a single bulk comparison.
+        if let ColumnarValue::Scalar(ref scalar_element) = args.args[1] {
+            let element_type = scalar_element.data_type();
+            if !element_type.is_nested() && element_type != DataType::Null {
+                return array_position_dispatch_scalar(&args.args, scalar_element);
+            }
+        }
         make_scalar_function(array_position_inner)(&args.args)
     }
 
@@ -150,6 +158,124 @@ fn array_position_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
         LargeList(_) => general_position_dispatch::<i64>(args),
         array_type => exec_err!("array_position does not support type '{array_type}'."),
     }
+}
+
+/// Fast path for `array_position` when the search element is a constant
+/// scalar value. Performs a single bulk comparison against the flat values
+/// buffer of the ListArray, then walks offsets to find the first match
+/// position per row.
+fn array_position_dispatch_scalar(
+    args: &[ColumnarValue],
+    scalar_element: &ScalarValue,
+) -> Result<ColumnarValue> {
+    let len = args
+        .iter()
+        .find_map(|arg| match arg {
+            ColumnarValue::Array(a) => Some(a.len()),
+            _ => None,
+        });
+    let is_all_scalar = len.is_none();
+    let len = len.unwrap_or(1);
+
+    let list_arr = args[0].to_array(len)?;
+
+    let arr_from = if args.len() == 3 {
+        let from_arr = args[2].to_array(len)?;
+        as_int64_array(&from_arr)?
+            .values()
+            .iter()
+            .map(|&x| x - 1)
+            .collect::<Vec<_>>()
+    } else {
+        vec![0i64; len]
+    };
+
+    let result = match list_arr.data_type() {
+        List(_) => {
+            let list_array = as_generic_list_array::<i32>(&list_arr)?;
+            general_position_scalar(list_array, scalar_element, &arr_from)?
+        }
+        LargeList(_) => {
+            let list_array = as_generic_list_array::<i64>(&list_arr)?;
+            general_position_scalar(list_array, scalar_element, &arr_from)?
+        }
+        array_type => {
+            return exec_err!("array_position does not support type '{array_type}'.")
+        }
+    };
+
+    if is_all_scalar {
+        ScalarValue::try_from_array(&result, 0).map(ColumnarValue::Scalar)
+    } else {
+        Ok(ColumnarValue::Array(result))
+    }
+}
+
+fn general_position_scalar<O: OffsetSizeTrait>(
+    list_array: &GenericListArray<O>,
+    scalar_element: &ScalarValue,
+    arr_from: &[i64],
+) -> Result<ArrayRef> {
+    let values = list_array.values();
+    let element_array = scalar_element.to_array_of_size(1)?;
+    crate::utils::check_datatypes("array_position", &[values, &element_array])?;
+
+    // Single bulk comparison against the entire flat values buffer.
+    let element_scalar = Scalar::new(element_array);
+    let eq_array = arrow_ord::cmp::not_distinct(values, &element_scalar)?;
+
+    let offsets = list_array.offsets();
+    let nulls = list_array.nulls();
+    let mut data = Vec::with_capacity(list_array.len());
+
+    // Walk the set-bit positions to find the first match per row.
+    // set_indices() skips zero-words at machine-word speed, so rows
+    // with no match (and entirely-empty result buffers) cost almost
+    // nothing to scan.
+    let mut matches = eq_array.values().set_indices().peekable();
+
+    for (i, window) in offsets.windows(2).enumerate() {
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
+        let from = arr_from[i];
+
+        if nulls.is_some_and(|n| !n.is_valid(i)) {
+            // Advance past any match positions within this null row.
+            while matches.peek().is_some_and(|&p| p < end) {
+                matches.next();
+            }
+            data.push(None);
+            continue;
+        }
+
+        assert_or_internal_err!(
+            from >= 0 && (from as usize) <= (end - start),
+            "start_from index out of bounds"
+        );
+        let from = from as usize;
+        let search_start = start + from;
+
+        // Advance past positions before our search range.
+        while matches.peek().is_some_and(|&p| p < search_start) {
+            matches.next();
+        }
+
+        // Check if the next match falls within this row's range.
+        if matches.peek().is_some_and(|&p| p < end) {
+            let pos = *matches.peek().unwrap();
+            data.push(Some((pos - start + 1) as u64));
+        } else {
+            data.push(None);
+        }
+
+        // Advance past remaining positions in this row so the
+        // iterator is positioned for the next row.
+        while matches.peek().is_some_and(|&p| p < end) {
+            matches.next();
+        }
+    }
+
+    Ok(Arc::new(UInt64Array::from(data)))
 }
 
 fn general_position_dispatch<O: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {

@@ -222,11 +222,15 @@ impl OptimizerRule for ScalarSubqueryToJoin {
     }
 }
 
-/// Returns true if the expression has a scalar subquery somewhere in it
-/// false otherwise
+/// Returns true if the expression has a correlated scalar subquery
+/// (one with outer reference columns) somewhere in it, false otherwise.
+/// Uncorrelated scalar subqueries are handled by the physical planner
+/// via `ScalarSubqueryExec` and do not need to be converted to joins.
 fn contains_scalar_subquery(expr: &Expr) -> bool {
-    expr.exists(|expr| Ok(matches!(expr, Expr::ScalarSubquery(_))))
-        .expect("Inner is always Ok")
+    expr.exists(|expr| {
+        Ok(matches!(expr, Expr::ScalarSubquery(sq) if !sq.outer_ref_columns.is_empty()))
+    })
+    .expect("Inner is always Ok")
 }
 
 struct ExtractScalarSubQuery<'a> {
@@ -239,7 +243,10 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
 
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match expr {
-            Expr::ScalarSubquery(subquery) => {
+            Expr::ScalarSubquery(ref subquery)
+                if !subquery.outer_ref_columns.is_empty() =>
+            {
+                let subquery = subquery.clone();
                 let subqry_alias = self.alias_gen.next("__scalar_sq");
                 self.sub_query_info
                     .push((subquery.clone(), subqry_alias.clone()));
@@ -624,15 +631,13 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
-            Filter: customer.c_custkey = __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-              Left Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-                TableScan: customer [c_custkey:Int64, c_name:Utf8]
-                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N]
-                  Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                    Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                      Filter: orders.o_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+          Filter: customer.c_custkey = (<subquery>) [c_custkey:Int64, c_name:Utf8]
+            Subquery: [max(orders.o_custkey):Int64;N]
+              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
+                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
+                  Filter: orders.o_custkey = orders.o_custkey [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+                    TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+            TableScan: customer [c_custkey:Int64, c_name:Utf8]
         "
         )
     }
@@ -1029,14 +1034,12 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
-            Filter: customer.c_custkey < __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-              Left Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-                TableScan: customer [c_custkey:Int64, c_name:Utf8]
-                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N]
-                  Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                    Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                      TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+          Filter: customer.c_custkey < (<subquery>) [c_custkey:Int64, c_name:Utf8]
+            Subquery: [max(orders.o_custkey):Int64;N]
+              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
+                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
+                  TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+            TableScan: customer [c_custkey:Int64, c_name:Utf8]
         "
         )
     }
@@ -1059,14 +1062,12 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
-            Filter: customer.c_custkey = __scalar_sq_1.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-              Left Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, max(orders.o_custkey):Int64;N]
-                TableScan: customer [c_custkey:Int64, c_name:Utf8]
-                SubqueryAlias: __scalar_sq_1 [max(orders.o_custkey):Int64;N]
-                  Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                    Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                      TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+          Filter: customer.c_custkey = (<subquery>) [c_custkey:Int64, c_name:Utf8]
+            Subquery: [max(orders.o_custkey):Int64;N]
+              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
+                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
+                  TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+            TableScan: customer [c_custkey:Int64, c_name:Utf8]
         "
         )
     }
@@ -1158,19 +1159,16 @@ mod tests {
             plan,
             @r"
         Projection: customer.c_custkey [c_custkey:Int64]
-          Projection: customer.c_custkey, customer.c_name [c_custkey:Int64, c_name:Utf8]
-            Filter: customer.c_custkey BETWEEN __scalar_sq_1.min(orders.o_custkey) AND __scalar_sq_2.max(orders.o_custkey) [c_custkey:Int64, c_name:Utf8, min(orders.o_custkey):Int64;N, max(orders.o_custkey):Int64;N]
-              Left Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, min(orders.o_custkey):Int64;N, max(orders.o_custkey):Int64;N]
-                Left Join:  Filter: Boolean(true) [c_custkey:Int64, c_name:Utf8, min(orders.o_custkey):Int64;N]
-                  TableScan: customer [c_custkey:Int64, c_name:Utf8]
-                  SubqueryAlias: __scalar_sq_1 [min(orders.o_custkey):Int64;N]
-                    Projection: min(orders.o_custkey) [min(orders.o_custkey):Int64;N]
-                      Aggregate: groupBy=[[]], aggr=[[min(orders.o_custkey)]] [min(orders.o_custkey):Int64;N]
-                        TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
-                SubqueryAlias: __scalar_sq_2 [max(orders.o_custkey):Int64;N]
-                  Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
-                    Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
-                      TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+          Filter: customer.c_custkey BETWEEN (<subquery>) AND (<subquery>) [c_custkey:Int64, c_name:Utf8]
+            Subquery: [min(orders.o_custkey):Int64;N]
+              Projection: min(orders.o_custkey) [min(orders.o_custkey):Int64;N]
+                Aggregate: groupBy=[[]], aggr=[[min(orders.o_custkey)]] [min(orders.o_custkey):Int64;N]
+                  TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+            Subquery: [max(orders.o_custkey):Int64;N]
+              Projection: max(orders.o_custkey) [max(orders.o_custkey):Int64;N]
+                Aggregate: groupBy=[[]], aggr=[[max(orders.o_custkey)]] [max(orders.o_custkey):Int64;N]
+                  TableScan: orders [o_orderkey:Int64, o_custkey:Int64, o_orderstatus:Utf8, o_totalprice:Float64;N]
+            TableScan: customer [c_custkey:Int64, c_name:Utf8]
         "
         )
     }

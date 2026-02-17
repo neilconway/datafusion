@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::datasource::file_format::file_type_to_format;
 use crate::datasource::listing::ListingTableUrl;
@@ -102,6 +102,7 @@ use datafusion_physical_plan::joins::PiecewiseMergeJoinExec;
 use datafusion_physical_plan::metrics::MetricType;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
+use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, SubqueryPlan};
 use datafusion_physical_plan::unnest::ListUnnest;
 
 use async_trait::async_trait;
@@ -962,21 +963,43 @@ impl DefaultPhysicalPlanner {
                     Arc::clone(&physical_input_schema),
                 )?)
             }
-            LogicalPlan::Projection(Projection { input, expr, .. }) => self
-                .create_project_physical_exec(
-                    session_state,
-                    children.one()?,
-                    input,
-                    expr,
-                )?,
+            LogicalPlan::Projection(Projection { input, expr, .. }) => {
+                let subqueries = Self::collect_scalar_subqueries(expr);
+                if subqueries.is_empty() {
+                    self.create_project_physical_exec(
+                        session_state,
+                        children.one()?,
+                        input,
+                        expr,
+                    )?
+                } else {
+                    let (subquery_plans, map) = self
+                        .plan_scalar_subqueries(&subqueries, session_state)
+                        .await?;
+                    let mut props = session_state.execution_props().clone();
+                    props.scalar_subqueries = map;
+                    let proj_exec = self.create_project_physical_exec_with_props(
+                        &props,
+                        children.one()?,
+                        input,
+                        expr,
+                    )?;
+                    Arc::new(ScalarSubqueryExec::new(proj_exec, subquery_plans))
+                }
+            }
             LogicalPlan::Filter(Filter {
                 predicate, input, ..
             }) => {
                 let physical_input = children.one()?;
                 let input_dfschema = input.schema();
 
-                let runtime_expr =
-                    self.create_physical_expr(predicate, input_dfschema, session_state)?;
+                let (runtime_expr, subquery_plans) = self
+                    .create_physical_expr_with_subqueries(
+                        predicate,
+                        input_dfschema,
+                        session_state,
+                    )
+                    .await?;
 
                 let input_schema = input.schema();
                 let filter = match self.try_plan_async_exprs(
@@ -1024,7 +1047,14 @@ impl DefaultPhysicalPlanner {
                     .options()
                     .optimizer
                     .default_filter_selectivity;
-                Arc::new(filter.with_default_selectivity(selectivity)?)
+                let filter_exec: Arc<dyn ExecutionPlan> =
+                    Arc::new(filter.with_default_selectivity(selectivity)?);
+
+                if subquery_plans.is_empty() {
+                    filter_exec
+                } else {
+                    Arc::new(ScalarSubqueryExec::new(filter_exec, subquery_plans))
+                }
             }
             LogicalPlan::Repartition(Repartition {
                 input,
@@ -2600,9 +2630,105 @@ impl DefaultPhysicalPlanner {
         Ok(mem_exec)
     }
 
+    /// Collect all uncorrelated scalar subqueries from a slice of expressions.
+    fn collect_scalar_subqueries(
+        exprs: &[Expr],
+    ) -> Vec<&datafusion_expr::logical_plan::Subquery> {
+        let mut subqueries = Vec::new();
+        for expr in exprs {
+            expr.apply(|e| {
+                if let Expr::ScalarSubquery(sq) = e
+                    && sq.outer_ref_columns.is_empty()
+                {
+                    subqueries.push(sq);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("infallible");
+        }
+        subqueries
+    }
+
+    /// Plan physical executions for scalar subqueries, creating shared
+    /// `OnceLock` slots and returning the subquery plans.
+    async fn plan_scalar_subqueries(
+        &self,
+        subqueries: &[&datafusion_expr::logical_plan::Subquery],
+        session_state: &SessionState,
+    ) -> Result<(
+        Vec<SubqueryPlan>,
+        datafusion_common::HashMap<
+            datafusion_expr::logical_plan::Subquery,
+            Arc<OnceLock<ScalarValue>>,
+        >,
+    )> {
+        let mut plans = Vec::with_capacity(subqueries.len());
+        let mut map = datafusion_common::HashMap::with_capacity(subqueries.len());
+        for &sq in subqueries {
+            if map.contains_key(sq) {
+                continue; // same subquery referenced multiple times
+            }
+            let physical_plan = self
+                .create_initial_plan(&sq.subquery, session_state)
+                .await?;
+            let physical_plan =
+                self.optimize_physical_plan(physical_plan, session_state, |_, _| {})?;
+            let value = Arc::new(OnceLock::new());
+            plans.push(SubqueryPlan {
+                plan: physical_plan,
+                value: Arc::clone(&value),
+            });
+            map.insert(sq.clone(), value);
+        }
+        Ok((plans, map))
+    }
+
+    /// Create a `create_physical_expr` call that resolves scalar subqueries,
+    /// returning the physical expression and optional `ScalarSubqueryExec` wrapper
+    /// (if any subqueries were found).
+    async fn create_physical_expr_with_subqueries(
+        &self,
+        expr: &Expr,
+        input_dfschema: &DFSchema,
+        session_state: &SessionState,
+    ) -> Result<(Arc<dyn PhysicalExpr>, Vec<SubqueryPlan>)> {
+        let exprs = [expr.clone()];
+        let subqueries = Self::collect_scalar_subqueries(&exprs);
+        if subqueries.is_empty() {
+            let physical_expr =
+                self.create_physical_expr(expr, input_dfschema, session_state)?;
+            return Ok((physical_expr, vec![]));
+        }
+
+        let (plans, map) = self
+            .plan_scalar_subqueries(&subqueries, session_state)
+            .await?;
+
+        let mut props = session_state.execution_props().clone();
+        props.scalar_subqueries = map;
+
+        let physical_expr = create_physical_expr(expr, input_dfschema, &props)?;
+        Ok((physical_expr, plans))
+    }
+
     fn create_project_physical_exec(
         &self,
         session_state: &SessionState,
+        input_exec: Arc<dyn ExecutionPlan>,
+        input: &Arc<LogicalPlan>,
+        expr: &[Expr],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.create_project_physical_exec_with_props(
+            session_state.execution_props(),
+            input_exec,
+            input,
+            expr,
+        )
+    }
+
+    fn create_project_physical_exec_with_props(
+        &self,
+        execution_props: &ExecutionProps,
         input_exec: Arc<dyn ExecutionPlan>,
         input: &Arc<LogicalPlan>,
         expr: &[Expr],
@@ -2612,28 +2738,11 @@ impl DefaultPhysicalPlanner {
         let physical_exprs = expr
             .iter()
             .map(|e| {
-                // For projections, SQL planner and logical plan builder may convert user
-                // provided expressions into logical Column expressions if their results
-                // are already provided from the input plans. Because we work with
-                // qualified columns in logical plane, derived columns involve operators or
-                // functions will contain qualifiers as well. This will result in logical
-                // columns with names like `SUM(t1.c1)`, `t1.c1 + t1.c2`, etc.
-                //
-                // If we run these logical columns through physical_name function, we will
-                // get physical names with column qualifiers, which violates DataFusion's
-                // field name semantics. To account for this, we need to derive the
-                // physical name from physical input instead.
-                //
-                // This depends on the invariant that logical schema field index MUST match
-                // with physical schema field index.
                 let physical_name = if let Expr::Column(col) = e {
                     match input_logical_schema.index_of_column(col) {
                         Ok(idx) => {
-                            // index physical field using logical field index
                             Ok(input_exec.schema().field(idx).name().to_string())
                         }
-                        // logical column is not a derived column, safe to pass along to
-                        // physical_name
                         Err(_) => physical_name(e),
                     }
                 } else {
@@ -2641,7 +2750,7 @@ impl DefaultPhysicalPlanner {
                 };
 
                 let physical_expr =
-                    self.create_physical_expr(e, input_logical_schema, session_state);
+                    create_physical_expr(e, input_logical_schema, execution_props);
 
                 tuple_err((physical_expr, physical_name))
             })

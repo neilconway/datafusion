@@ -1668,3 +1668,86 @@ drop table employees;
 
 statement count 0
 drop table project_assignments;
+
+#############
+## Uncorrelated scalar subquery row-count semantics
+## A scalar subquery must return at most one row; returning more is an error.
+## Previously, these were silently converted to cross-joins.
+#############
+
+statement ok
+CREATE TABLE sq_values(v INT) AS VALUES (1), (2), (3);
+
+statement ok
+CREATE TABLE sq_main(x INT) AS VALUES (10), (20);
+
+statement ok
+CREATE TABLE sq_empty(v INT) AS VALUES (1) LIMIT 0;
+
+# Scalar subquery returning multiple rows in SELECT position → error
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT (SELECT v FROM sq_values);
+
+# Scalar subquery returning multiple rows in WHERE position → error
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x FROM sq_main WHERE x > (SELECT v FROM sq_values);
+
+# Scalar subquery returning multiple rows as a function argument → error
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT x + (SELECT v FROM sq_values) FROM sq_main;
+
+# Scalar subquery returning exactly one row → success
+query I
+SELECT (SELECT v FROM sq_values LIMIT 1);
+----
+1
+
+# Scalar subquery returning exactly one row in WHERE → success
+query I rowsort
+SELECT x FROM sq_main WHERE x > (SELECT v FROM sq_values LIMIT 1);
+----
+10
+20
+
+# Scalar subquery returning zero rows → NULL
+query I
+SELECT (SELECT v FROM sq_empty);
+----
+NULL
+
+# Scalar subquery returning zero rows in arithmetic → NULL propagation
+query I
+SELECT x + (SELECT v FROM sq_empty) FROM sq_main;
+----
+NULL
+NULL
+
+# Scalar subquery returning zero rows in WHERE comparison → no matching rows
+query I
+SELECT x FROM sq_main WHERE x > (SELECT v FROM sq_empty);
+----
+
+# Aggregated subquery always returns one row, even on empty input → success
+query I
+SELECT (SELECT count(*) FROM sq_empty);
+----
+0
+
+# Aggregated subquery on multi-row table → success (aggregation reduces to 1 row)
+query I
+SELECT (SELECT max(v) FROM sq_values);
+----
+3
+
+# Multiple scalar subqueries, one returns multiple rows → error
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT (SELECT count(*) FROM sq_empty), (SELECT v FROM sq_values);
+
+statement count 0
+DROP TABLE sq_values;
+
+statement count 0
+DROP TABLE sq_main;
+
+statement count 0
+DROP TABLE sq_empty;

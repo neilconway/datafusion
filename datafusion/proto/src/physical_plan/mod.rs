@@ -78,6 +78,7 @@ use datafusion_physical_plan::metrics::MetricType;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, SubqueryPlan};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
@@ -315,6 +316,14 @@ impl protobuf::PhysicalPlanNode {
                 ),
             PhysicalPlanType::Buffer(buffer) => {
                 self.try_into_buffer_physical_plan(buffer, ctx, codec, proto_converter)
+            }
+            PhysicalPlanType::ScalarSubquery(sq) => {
+                self.try_into_scalar_subquery_physical_plan(
+                    sq,
+                    ctx,
+                    codec,
+                    proto_converter,
+                )
             }
         }
     }
@@ -558,6 +567,14 @@ impl protobuf::PhysicalPlanNode {
 
         if let Some(exec) = plan.downcast_ref::<BufferExec>() {
             return protobuf::PhysicalPlanNode::try_from_buffer_exec(
+                exec,
+                codec,
+                proto_converter,
+            );
+        }
+
+        if let Some(exec) = plan.downcast_ref::<ScalarSubqueryExec>() {
+            return protobuf::PhysicalPlanNode::try_from_scalar_subquery_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -2223,6 +2240,33 @@ impl protobuf::PhysicalPlanNode {
         Ok(Arc::new(BufferExec::new(input, buffer.capacity as usize)))
     }
 
+    fn try_into_scalar_subquery_physical_plan(
+        &self,
+        sq: &protobuf::ScalarSubqueryExecNode,
+        ctx: &TaskContext,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input: Arc<dyn ExecutionPlan> =
+            into_physical_plan(&sq.input, ctx, codec, proto_converter)?;
+        let subqueries = sq
+            .subqueries
+            .iter()
+            .map(|sq_plan| {
+                let plan = sq_plan.try_into_physical_plan_with_converter(
+                    ctx,
+                    codec,
+                    proto_converter,
+                )?;
+                Ok(SubqueryPlan {
+                    plan,
+                    value: Arc::new(std::sync::OnceLock::new()),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(ScalarSubqueryExec::new(input, subqueries)))
+    }
+
     fn try_from_explain_exec(
         exec: &ExplainExec,
         _codec: &dyn PhysicalExtensionCodec,
@@ -3605,6 +3649,38 @@ impl protobuf::PhysicalPlanNode {
                 protobuf::BufferExecNode {
                     input: Some(Box::new(input)),
                     capacity: exec.capacity() as u64,
+                },
+            ))),
+        })
+    }
+
+    fn try_from_scalar_subquery_exec(
+        exec: &ScalarSubqueryExec,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Self> {
+        let input = protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+            Arc::clone(exec.input()),
+            codec,
+            proto_converter,
+        )?;
+        let subqueries = exec
+            .subqueries()
+            .iter()
+            .map(|sq| {
+                protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+                    Arc::clone(&sq.plan),
+                    codec,
+                    proto_converter,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::ScalarSubquery(Box::new(
+                protobuf::ScalarSubqueryExecNode {
+                    input: Some(Box::new(input)),
+                    subqueries,
                 },
             ))),
         })

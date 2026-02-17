@@ -3435,12 +3435,20 @@ impl ScalarValue {
     }
 
     fn list_to_array_of_size(arr: &dyn Array, size: usize) -> Result<ArrayRef> {
+        if size == 0 {
+            return Ok(arr.slice(0, 0));
+        }
+        if arr.len() == 1 {
+            // Fast path for single-element arrays (the common case for
+            // ScalarValue). Use `take` with repeated index 0 — a single
+            // O(size) kernel call — instead of `concat` of `size`
+            // single-element arrays, which incurs per-element overhead
+            // in MutableArrayData.
+            let indices = UInt32Array::from(vec![0u32; size]);
+            return Ok(arrow::compute::take(arr, &indices, None)?);
+        }
         let arrays = repeat_n(arr, size).collect::<Vec<_>>();
-        let ret = match !arrays.is_empty() {
-            true => arrow::compute::concat(arrays.as_slice())?,
-            false => arr.slice(0, 0),
-        };
-        Ok(ret)
+        Ok(arrow::compute::concat(arrays.as_slice())?)
     }
 
     /// Retrieve ScalarValue for each row in `array`

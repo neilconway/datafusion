@@ -752,6 +752,7 @@ message PhysicalPlanNode {
     AsyncFuncExecNode async_func = 36;
     BufferExecNode buffer = 37;
     ArrowScanExecNode arrow_scan = 38;
+    ScalarSubqueryExecNode scalar_subquery = 39;
   }
 }
 
@@ -897,6 +898,8 @@ message PhysicalExprNode {
     UnknownColumn unknown_column = 20;
 
     PhysicalHashExprNode hash_expr = 21;
+
+    PhysicalScalarSubqueryExprNode scalar_subquery = 22;
   }
 }
 
@@ -1448,4 +1451,14 @@ message AsyncFuncExecNode {
 message BufferExecNode {
   PhysicalPlanNode input = 1;
   uint64 capacity = 2;
+}
+
+message ScalarSubqueryExecNode {
+  PhysicalPlanNode input = 1;
+  repeated PhysicalPlanNode subqueries = 2;
+}
+
+message PhysicalScalarSubqueryExprNode {
+  datafusion_common.ArrowType data_type = 1;
+  bool nullable = 2;
 }

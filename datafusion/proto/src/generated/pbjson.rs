@@ -16304,6 +16304,9 @@ impl serde::Serialize for PhysicalExprNode {
                 physical_expr_node::ExprType::HashExpr(v) => {
                     struct_ser.serialize_field("hashExpr", v)?;
                 }
+                physical_expr_node::ExprType::ScalarSubquery(v) => {
+                    struct_ser.serialize_field("scalarSubquery", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -16350,6 +16353,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             "unknownColumn",
             "hash_expr",
             "hashExpr",
+            "scalar_subquery",
+            "scalarSubquery",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -16374,6 +16379,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
             Extension,
             UnknownColumn,
             HashExpr,
+            ScalarSubquery,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16415,6 +16421,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                             "extension" => Ok(GeneratedField::Extension),
                             "unknownColumn" | "unknown_column" => Ok(GeneratedField::UnknownColumn),
                             "hashExpr" | "hash_expr" => Ok(GeneratedField::HashExpr),
+                            "scalarSubquery" | "scalar_subquery" => Ok(GeneratedField::ScalarSubquery),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16577,6 +16584,13 @@ impl<'de> serde::Deserialize<'de> for PhysicalExprNode {
                                 return Err(serde::de::Error::duplicate_field("hashExpr"));
                             }
                             expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::HashExpr)
+;
+                        }
+                        GeneratedField::ScalarSubquery => {
+                            if expr_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scalarSubquery"));
+                            }
+                            expr_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_expr_node::ExprType::ScalarSubquery)
 ;
                         }
                     }
@@ -17878,6 +17892,9 @@ impl serde::Serialize for PhysicalPlanNode {
                 physical_plan_node::PhysicalPlanType::ArrowScan(v) => {
                     struct_ser.serialize_field("arrowScan", v)?;
                 }
+                physical_plan_node::PhysicalPlanType::ScalarSubquery(v) => {
+                    struct_ser.serialize_field("scalarSubquery", v)?;
+                }
             }
         }
         struct_ser.end()
@@ -17948,6 +17965,8 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
             "buffer",
             "arrow_scan",
             "arrowScan",
+            "scalar_subquery",
+            "scalarSubquery",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -17989,6 +18008,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
             AsyncFunc,
             Buffer,
             ArrowScan,
+            ScalarSubquery,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -18047,6 +18067,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
                             "asyncFunc" | "async_func" => Ok(GeneratedField::AsyncFunc),
                             "buffer" => Ok(GeneratedField::Buffer),
                             "arrowScan" | "arrow_scan" => Ok(GeneratedField::ArrowScan),
+                            "scalarSubquery" | "scalar_subquery" => Ok(GeneratedField::ScalarSubquery),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -18328,6 +18349,13 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
                             physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::ArrowScan)
 ;
                         }
+                        GeneratedField::ScalarSubquery => {
+                            if physical_plan_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("scalarSubquery"));
+                            }
+                            physical_plan_type__ = map_.next_value::<::std::option::Option<_>>()?.map(physical_plan_node::PhysicalPlanType::ScalarSubquery)
+;
+                        }
                     }
                 }
                 Ok(PhysicalPlanNode {
@@ -18336,6 +18364,115 @@ impl<'de> serde::Deserialize<'de> for PhysicalPlanNode {
             }
         }
         deserializer.deserialize_struct("datafusion.PhysicalPlanNode", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for PhysicalScalarSubqueryExprNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.data_type.is_some() {
+            len += 1;
+        }
+        if self.nullable {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalScalarSubqueryExprNode", len)?;
+        if let Some(v) = self.data_type.as_ref() {
+            struct_ser.serialize_field("dataType", v)?;
+        }
+        if self.nullable {
+            struct_ser.serialize_field("nullable", &self.nullable)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for PhysicalScalarSubqueryExprNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "data_type",
+            "dataType",
+            "nullable",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            DataType,
+            Nullable,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "dataType" | "data_type" => Ok(GeneratedField::DataType),
+                            "nullable" => Ok(GeneratedField::Nullable),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = PhysicalScalarSubqueryExprNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.PhysicalScalarSubqueryExprNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<PhysicalScalarSubqueryExprNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut data_type__ = None;
+                let mut nullable__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::DataType => {
+                            if data_type__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("dataType"));
+                            }
+                            data_type__ = map_.next_value()?;
+                        }
+                        GeneratedField::Nullable => {
+                            if nullable__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("nullable"));
+                            }
+                            nullable__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(PhysicalScalarSubqueryExprNode {
+                    data_type: data_type__,
+                    nullable: nullable__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.PhysicalScalarSubqueryExprNode", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for PhysicalScalarUdfNode {
@@ -20987,6 +21124,114 @@ impl<'de> serde::Deserialize<'de> for RollupNode {
             }
         }
         deserializer.deserialize_struct("datafusion.RollupNode", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for ScalarSubqueryExecNode {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.input.is_some() {
+            len += 1;
+        }
+        if !self.subqueries.is_empty() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion.ScalarSubqueryExecNode", len)?;
+        if let Some(v) = self.input.as_ref() {
+            struct_ser.serialize_field("input", v)?;
+        }
+        if !self.subqueries.is_empty() {
+            struct_ser.serialize_field("subqueries", &self.subqueries)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for ScalarSubqueryExecNode {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "input",
+            "subqueries",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Input,
+            Subqueries,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl serde::de::Visitor<'_> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "input" => Ok(GeneratedField::Input),
+                            "subqueries" => Ok(GeneratedField::Subqueries),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = ScalarSubqueryExecNode;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion.ScalarSubqueryExecNode")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ScalarSubqueryExecNode, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut input__ = None;
+                let mut subqueries__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Input => {
+                            if input__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("input"));
+                            }
+                            input__ = map_.next_value()?;
+                        }
+                        GeneratedField::Subqueries => {
+                            if subqueries__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("subqueries"));
+                            }
+                            subqueries__ = Some(map_.next_value()?);
+                        }
+                    }
+                }
+                Ok(ScalarSubqueryExecNode {
+                    input: input__,
+                    subqueries: subqueries__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion.ScalarSubqueryExecNode", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for ScalarUdfExprNode {

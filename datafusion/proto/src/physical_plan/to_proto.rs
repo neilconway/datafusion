@@ -32,6 +32,7 @@ use datafusion_datasource_json::file_format::JsonSink;
 use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_expr::WindowFrame;
 use datafusion_physical_expr::ScalarFunctionExpr;
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::window::{SlidingAggregateWindowExpr, StandardWindowExpr};
 use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr;
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
@@ -506,6 +507,20 @@ pub fn serialize_physical_expr_with_converter(
                     description: expr.description().to_string(),
                 },
             )),
+        })
+    } else if let Some(expr) = expr.downcast_ref::<ScalarSubqueryExpr>() {
+        Ok(protobuf::PhysicalExprNode {
+            expr_id: None,
+            expr_type: Some(
+                protobuf::physical_expr_node::ExprType::ScalarSubquery(
+                    protobuf::PhysicalScalarSubqueryExprNode {
+                        data_type: Some(
+                            (&expr.data_type(&Schema::empty())?).try_into()?,
+                        ),
+                        nullable: expr.nullable(&Schema::empty())?,
+                    },
+                ),
+            ),
         })
     } else {
         let mut buf: Vec<u8> = vec![];

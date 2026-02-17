@@ -1079,7 +1079,7 @@ pub mod table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1163,6 +1163,8 @@ pub mod physical_plan_node {
         Buffer(::prost::alloc::boxed::Box<super::BufferExecNode>),
         #[prost(message, tag = "38")]
         ArrowScan(super::ArrowScanExecNode),
+        #[prost(message, tag = "39")]
+        ScalarSubquery(::prost::alloc::boxed::Box<super::ScalarSubqueryExecNode>),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1294,7 +1296,7 @@ pub struct PhysicalExprNode {
     pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21"
+        tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21, 22"
     )]
     pub expr_type: ::core::option::Option<physical_expr_node::ExprType>,
 }
@@ -1347,6 +1349,8 @@ pub mod physical_expr_node {
         UnknownColumn(super::UnknownColumn),
         #[prost(message, tag = "21")]
         HashExpr(super::PhysicalHashExprNode),
+        #[prost(message, tag = "22")]
+        ScalarSubquery(super::PhysicalScalarSubqueryExprNode),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2170,6 +2174,20 @@ pub struct BufferExecNode {
     pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
     #[prost(uint64, tag = "2")]
     pub capacity: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ScalarSubqueryExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(message, repeated, tag = "2")]
+    pub subqueries: ::prost::alloc::vec::Vec<PhysicalPlanNode>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PhysicalScalarSubqueryExprNode {
+    #[prost(message, optional, tag = "1")]
+    pub data_type: ::core::option::Option<super::datafusion_common::ArrowType>,
+    #[prost(bool, tag = "2")]
+    pub nullable: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]

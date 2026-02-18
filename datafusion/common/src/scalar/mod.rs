@@ -3439,16 +3439,19 @@ impl ScalarValue {
             return Ok(arr.slice(0, 0));
         }
         if arr.len() == 1 {
-            // Fast path for single-element arrays (the common case for
-            // ScalarValue). Use `take` with repeated index 0 — a single
-            // O(size) kernel call — instead of `concat` of `size`
-            // single-element arrays, which incurs per-element overhead
-            // in MutableArrayData.
+            // For 1-element arrays (the normal case for List, LargeList,
+            // FixedSizeList, and Map scalars), use `take` instead of `concat`.
+            // Both produce the same result, but `take` preserves the source
+            // array's buffer count. With `concat`, a StringViewArray with B
+            // data buffers would produce an output with size*B buffers, making
+            // every subsequent `ListArray::value(i)` → `StringViewArray::slice()`
+            // clone a massive buffer vector.
             let indices = UInt32Array::from(vec![0u32; size]);
-            return Ok(arrow::compute::take(arr, &indices, None)?);
+            Ok(arrow::compute::take(arr, &indices, None)?)
+        } else {
+            let arrays = repeat_n(arr, size).collect::<Vec<_>>();
+            Ok(arrow::compute::concat(arrays.as_slice())?)
         }
-        let arrays = repeat_n(arr, size).collect::<Vec<_>>();
-        Ok(arrow::compute::concat(arrays.as_slice())?)
     }
 
     /// Retrieve ScalarValue for each row in `array`

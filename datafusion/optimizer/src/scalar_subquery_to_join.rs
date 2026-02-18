@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! [`ScalarSubqueryToJoin`] rewriting scalar subquery filters to `JOIN`s
+//! [`ScalarSubqueryToJoin`] rewriting correlated scalar subquery filters to `JOIN`s
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
 use datafusion_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, expr};
 
-/// Optimizer rule for rewriting subquery filters to joins
+/// Optimizer rule for rewriting correlated scalar subquery filters to joins
 /// and places additional projection on top of the filter, to preserve
 /// original schema.
 #[derive(Default, Debug)]

@@ -140,38 +140,39 @@ statement error Arrow error: Cast error: Cannot cast string '9999999999999999999
 SELECT * FROM t_int WHERE column1 = '99999999999999999999';
 
 # -------------------------------------------------
-# UNION still uses string coercion (type unification context)
+# UNION uses numeric-preferring coercion
 # -------------------------------------------------
 
 statement ok
-CREATE TABLE t_str AS VALUES ('one'), ('two'), ('three');
+CREATE TABLE t_str AS VALUES ('10'), ('20'), ('30');
 
-query T rowsort
+# UNION of int and string columns coerces string to numeric
+query I rowsort
 SELECT column1 FROM t_int UNION ALL SELECT column1 FROM t_str;
 ----
 1
+10
 1000
+20
+30
 325
 499
 5
-one
-three
-two
 
-# Verify the UNION coerces to Utf8 (not numeric)
+# Verify the UNION coerces to Int64 (string column is cast to numeric)
 query TT
 EXPLAIN SELECT column1 FROM t_int UNION ALL SELECT column1 FROM t_str;
 ----
 logical_plan
 01)Union
-02)--Projection: CAST(t_int.column1 AS Utf8) AS column1
-03)----TableScan: t_int projection=[column1]
-04)--TableScan: t_str projection=[column1]
+02)--TableScan: t_int projection=[column1]
+03)--Projection: CAST(t_str.column1 AS Int64) AS column1
+04)----TableScan: t_str projection=[column1]
 physical_plan
 01)UnionExec
-02)--ProjectionExec: expr=[CAST(column1@0 AS Utf8) as column1]
-03)----DataSourceExec: partitions=1, partition_sizes=[1]
-04)--DataSourceExec: partitions=1, partition_sizes=[1]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+03)--ProjectionExec: expr=[CAST(column1@0 AS Int64) as column1]
+04)----DataSourceExec: partitions=1, partition_sizes=[1]
 
 # -------------------------------------------------
 # BETWEEN uses comparison coercion (numeric preferred)

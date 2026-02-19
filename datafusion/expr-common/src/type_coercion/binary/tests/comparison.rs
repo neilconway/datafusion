@@ -833,46 +833,6 @@ fn test_comparison_coercion_prefers_numeric() {
     );
 }
 
-/// Tests that `type_union_coercion` prefers string type when unifying
-/// numeric and string types (for UNION, CASE, etc.).
-#[test]
-fn test_type_union_coercion_prefers_string() {
-    assert_eq!(
-        type_union_coercion(&DataType::Int32, &DataType::Utf8),
-        Some(DataType::Utf8)
-    );
-    assert_eq!(
-        type_union_coercion(&DataType::Utf8, &DataType::Int32),
-        Some(DataType::Utf8)
-    );
-    assert_eq!(
-        type_union_coercion(&DataType::Float64, &DataType::Utf8),
-        Some(DataType::Utf8)
-    );
-    assert_eq!(
-        type_union_coercion(&DataType::Utf8, &DataType::Float64),
-        Some(DataType::Utf8)
-    );
-    assert_eq!(
-        type_union_coercion(&DataType::Int64, &DataType::LargeUtf8),
-        Some(DataType::LargeUtf8)
-    );
-    assert_eq!(
-        type_union_coercion(&DataType::Utf8View, &DataType::Int16),
-        Some(DataType::Utf8View)
-    );
-    // String-string stays string
-    assert_eq!(
-        type_union_coercion(&DataType::Utf8, &DataType::Utf8),
-        Some(DataType::Utf8)
-    );
-    // Numeric-numeric stays numeric
-    assert_eq!(
-        type_union_coercion(&DataType::Int32, &DataType::Int64),
-        Some(DataType::Int64)
-    );
-}
-
 /// Tests that comparison operators coerce to numeric when comparing
 /// numeric and string types.
 #[test]

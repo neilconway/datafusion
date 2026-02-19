@@ -282,7 +282,7 @@ NULL 3
 
 # Different types
 
-query T rowsort
+query I rowsort
 SELECT '0' as c UNION ALL BY NAME SELECT 0 as c;
 ----
 0

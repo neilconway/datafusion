@@ -42,7 +42,7 @@ use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::cast_subquery;
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::type_coercion::binary::{
-    comparison_coercion, like_coercion, type_union_coercion,
+    comparison_coercion, like_coercion,
 };
 use datafusion_expr::type_coercion::functions::{UDFCoercionExt, fields_with_udf};
 use datafusion_expr::type_coercion::is_datetime;
@@ -1186,7 +1186,7 @@ fn coerce_union_schema_with_schema(
             plan_schema.fields().iter()
         ) {
             let coerced_type =
-                type_union_coercion(union_datatype, plan_field.data_type()).ok_or_else(
+                comparison_coercion(union_datatype, plan_field.data_type()).ok_or_else(
                     || {
                         plan_datafusion_err!(
                             "Incompatible inputs for Union: Previous inputs were \
@@ -2341,7 +2341,7 @@ mod test {
             else_expr: None,
         };
         let case_when_common_type = DataType::Boolean;
-        let then_else_common_type = Utf8;
+        let then_else_common_type = DataType::Float32;
         let expected = cast_helper(
             case.clone(),
             &case_when_common_type,
@@ -2360,8 +2360,8 @@ mod test {
             ],
             else_expr: Some(Box::new(col("string"))),
         };
-        let case_when_common_type = Utf8;
-        let then_else_common_type = Utf8;
+        let case_when_common_type = DataType::Float32;
+        let then_else_common_type = DataType::Float32;
         let expected = cast_helper(
             case.clone(),
             &case_when_common_type,

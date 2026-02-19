@@ -840,40 +840,10 @@ pub fn try_type_union_resolution_with_struct(
     Ok(final_struct_types)
 }
 
-/// Coerce `lhs_type` and `rhs_type` to a common type for the purposes of
-/// type unification (e.g., UNION, CASE, NVL2).
+/// Coerce `lhs_type` and `rhs_type` to a common type.
 ///
-/// When unifying numeric values and strings, both values will be coerced to
-/// strings. For example, in `SELECT 1 UNION SELECT '2'`, both sides are
-/// coerced to `Utf8` since string is the safe widening type.
-///
-/// For comparison operations (e.g., `=`, `<`, `>`), use [`comparison_coercion`]
-/// instead, which prefers numeric types over strings.
-pub fn type_union_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
-    if lhs_type.equals_datatype(rhs_type) {
-        return Some(lhs_type.clone());
-    }
-    binary_numeric_coercion(lhs_type, rhs_type)
-        .or_else(|| dictionary_type_union_coercion(lhs_type, rhs_type, true))
-        .or_else(|| ree_type_union_coercion(lhs_type, rhs_type, true))
-        .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
-        .or_else(|| string_coercion(lhs_type, rhs_type))
-        .or_else(|| list_coercion(lhs_type, rhs_type))
-        .or_else(|| null_coercion(lhs_type, rhs_type))
-        .or_else(|| string_numeric_union_coercion(lhs_type, rhs_type))
-        .or_else(|| string_temporal_coercion(lhs_type, rhs_type))
-        .or_else(|| binary_coercion(lhs_type, rhs_type))
-        .or_else(|| struct_coercion(lhs_type, rhs_type))
-        .or_else(|| map_coercion(lhs_type, rhs_type))
-}
-
-/// Coerce `lhs_type` and `rhs_type` to a common type for the purposes of a
-/// comparison operation (e.g., `=`, `!=`, `<`, `>`, `<=`, `>=`).
-///
-/// Binary comparison kernels require the two arguments to be the (exact) same
-/// data type. However, users can write queries where the two arguments are
-/// different data types. In such cases, the data types are automatically cast
-/// (coerced) to a single data type to pass to the kernels.
+/// Used for both comparison operations (e.g., `=`, `<`, `>`) and type
+/// unification contexts (e.g., UNION, CASE, NVL2).
 ///
 /// # Numeric comparisons
 ///
@@ -882,15 +852,11 @@ pub fn type_union_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
 /// `Int32` to `Int64` the coerced type is `Int64` so the `Int32` argument will
 /// be cast.
 ///
-/// # Numeric / String comparisons
+/// # Numeric / String coercion
 ///
-/// When comparing numeric values and strings, the string value will be coerced
-/// to the numeric type. For example when comparing `'2' > 1` where `1` is
-/// `Int32`, `'2'` will be coerced to `Int32` for comparison.
-///
-/// For type unification contexts (UNION, CASE, NVL2), use
-/// [`type_union_coercion`] instead, which prefers strings as the safe widening
-/// type.
+/// When one side is numeric and the other is a string, the string value will be
+/// coerced to the numeric type. For example when comparing `'2' > 1` where `1`
+/// is `Int32`, `'2'` will be coerced to `Int32`.
 pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     if lhs_type == rhs_type {
         // same type => equality is possible
@@ -924,25 +890,6 @@ fn string_numeric_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
     }
 
     None
-}
-
-/// Coerce `lhs_type` and `rhs_type` to a common type where one is numeric and
-/// one is string, preferring the string type. Used for type unification contexts
-/// (e.g., UNION, CASE, NVL2) where string is the safe widening type.
-fn string_numeric_union_coercion(
-    lhs_type: &DataType,
-    rhs_type: &DataType,
-) -> Option<DataType> {
-    use arrow::datatypes::DataType::*;
-    match (lhs_type, rhs_type) {
-        (Utf8, _) if rhs_type.is_numeric() => Some(Utf8),
-        (LargeUtf8, _) if rhs_type.is_numeric() => Some(LargeUtf8),
-        (Utf8View, _) if rhs_type.is_numeric() => Some(Utf8View),
-        (_, Utf8) if lhs_type.is_numeric() => Some(Utf8),
-        (_, LargeUtf8) if lhs_type.is_numeric() => Some(LargeUtf8),
-        (_, Utf8View) if lhs_type.is_numeric() => Some(Utf8View),
-        _ => None,
-    }
 }
 
 /// Coerce `lhs_type` and `rhs_type` to a common type for the purposes of a comparison operation
@@ -1315,7 +1262,7 @@ fn coerce_struct_by_name(lhs_fields: &Fields, rhs_fields: &Fields) -> Option<Dat
 
     for lhs in lhs_fields.iter() {
         let rhs = rhs_by_name.get(lhs.name().as_str()).unwrap(); // safe: caller ensured names match
-        let coerced_type = type_union_coercion(lhs.data_type(), rhs.data_type())?;
+        let coerced_type = comparison_coercion(lhs.data_type(), rhs.data_type())?;
         let is_nullable = lhs.is_nullable() || rhs.is_nullable();
         coerced.push(Arc::new(Field::new(
             lhs.name().clone(),
@@ -1339,7 +1286,7 @@ fn coerce_struct_by_position(
     let coerced_types: Vec<DataType> = lhs_fields
         .iter()
         .zip(rhs_fields.iter())
-        .map(|(l, r)| type_union_coercion(l.data_type(), r.data_type()))
+        .map(|(l, r)| comparison_coercion(l.data_type(), r.data_type()))
         .collect::<Option<Vec<DataType>>>()?;
 
     // Build final fields preserving left-side names and combined nullability.
@@ -1519,26 +1466,11 @@ fn dictionary_comparison_coercion_generic(
     }
 }
 
-/// Coercion rules for Dictionaries in type unification contexts (UNION, CASE, NVL2).
+/// Coercion rules for Dictionaries: the type that both lhs and rhs
+/// can be casted to for the purpose of a computation.
 ///
 /// Not all operators support dictionaries, if `preserve_dictionaries` is true
 /// dictionaries will be preserved if possible
-fn dictionary_type_union_coercion(
-    lhs_type: &DataType,
-    rhs_type: &DataType,
-    preserve_dictionaries: bool,
-) -> Option<DataType> {
-    dictionary_comparison_coercion_generic(
-        lhs_type,
-        rhs_type,
-        preserve_dictionaries,
-        type_union_coercion,
-    )
-}
-
-/// Coercion rules for Dictionaries in comparison contexts.
-///
-/// Prefers numeric types over strings when both are present.
 fn dictionary_comparison_coercion(
     lhs_type: &DataType,
     rhs_type: &DataType,
@@ -1587,21 +1519,11 @@ fn ree_comparison_coercion_generic(
     }
 }
 
-/// Coercion rules for RunEndEncoded in type unification contexts (UNION, CASE, NVL2).
+/// Coercion rules for RunEndEncoded: the type that both lhs and rhs
+/// can be casted to for the purpose of a computation.
 ///
 /// Not all operators support REE, if `preserve_ree` is true
 /// REE will be preserved if possible
-fn ree_type_union_coercion(
-    lhs_type: &DataType,
-    rhs_type: &DataType,
-    preserve_ree: bool,
-) -> Option<DataType> {
-    ree_comparison_coercion_generic(lhs_type, rhs_type, preserve_ree, type_union_coercion)
-}
-
-/// Coercion rules for RunEndEncoded in comparison contexts.
-///
-/// Prefers numeric types over strings when both are present.
 fn ree_comparison_coercion(
     lhs_type: &DataType,
     rhs_type: &DataType,
@@ -1794,8 +1716,8 @@ fn binary_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType>
 pub fn like_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
         .or_else(|| binary_to_string_coercion(lhs_type, rhs_type))
-        .or_else(|| dictionary_type_union_coercion(lhs_type, rhs_type, false))
-        .or_else(|| ree_type_union_coercion(lhs_type, rhs_type, false))
+        .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
+        .or_else(|| ree_comparison_coercion(lhs_type, rhs_type, false))
         .or_else(|| regex_null_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
 }
@@ -1815,7 +1737,7 @@ fn regex_null_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataT
 /// This is a union of string coercion rules and dictionary coercion rules
 pub fn regex_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     string_coercion(lhs_type, rhs_type)
-        .or_else(|| dictionary_type_union_coercion(lhs_type, rhs_type, false))
+        .or_else(|| dictionary_comparison_coercion(lhs_type, rhs_type, false))
         .or_else(|| regex_null_coercion(lhs_type, rhs_type))
 }
 

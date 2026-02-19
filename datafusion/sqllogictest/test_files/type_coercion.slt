@@ -159,26 +159,15 @@ logical_plan
 05)----EmptyRelation: rows=1
 
 # union_with_float_and_string()
-query TT
-EXPLAIN SELECT 'a' a UNION ALL SELECT 1.1 a
-----
-logical_plan
-01)Union
-02)--Projection: Utf8("a") AS a
-03)----EmptyRelation: rows=1
-04)--Projection: CAST(Float64(1.1) AS Utf8) AS a
-05)----EmptyRelation: rows=1
+# Numeric-preferring coercion picks Float64 as the common type,
+# so 'a' fails to cast to Float64
+statement error Arrow error: Cast error: Cannot cast string 'a' to value of Float64 type
+SELECT 'a' a UNION ALL SELECT 1.1 a
 
 # union_with_multiply_cols()
-query TT
-EXPLAIN SELECT 'a' a, 1 b UNION ALL SELECT 1.1 a, 1.1 b
-----
-logical_plan
-01)Union
-02)--Projection: Utf8("a") AS a, CAST(Int64(1) AS Float64) AS b
-03)----EmptyRelation: rows=1
-04)--Projection: CAST(Float64(1.1) AS Utf8) AS a, Float64(1.1) AS b
-05)----EmptyRelation: rows=1
+# Same issue: column 'a' has Utf8 vs Float64, coerces to Float64
+statement error Arrow error: Cast error: Cannot cast string 'a' to value of Float64 type
+SELECT 'a' a, 1 b UNION ALL SELECT 1.1 a, 1.1 b
 
 # sorted_union_with_different_types_and_group_by()
 query TT

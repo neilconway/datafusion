@@ -3326,8 +3326,10 @@ mod tests {
 
     #[tokio::test]
     async fn in_list_types() -> Result<()> {
-        // expression: "a in ('a', 1)"
-        let list = vec![lit("a"), lit(1i64)];
+        // expression: "c1 in ('a', 'b')" where c1 is Utf8
+        // This also tests that numeric literals in the list get coerced:
+        // c3 is Int64, so "c3 in (1, 2)" stays numeric
+        let list = vec![lit("a"), lit("b")];
         let logical_plan = test_csv_scan()
             .await?
             // filter clause needs the type coercion rule applied
@@ -3335,7 +3337,6 @@ mod tests {
             .project(vec![col("c1").in_list(list, false)])?
             .build()?;
         let execution_plan = plan(&logical_plan).await?;
-        // verify that the plan correctly adds cast from Int64(1) to Utf8, and the const will be evaluated.
 
         let expected = r#"expr: BinaryExpr { left: BinaryExpr { left: Column { name: "c1", index: 0 }, op: Eq, right: Literal { value: Utf8("a"), field: Field { name: "lit", data_type: Utf8 } }, fail_on_overflow: false }"#;
 

@@ -18,9 +18,17 @@
 use crate::var_provider::{VarProvider, VarType};
 use chrono::{DateTime, Utc};
 use datafusion_common::HashMap;
+use datafusion_common::ScalarValue;
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::ConfigOptions;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+
+/// Shared results container for uncorrelated scalar subqueries.
+///
+/// Each entry corresponds to one scalar subquery, identified by its index.
+/// The `OnceLock` is populated at execution time by `ScalarSubqueryExec` and
+/// read by `ScalarSubqueryExpr` instances that share this container.
+pub type ScalarSubqueryResults = Arc<Vec<OnceLock<ScalarValue>>>;
 
 /// Holds per-query execution properties and data (such as statement
 /// starting timestamps).
@@ -42,6 +50,12 @@ pub struct ExecutionProps {
     pub config_options: Option<Arc<ConfigOptions>>,
     /// Providers for scalar variables
     pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
+    /// Maps each logical `Subquery` to its index in `subquery_results`.
+    /// Populated by the physical planner before calling `create_physical_expr`.
+    pub subquery_indexes: HashMap<crate::logical_plan::Subquery, usize>,
+    /// Shared results container for uncorrelated scalar subquery values.
+    /// Populated at execution time by `ScalarSubqueryExec`.
+    pub subquery_results: ScalarSubqueryResults,
 }
 
 impl Default for ExecutionProps {
@@ -58,6 +72,8 @@ impl ExecutionProps {
             alias_generator: Arc::new(AliasGenerator::new()),
             config_options: None,
             var_providers: None,
+            subquery_indexes: HashMap::new(),
+            subquery_results: Arc::new(vec![]),
         }
     }
 
@@ -126,7 +142,7 @@ mod test {
     fn debug() {
         let props = ExecutionProps::new();
         assert_eq!(
-            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None }",
+            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None, subquery_indexes: {}, subquery_results: [] }",
             format!("{props:?}")
         );
     }

@@ -51,6 +51,7 @@ use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
+use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
@@ -83,6 +84,7 @@ use datafusion_physical_plan::metrics::{MetricCategory, MetricType};
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
+use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
@@ -145,7 +147,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
         self.try_into_physical_plan_with_converter(
             ctx,
             codec,
-            &DefaultPhysicalProtoConverter {},
+            &DefaultPhysicalProtoConverter::default(),
         )
     }
 
@@ -159,7 +161,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
         Self::try_from_physical_plan_with_converter(
             plan,
             codec,
-            &DefaultPhysicalProtoConverter {},
+            &DefaultPhysicalProtoConverter::default(),
         )
     }
 }
@@ -321,6 +323,8 @@ impl protobuf::PhysicalPlanNode {
             PhysicalPlanType::Buffer(buffer) => {
                 self.try_into_buffer_physical_plan(buffer, ctx, codec, proto_converter)
             }
+            PhysicalPlanType::ScalarSubquery(sq) => self
+                .try_into_scalar_subquery_physical_plan(sq, ctx, codec, proto_converter),
         }
     }
 
@@ -563,6 +567,14 @@ impl protobuf::PhysicalPlanNode {
 
         if let Some(exec) = plan.downcast_ref::<BufferExec>() {
             return protobuf::PhysicalPlanNode::try_from_buffer_exec(
+                exec,
+                codec,
+                proto_converter,
+            );
+        }
+
+        if let Some(exec) = plan.downcast_ref::<ScalarSubqueryExec>() {
+            return protobuf::PhysicalPlanNode::try_from_scalar_subquery_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -2251,6 +2263,46 @@ impl protobuf::PhysicalPlanNode {
         Ok(Arc::new(BufferExec::new(input, buffer.capacity as usize)))
     }
 
+    fn try_into_scalar_subquery_physical_plan(
+        &self,
+        sq: &protobuf::ScalarSubqueryExecNode,
+        ctx: &TaskContext,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // Create the results container upfront — we know the count from the
+        // proto. Making it available on the converter before deserializing
+        // the input plan allows ScalarSubqueryExpr nodes to pick up the
+        // shared container at construction time.
+        let results = Arc::new(
+            (0..sq.subqueries.len())
+                .map(|_| std::sync::OnceLock::new())
+                .collect::<Vec<_>>(),
+        );
+        let prev =
+            proto_converter.set_scalar_subquery_results(Some(Arc::clone(&results)));
+        let input = into_physical_plan(&sq.input, ctx, codec, proto_converter);
+        // Restore previous state before propagating errors, so nested
+        // ScalarSubqueryExec deserialization doesn't see stale state.
+        proto_converter.set_scalar_subquery_results(prev);
+        let input: Arc<dyn ExecutionPlan> = input?;
+
+        let subqueries: Vec<ScalarSubqueryLink> = sq
+            .subqueries
+            .iter()
+            .enumerate()
+            .map(|(index, sq_plan)| {
+                let plan = sq_plan.try_into_physical_plan_with_converter(
+                    ctx,
+                    codec,
+                    proto_converter,
+                )?;
+                Ok(ScalarSubqueryLink { plan, index })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Arc::new(ScalarSubqueryExec::new(input, subqueries, results)))
+    }
+
     fn try_from_explain_exec(
         exec: &ExplainExec,
         _codec: &dyn PhysicalExtensionCodec,
@@ -3645,6 +3697,38 @@ impl protobuf::PhysicalPlanNode {
             ))),
         })
     }
+
+    fn try_from_scalar_subquery_exec(
+        exec: &ScalarSubqueryExec,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Self> {
+        let input = protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+            Arc::clone(exec.input()),
+            codec,
+            proto_converter,
+        )?;
+        let subqueries = exec
+            .subqueries()
+            .iter()
+            .map(|sq| {
+                protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+                    Arc::clone(&sq.plan),
+                    codec,
+                    proto_converter,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::ScalarSubquery(Box::new(
+                protobuf::ScalarSubqueryExecNode {
+                    input: Some(Box::new(input)),
+                    subqueries,
+                },
+            ))),
+        })
+    }
 }
 
 pub trait AsExecutionPlan: Debug + Send + Sync + Clone {
@@ -3777,6 +3861,24 @@ pub trait PhysicalProtoConverterExtension {
         expr: &Arc<dyn PhysicalExpr>,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode>;
+
+    /// Sets the scalar subquery results container for expression deserialization.
+    /// Returns the previous value (for save/restore around nested subqueries).
+    ///
+    /// During `ScalarSubqueryExec` deserialization, this is called before
+    /// deserializing the input plan so that `ScalarSubqueryExpr` nodes can
+    /// pick up the shared results container at construction time.
+    fn set_scalar_subquery_results(
+        &self,
+        _results: Option<ScalarSubqueryResults>,
+    ) -> Option<ScalarSubqueryResults> {
+        None
+    }
+
+    /// Returns the current scalar subquery results container, if any.
+    fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
+        None
+    }
 }
 
 /// DataEncoderTuple captures the position of the encoder
@@ -3792,7 +3894,11 @@ struct DataEncoderTuple {
     pub blob: Vec<u8>,
 }
 
-pub struct DefaultPhysicalProtoConverter;
+#[derive(Default)]
+pub struct DefaultPhysicalProtoConverter {
+    scalar_subquery_results: RefCell<Option<ScalarSubqueryResults>>,
+}
+
 impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
     fn proto_to_execution_plan(
         &self,
@@ -3838,6 +3944,17 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode> {
         serialize_physical_expr_with_converter(expr, codec, self)
+    }
+
+    fn set_scalar_subquery_results(
+        &self,
+        results: Option<ScalarSubqueryResults>,
+    ) -> Option<ScalarSubqueryResults> {
+        self.scalar_subquery_results.replace(results)
+    }
+
+    fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
+        self.scalar_subquery_results.borrow().clone()
     }
 }
 
@@ -3921,6 +4038,10 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
 struct DeduplicatingDeserializer {
     /// Cache mapping expr_id to deserialized expressions.
     cache: RefCell<HashMap<u64, Arc<dyn PhysicalExpr>>>,
+    /// Scalar subquery results container for the current deserialization scope.
+    /// Set by `ScalarSubqueryExec` deserialization so that `ScalarSubqueryExpr`
+    /// nodes in the input plan can pick up the shared results container.
+    scalar_subquery_results: RefCell<Option<ScalarSubqueryResults>>,
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
@@ -3980,6 +4101,17 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
         _codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalExprNode> {
         internal_err!("DeduplicatingDeserializer cannot serialize physical expressions")
+    }
+
+    fn set_scalar_subquery_results(
+        &self,
+        results: Option<ScalarSubqueryResults>,
+    ) -> Option<ScalarSubqueryResults> {
+        self.scalar_subquery_results.replace(results)
+    }
+
+    fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
+        self.scalar_subquery_results.borrow().clone()
     }
 }
 

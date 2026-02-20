@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::vec;
 
 use arrow::array::RecordBatch;
@@ -54,6 +54,7 @@ use datafusion::physical_expr::window::{SlidingAggregateWindowExpr, StandardWind
 use datafusion::physical_expr::{
     LexOrdering, PhysicalSortRequirement, ScalarFunctionExpr,
 };
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
 };
@@ -66,6 +67,7 @@ use datafusion::physical_plan::expressions::{
     BinaryExpr, Column, NotExpr, PhysicalSortExpr, binary, cast, col, in_list, like, lit,
 };
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
+use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion::physical_plan::joins::{
     HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
@@ -136,7 +138,7 @@ use crate::cases::{
 fn roundtrip_test(exec_plan: Arc<dyn ExecutionPlan>) -> Result<()> {
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     roundtrip_test_and_return(exec_plan, &ctx, &codec, &proto_converter)?;
     Ok(())
 }
@@ -183,7 +185,7 @@ fn roundtrip_test_with_context(
     ctx: &SessionContext,
 ) -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     roundtrip_test_and_return(exec_plan, ctx, &codec, &proto_converter)?;
     Ok(())
 }
@@ -192,7 +194,7 @@ fn roundtrip_test_with_context(
 /// query results are identical.
 async fn roundtrip_test_sql_with_context(sql: &str, ctx: &SessionContext) -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     let initial_plan = ctx.sql(sql).await?.create_physical_plan().await?;
 
     roundtrip_test_and_return(initial_plan, ctx, &codec, &proto_converter)?;
@@ -964,7 +966,7 @@ fn roundtrip_parquet_exec_attaches_cached_reader_factory_after_roundtrip() -> Re
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     let roundtripped =
         roundtrip_test_and_return(exec_plan, &ctx, &codec, &proto_converter)?;
 
@@ -1192,7 +1194,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
         exec_plan,
         &ctx,
         &CustomPhysicalExtensionCodec {},
-        &DefaultPhysicalProtoConverter {},
+        &DefaultPhysicalProtoConverter::default(),
     )?;
     Ok(())
 }
@@ -1399,7 +1401,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     roundtrip_test_and_return(aggregate, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1447,7 +1449,7 @@ fn roundtrip_udwf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     roundtrip_test_and_return(window, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1519,7 +1521,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
     roundtrip_test_and_return(aggregate, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1647,7 +1649,7 @@ fn roundtrip_csv_sink() -> Result<()> {
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
 
     let roundtrip_plan = roundtrip_test_and_return(
         Arc::new(DataSinkExec::new(input, data_sink, Some(sort_order))),
@@ -2856,7 +2858,7 @@ fn test_backward_compatibility_no_expr_id() -> Result<()> {
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter {};
+    let proto_converter = DefaultPhysicalProtoConverter::default();
 
     // Should deserialize without error
     let result = proto_converter.proto_to_physical_expr(
@@ -3192,4 +3194,88 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
         InputOrderMode::Sorted,
         true,
     )?))
+}
+
+/// Verify that ScalarSubqueryExpr nodes in the input plan are connected to the
+/// same shared results container as ScalarSubqueryExec after a proto round-trip.
+#[test]
+fn roundtrip_scalar_subquery_exec() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Int64, false),
+    ]));
+
+    // Create a shared results container with one slot.
+    let results = Arc::new(vec![OnceLock::new()]);
+
+    // Build the input plan: a filter whose predicate references the
+    // scalar subquery result via ScalarSubqueryExpr.
+    let sq_expr = Arc::new(ScalarSubqueryExpr::new(
+        DataType::Int64,
+        true,
+        0,
+        Arc::clone(&results),
+    ));
+    let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
+    let filter = FilterExec::try_new(predicate, Arc::new(EmptyExec::new(schema.clone())))?;
+
+    // Build a trivial subquery plan.
+    let subquery_plan = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
+        Field::new("x", DataType::Int64, true),
+    ]))));
+
+    let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
+        Arc::new(filter),
+        vec![ScalarSubqueryLink {
+            plan: subquery_plan,
+            index: 0,
+        }],
+        results,
+    ));
+
+    // Perform the round-trip using DeduplicatingProtoConverter, which
+    // creates a DeduplicatingDeserializer that threads scalar subquery
+    // results through expression deserialization.
+    let codec = DefaultPhysicalExtensionCodec {};
+    let converter = DeduplicatingProtoConverter {};
+    let bytes =
+        physical_plan_to_bytes_with_proto_converter(Arc::clone(&exec), &codec, &converter)?;
+    let ctx = SessionContext::new();
+    let deserialized = physical_plan_from_bytes_with_proto_converter(
+        bytes.as_ref(),
+        ctx.task_ctx().as_ref(),
+        &codec,
+        &converter,
+    )?;
+
+    // Verify the deserialized ScalarSubqueryExec's results container is
+    // shared with the ScalarSubqueryExpr in the input plan.
+    let sq_exec = deserialized
+        .as_any()
+        .downcast_ref::<ScalarSubqueryExec>()
+        .expect("expected ScalarSubqueryExec");
+    let exec_results = sq_exec.results();
+
+    // Walk the input plan to find the ScalarSubqueryExpr and verify it
+    // points to the same results container.
+    let filter_exec = sq_exec
+        .input()
+        .as_any()
+        .downcast_ref::<FilterExec>()
+        .expect("expected FilterExec");
+    let binary_expr = filter_exec
+        .predicate()
+        .as_any()
+        .downcast_ref::<BinaryExpr>()
+        .expect("expected BinaryExpr");
+    let deserialized_sq_expr = binary_expr
+        .right()
+        .as_any()
+        .downcast_ref::<ScalarSubqueryExpr>()
+        .expect("expected ScalarSubqueryExpr");
+
+    assert!(
+        Arc::ptr_eq(exec_results, deserialized_sq_expr.results()),
+        "ScalarSubqueryExpr should share the same results container as ScalarSubqueryExec"
+    );
+    Ok(())
 }

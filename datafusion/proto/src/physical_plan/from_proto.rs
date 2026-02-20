@@ -39,6 +39,7 @@ use datafusion_execution::{FunctionRegistry, TaskContext};
 use datafusion_expr::WindowFunctionDefinition;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::{LexOrdering, PhysicalSortExpr, ScalarFunctionExpr};
 use datafusion_physical_plan::expressions::{
     BinaryExpr, CaseExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, LikeExpr, Literal,
@@ -240,7 +241,7 @@ pub fn parse_physical_expr(
         ctx,
         input_schema,
         codec,
-        &DefaultPhysicalProtoConverter {},
+        &DefaultPhysicalProtoConverter::default(),
     )
 }
 
@@ -488,6 +489,28 @@ pub fn parse_physical_expr_with_converter(
                 on_columns,
                 SeededRandomState::with_seed(hash_expr.seed0),
                 hash_expr.description.clone(),
+            ))
+        }
+        ExprType::ScalarSubquery(sq) => {
+            let data_type: arrow::datatypes::DataType = sq
+                .data_type
+                .as_ref()
+                .ok_or_else(|| {
+                    proto_error("Missing data_type in PhysicalScalarSubqueryExprNode")
+                })?
+                .try_into()?;
+            // Use the results container from the converter if available
+            // (set by ScalarSubqueryExec deserialization), otherwise fall
+            // back to an empty placeholder for standalone expression
+            // deserialization.
+            let results = proto_converter
+                .scalar_subquery_results()
+                .unwrap_or_else(|| Arc::new(vec![]));
+            Arc::new(ScalarSubqueryExpr::new(
+                data_type,
+                sq.nullable,
+                sq.index as usize,
+                results,
             ))
         }
         ExprType::Extension(extension) => {

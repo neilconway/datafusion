@@ -297,3 +297,7 @@ required-features = ["parquet"]
 [[bench]]
 harness = false
 name = "reset_plan_states"
+
+[[bench]]
+harness = false
+name = "scalar_subquery_sql"

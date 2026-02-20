@@ -886,10 +886,12 @@ pub fn type_union_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
 /// For type unification contexts (see [`type_union_coercion`]), use
 /// [`type_union_coercion`] instead.
 ///
-/// Note: string-vs-numeric comparisons are *not* handled here. They are
-/// handled at the analyzer level (in the type coercion rule), which can
-/// inspect whether an operand is a literal. This allows `int_col < '5'`
-/// (cast the literal) while rejecting `text_col < 5` (type mismatch).
+/// Note: string-vs-numeric comparisons are handled here at the type level
+/// (via [`numeric_string_coercion`]), so that `Expr::get_type()` succeeds
+/// for expressions like `int_col < '5'` in projections. The analyzer's
+/// type coercion rule then enforces the literal-only policy: it allows
+/// `int_col < '5'` (cast the string literal) while rejecting
+/// `text_col < 5` or `text_col = int_col` (no implicit column cast).
 pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<DataType> {
     if lhs_type.equals_datatype(rhs_type) {
         // same type => equality is possible
@@ -902,6 +904,7 @@ pub fn comparison_coercion(lhs_type: &DataType, rhs_type: &DataType) -> Option<D
         .or_else(|| string_coercion(lhs_type, rhs_type))
         .or_else(|| list_coercion(lhs_type, rhs_type))
         .or_else(|| null_coercion(lhs_type, rhs_type))
+        .or_else(|| numeric_string_coercion(lhs_type, rhs_type))
         .or_else(|| string_temporal_coercion(lhs_type, rhs_type))
         .or_else(|| binary_coercion(lhs_type, rhs_type))
         .or_else(|| struct_coercion(lhs_type, rhs_type))

@@ -154,15 +154,6 @@ fn analyze_internal(
 /// literal's [`ScalarValue`] to the numeric type and return the rewritten
 /// expression. Returns `Ok(None)` when the rewrite does not apply, or `Err`
 /// when the literal cannot be cast (e.g., `'hello'` → `Int64`).
-///
-/// TODO: this function is called during the analyzer pass, but
-/// `Expr::get_type()` for `BinaryExpr` calls `BinaryTypeCoercer` (which
-/// uses `comparison_coercion`) *before* the analyzer runs. This means
-/// string-numeric comparisons in projection expressions (e.g.,
-/// `SELECT column1 < '5' FROM int_table`) fail at plan creation time
-/// because `Projection::try_new` computes the output schema via
-/// `Expr::get_type()`. The same comparison works in a WHERE clause
-/// because `Filter` does not eagerly compute the predicate's type.
 fn try_cast_string_literal_to_type(
     expr: &Expr,
     target_type: &DataType,
@@ -178,6 +169,25 @@ fn try_cast_string_literal_to_type(
     }
     let casted = scalar.cast_to(target_type)?;
     Ok(Some(Expr::Literal(casted, metadata.clone())))
+}
+
+/// Returns true if one type is a string type and the other is numeric,
+/// unwrapping Dictionary and RunEndEncoded wrappers to check value types.
+/// Used to reject comparisons like `text_col < 5` or `text_col = int_col`
+/// where no string literal was cast to a numeric type.
+fn is_string_numeric_mismatch(left: &DataType, right: &DataType) -> bool {
+    let left = value_type(left);
+    let right = value_type(right);
+    (left.is_string() && right.is_numeric()) || (left.is_numeric() && right.is_string())
+}
+
+/// Unwraps Dictionary and RunEndEncoded types to get the underlying value type.
+fn value_type(dt: &DataType) -> &DataType {
+    match dt {
+        DataType::Dictionary(_, v) => value_type(v.as_ref()),
+        DataType::RunEndEncoded(_, v) => value_type(v.data_type()),
+        other => other,
+    }
 }
 
 /// Rewrite expressions to apply type coercion.
@@ -643,6 +653,15 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                     let right_type = right.get_type(self.schema)?;
                     let new_left = try_cast_string_literal_to_type(&left, &right_type)?;
                     let new_right = try_cast_string_literal_to_type(&right, &left_type)?;
+                    if new_left.is_none()
+                        && new_right.is_none()
+                        && is_string_numeric_mismatch(&left_type, &right_type)
+                    {
+                        return plan_err!(
+                            "Cannot infer common argument type for comparison operation {} {} {}",
+                            left_type, op, right_type
+                        );
+                    }
                     (
                         new_left.map(Box::new).unwrap_or(left),
                         new_right.map(Box::new).unwrap_or(right),
@@ -681,13 +700,23 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                     .unwrap_or(expr);
                 let expr_type = expr.get_type(self.schema)?;
                 let low_type = low.get_type(self.schema)?;
+                let high_type = high.get_type(self.schema)?;
+                if is_string_numeric_mismatch(&expr_type, &low_type) {
+                    return plan_err!(
+                        "Failed to coerce types {expr_type} and {low_type} in BETWEEN expression"
+                    );
+                }
+                if is_string_numeric_mismatch(&expr_type, &high_type) {
+                    return plan_err!(
+                        "Failed to coerce types {expr_type} and {high_type} in BETWEEN expression"
+                    );
+                }
                 let low_coerced_type = comparison_coercion(&expr_type, &low_type)
                     .ok_or_else(|| {
                         plan_datafusion_err!(
                             "Failed to coerce types {expr_type} and {low_type} in BETWEEN expression"
                         )
                     })?;
-                let high_type = high.get_type(self.schema)?;
                 let high_coerced_type = comparison_coercion(&expr_type, &high_type)
                     .ok_or_else(|| {
                         plan_datafusion_err!(
@@ -754,6 +783,20 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 } else {
                     (expr, expr_data_type)
                 };
+                // Reject string-vs-numeric mismatches that were not
+                // resolved by literal casting above.
+                let has_string = list_data_types.iter().any(|dt| dt.is_string());
+                let has_numeric = list_data_types.iter().any(|dt| dt.is_numeric());
+                if has_string && has_numeric
+                    || list_data_types
+                        .iter()
+                        .any(|dt| is_string_numeric_mismatch(&expr_data_type, dt))
+                {
+                    return plan_err!(
+                        "Can not find compatible types to compare {expr_data_type} with [{}]",
+                        list_data_types.iter().join(", ")
+                    );
+                }
                 // Use comparison_coercion (not type_union_coercion) so
                 // that string-numeric mismatches that cannot be resolved
                 // by literal casting are rejected — consistent with

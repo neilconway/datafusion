@@ -792,28 +792,35 @@ fn test_decimal_cross_variant_comparison_coercion() -> Result<()> {
     Ok(())
 }
 
-/// Tests that `comparison_coercion` returns `None` for string-vs-numeric
-/// comparisons. String-numeric coercion for comparisons is handled at the
-/// analyzer level (literal-aware), not in the type coercion function.
+/// Tests that `comparison_coercion` returns the numeric type for
+/// string-vs-numeric comparisons. The analyzer enforces the literal-only
+/// policy (rejecting `text_col < 5`), while the type system allows the
+/// coercion so that `Expr::get_type()` succeeds in projections.
 #[test]
-fn test_comparison_coercion_rejects_string_numeric() {
-    assert_eq!(comparison_coercion(&DataType::Int32, &DataType::Utf8), None);
-    assert_eq!(comparison_coercion(&DataType::Utf8, &DataType::Int32), None);
+fn test_comparison_coercion_string_numeric() {
+    assert_eq!(
+        comparison_coercion(&DataType::Int32, &DataType::Utf8),
+        Some(DataType::Int32)
+    );
+    assert_eq!(
+        comparison_coercion(&DataType::Utf8, &DataType::Int32),
+        Some(DataType::Int32)
+    );
     assert_eq!(
         comparison_coercion(&DataType::Utf8, &DataType::Float64),
-        None
+        Some(DataType::Float64)
     );
     assert_eq!(
         comparison_coercion(&DataType::Float64, &DataType::Utf8),
-        None
+        Some(DataType::Float64)
     );
     assert_eq!(
         comparison_coercion(&DataType::Int64, &DataType::LargeUtf8),
-        None
+        Some(DataType::Int64)
     );
     assert_eq!(
         comparison_coercion(&DataType::Utf8View, &DataType::Int16),
-        None
+        Some(DataType::Int16)
     );
     // String-string stays string
     assert_eq!(
@@ -867,13 +874,11 @@ fn test_type_union_coercion_prefers_string() {
     );
 }
 
-/// Tests that comparison operators coerce to numeric when comparing
-/// numeric and string types.
+/// Tests that comparison operators coerce to the numeric type when
+/// comparing numeric and string types. The analyzer enforces the
+/// literal-only policy at a higher level.
 #[test]
 fn test_binary_comparison_string_numeric_coercion() -> Result<()> {
-    // String-vs-numeric comparisons are now handled at the analyzer level
-    // (literal-aware), not in the type coercion function. BinaryTypeCoercer
-    // should reject these combinations.
     let comparison_ops = [
         Operator::Eq,
         Operator::NotEq,
@@ -884,14 +889,19 @@ fn test_binary_comparison_string_numeric_coercion() -> Result<()> {
     ];
     for op in &comparison_ops {
         let result = BinaryTypeCoercer::new(&DataType::Int64, op, &DataType::Utf8)
-            .get_input_types();
-        assert!(result.is_err(), "Op {op}: Int64 vs Utf8 should be rejected");
+            .get_input_types()?;
+        assert_eq!(
+            result,
+            (DataType::Int64, DataType::Int64),
+            "Op {op}: Int64 vs Utf8 should coerce to Int64"
+        );
 
         let result = BinaryTypeCoercer::new(&DataType::Utf8, op, &DataType::Float64)
-            .get_input_types();
-        assert!(
-            result.is_err(),
-            "Op {op}: Utf8 vs Float64 should be rejected"
+            .get_input_types()?;
+        assert_eq!(
+            result,
+            (DataType::Float64, DataType::Float64),
+            "Op {op}: Utf8 vs Float64 should coerce to Float64"
         );
     }
     Ok(())

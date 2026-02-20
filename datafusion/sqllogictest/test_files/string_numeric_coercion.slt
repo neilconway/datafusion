@@ -328,8 +328,40 @@ SELECT * FROM t_mixed WHERE column2 IN (5, 10);
 statement error Failed to coerce types Utf8 and Int64 in BETWEEN expression
 SELECT * FROM t_mixed WHERE column2 BETWEEN 1 AND 10;
 
+# Projection: string column vs numeric literal should still error
+statement error Cannot infer common argument type for comparison operation
+SELECT column2 < 5 FROM t_mixed;
+
 statement ok
 DROP TABLE t_mixed;
+
+# -------------------------------------------------
+# Projection: comparison in SELECT list
+# (ensures string-numeric coercion works for projections,
+# not just WHERE clauses)
+# -------------------------------------------------
+
+query B rowsort
+SELECT column1 < '5' FROM t_int;
+----
+false
+false
+false
+false
+true
+
+query B rowsort
+SELECT column1 = '5' FROM t_int;
+----
+false
+false
+false
+false
+true
+
+# Projection: non-numeric string literal should still error
+statement error Arrow error: Cast error: Cannot cast string 'hello' to value of Int64 type
+SELECT column1 < 'hello' FROM t_int;
 
 # -------------------------------------------------
 # Cleanup

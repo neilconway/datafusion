@@ -593,6 +593,15 @@ fn get_valid_types(
             function_length_check(function_name, current_types.len(), *num)?;
             let mut target_type = current_types[0].to_owned();
             for data_type in current_types.iter().skip(1) {
+                // Reject string-vs-numeric comparisons in function arguments.
+                // comparison_coercion allows these at the type level (for
+                // projections), but functions cannot distinguish between
+                // literal and column arguments, so reject them here.
+                if is_string_numeric_mismatch(&target_type, data_type) {
+                    return plan_err!(
+                        "For function '{function_name}' {target_type} and {data_type} is not comparable"
+                    );
+                }
                 if let Some(dt) = comparison_coercion(&target_type, data_type) {
                     target_type = dt;
                 } else {
@@ -930,6 +939,16 @@ fn coerced_from<'a>(
         }
         _ => None,
     }
+}
+
+/// Returns true if one type is a string type and the other is numeric.
+fn is_string_numeric_mismatch(left: &DataType, right: &DataType) -> bool {
+    use arrow::datatypes::DataType::*;
+    matches!(
+        (left, right),
+        (Utf8 | LargeUtf8 | Utf8View, t) | (t, Utf8 | LargeUtf8 | Utf8View)
+            if t.is_numeric()
+    )
 }
 
 #[cfg(test)]

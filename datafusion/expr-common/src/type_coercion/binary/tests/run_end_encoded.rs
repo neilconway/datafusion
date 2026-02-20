@@ -47,7 +47,10 @@ fn test_ree_type_coercion() {
         Arc::new(Field::new("run_ends", Int8, false)),
         Arc::new(Field::new("values", Int16, false)),
     );
-    assert_eq!(ree_comparison_coercion(&lhs_type, &rhs_type, true), None);
+    assert_eq!(
+        ree_comparison_coercion(&lhs_type, &rhs_type, true),
+        Some(Int16)
+    );
 
     // Since we can coerce values of Utf8 to Binary can support this
     let lhs_type = RunEndEncoded(

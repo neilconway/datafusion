@@ -18,9 +18,10 @@
 use crate::var_provider::{VarProvider, VarType};
 use chrono::{DateTime, Utc};
 use datafusion_common::HashMap;
+use datafusion_common::ScalarValue;
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::ConfigOptions;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Holds per-query execution properties and data (such as statement
 /// starting timestamps).
@@ -42,6 +43,11 @@ pub struct ExecutionProps {
     pub config_options: Option<Arc<ConfigOptions>>,
     /// Providers for scalar variables
     pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
+    /// Pre-registered value slots for uncorrelated scalar subqueries.
+    /// Populated by the physical planner before calling `create_physical_expr`.
+    /// Each entry maps a subquery to a shared `OnceLock` that will be filled
+    /// at execution time by `ScalarSubqueryExec`.
+    pub scalar_subqueries: HashMap<crate::logical_plan::Subquery, Arc<OnceLock<ScalarValue>>>,
 }
 
 impl Default for ExecutionProps {
@@ -58,6 +64,7 @@ impl ExecutionProps {
             alias_generator: Arc::new(AliasGenerator::new()),
             config_options: None,
             var_providers: None,
+            scalar_subqueries: HashMap::new(),
         }
     }
 
@@ -126,7 +133,7 @@ mod test {
     fn debug() {
         let props = ExecutionProps::new();
         assert_eq!(
-            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None }",
+            "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None, scalar_subqueries: {} }",
             format!("{props:?}")
         );
     }

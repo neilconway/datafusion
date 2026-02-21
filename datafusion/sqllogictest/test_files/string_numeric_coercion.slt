@@ -332,6 +332,83 @@ statement ok
 DROP TABLE t_mixed;
 
 # -------------------------------------------------
+# Projection: comparison in SELECT list
+# (Previously failed because Projection::try_new computes output
+# schema via Expr::to_field, which calls BinaryTypeCoercer before
+# the analyzer can cast the string literal.)
+# -------------------------------------------------
+
+query B rowsort
+SELECT column1 < '5' FROM t_int;
+----
+false
+false
+false
+false
+true
+
+query B rowsort
+SELECT column1 = '5' FROM t_int;
+----
+false
+false
+false
+false
+true
+
+query B rowsort
+SELECT column1 > '100' FROM t_int;
+----
+false
+false
+true
+true
+true
+
+query B rowsort
+SELECT column1 < '5.0' FROM t_float;
+----
+false
+false
+false
+false
+true
+
+# Expression with alias
+query B rowsort
+SELECT column1 < '5' AS cmp FROM t_int;
+----
+false
+false
+false
+false
+true
+
+# Mixed projection: regular column + comparison
+query IB rowsort
+SELECT column1, column1 >= '100' FROM t_int;
+----
+1 false
+1000 true
+325 true
+499 true
+5 false
+
+# Non-numeric string literal should still error
+statement error Arrow error: Cast error: Cannot cast string 'hello' to value of Int64 type
+SELECT column1 < 'hello' FROM t_int;
+
+# String column vs numeric literal should still error
+statement ok
+CREATE TABLE t_mixed2 AS VALUES (1, 'hello');
+
+statement error Cannot infer common argument type for comparison operation
+SELECT column2 < 5 FROM t_mixed2;
+
+statement ok
+DROP TABLE t_mixed2;
+
+# -------------------------------------------------
 # Cleanup
 # -------------------------------------------------
 

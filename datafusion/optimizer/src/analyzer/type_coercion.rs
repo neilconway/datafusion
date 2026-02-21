@@ -154,15 +154,6 @@ fn analyze_internal(
 /// literal's [`ScalarValue`] to the numeric type and return the rewritten
 /// expression. Returns `Ok(None)` when the rewrite does not apply, or `Err`
 /// when the literal cannot be cast (e.g., `'hello'` → `Int64`).
-///
-/// TODO: this function is called during the analyzer pass, but
-/// `Expr::get_type()` for `BinaryExpr` calls `BinaryTypeCoercer` (which
-/// uses `comparison_coercion`) *before* the analyzer runs. This means
-/// string-numeric comparisons in projection expressions (e.g.,
-/// `SELECT column1 < '5' FROM int_table`) fail at plan creation time
-/// because `Projection::try_new` computes the output schema via
-/// `Expr::get_type()`. The same comparison works in a WHERE clause
-/// because `Filter` does not eagerly compute the predicate's type.
 fn try_cast_string_literal_to_type(
     expr: &Expr,
     target_type: &DataType,

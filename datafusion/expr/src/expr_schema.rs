@@ -32,6 +32,7 @@ use datafusion_common::{
     Column, DataFusionError, ExprSchema, Result, ScalarValue, Spans, TableReference,
     not_impl_err, plan_datafusion_err, plan_err,
 };
+use datafusion_expr_common::operator::Operator;
 use datafusion_expr_common::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_functions_window_common::field::WindowUDFFieldArgs;
 use std::sync::Arc;
@@ -481,6 +482,23 @@ impl ExprSchemable for Expr {
                     (left_field.data_type(), left_field.is_nullable());
                 let (rhs_type, rhs_nullable) =
                     (right_field.data_type(), right_field.is_nullable());
+
+                // When a string literal is compared to a numeric type, the
+                // analyzer will cast the literal to the numeric type.
+                // Return Boolean here so projection schema computation succeeds.
+                if is_string_literal_numeric_comparison(
+                    left, lhs_type, right, rhs_type, op,
+                ) {
+                    return Ok((
+                        relation,
+                        Arc::new(Field::new(
+                            &schema_name,
+                            DataType::Boolean,
+                            lhs_nullable || rhs_nullable,
+                        )),
+                    ));
+                }
+
                 let mut coercer = BinaryTypeCoercer::new(lhs_type, op, rhs_type);
                 coercer.set_lhs_spans(left.spans().cloned().unwrap_or_default());
                 coercer.set_rhs_spans(right.spans().cloned().unwrap_or_default());
@@ -695,6 +713,39 @@ pub fn cast_subquery(subquery: Subquery, cast_to_type: &DataType) -> Result<Subq
         outer_ref_columns: subquery.outer_ref_columns,
         spans: Spans::new(),
     })
+}
+
+/// Returns true when a comparison BinaryExpr has a string literal on one
+/// side and a numeric type on the other. In this case the analyzer will
+/// cast the string literal to the numeric type, so type inference should
+/// report Boolean without going through BinaryTypeCoercer (which would
+/// reject the Utf8-vs-numeric pair).
+fn is_string_literal_numeric_comparison(
+    left: &Expr,
+    left_type: &DataType,
+    right: &Expr,
+    right_type: &DataType,
+    op: &Operator,
+) -> bool {
+    if !matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+            | Operator::IsDistinctFrom
+            | Operator::IsNotDistinctFrom
+    ) {
+        return false;
+    }
+    (is_string_literal(left) && right_type.is_numeric())
+        || (is_string_literal(right) && left_type.is_numeric())
+}
+
+fn is_string_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Literal(scalar, _) if scalar.data_type().is_string())
 }
 
 #[cfg(test)]

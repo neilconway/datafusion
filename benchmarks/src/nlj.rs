@@ -56,6 +56,27 @@ pub struct RunOpt {
     output_path: Option<std::path::PathBuf>,
 }
 
+/// Setup SQL executed before benchmark queries. Creates tables needed by
+/// queries that require non-trivial column types (e.g., List(Utf8View)).
+const NLJ_SETUP: &[&str] = &[
+    // Build-side table with a List(Utf8View) column containing 100-element
+    // lists. Strings are >12 bytes so they are stored in data buffers rather
+    // than inlined in StringView metadata.
+    r#"
+        CREATE TABLE nlj_build_list_utf8view AS
+        WITH list_data AS (
+            SELECT array_agg(arrow_cast(
+                concat('string_value_', CAST(s.value AS VARCHAR),
+                       '_padding_for_buffer'),
+                'Utf8View'
+            )) as list_col
+            FROM range(100) AS s
+        )
+        SELECT t.value, list_data.list_col
+        FROM range(1000) AS t, list_data;
+    "#,
+];
+
 /// Inline SQL queries for NLJ benchmarks
 ///
 /// Each query's comment includes:
@@ -185,6 +206,15 @@ const NLJ_QUERIES: &[&str] = &[
             WHERE t2.k2 > t1.k1
         );
     "#,
+    // Q18: INNER 1K x 10K | LOW 0.1% | List(Utf8View) build-side column
+    // Exercises broadcasting of List(Utf8View) scalars via to_array_of_size.
+    // Requires setup table nlj_build_list_utf8view.
+    r#"
+        SELECT t1.list_col
+        FROM nlj_build_list_utf8view AS t1
+        JOIN range(10000) AS t2
+        ON (t1.value + t2.value) % 1000 = 0;
+    "#,
 ];
 
 impl RunOpt {
@@ -209,6 +239,10 @@ impl RunOpt {
         let config = self.common.config()?;
         let rt_builder = self.common.runtime_env_builder()?;
         let ctx = SessionContext::new_with_config_rt(config, rt_builder.build_arc()?);
+
+        for setup_sql in NLJ_SETUP {
+            ctx.sql(setup_sql).await?.collect().await?;
+        }
 
         let mut benchmark_run = BenchmarkRun::new();
         for query_id in query_range {

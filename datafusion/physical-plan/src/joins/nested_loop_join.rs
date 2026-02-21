@@ -2011,30 +2011,11 @@ fn build_row_join_batch(
             // Broadcast the single build-side row to match the filtered
             // probe-side batch length
             let original_left_array = build_side_batch.column(column_index.index);
-            // Avoid using `ScalarValue::to_array_of_size()` for `List(Utf8View)` to avoid
-            // deep copies for buffers inside `Utf8View` array. See below for details.
-            // https://github.com/apache/datafusion/issues/18159
-            //
-            // In other cases, `to_array_of_size()` is faster.
-            match original_left_array.data_type() {
-                DataType::List(field) | DataType::LargeList(field)
-                    if field.data_type() == &DataType::Utf8View =>
-                {
-                    let indices_iter = std::iter::repeat_n(
-                        build_side_index as u64,
-                        filtered_probe_batch.num_rows(),
-                    );
-                    let indices_array = UInt64Array::from_iter_values(indices_iter);
-                    take(original_left_array.as_ref(), &indices_array, None)?
-                }
-                _ => {
-                    let scalar_value = ScalarValue::try_from_array(
-                        original_left_array.as_ref(),
-                        build_side_index,
-                    )?;
-                    scalar_value.to_array_of_size(filtered_probe_batch.num_rows())?
-                }
-            }
+            let scalar_value = ScalarValue::try_from_array(
+                original_left_array.as_ref(),
+                build_side_index,
+            )?;
+            scalar_value.to_array_of_size(filtered_probe_batch.num_rows())?
         } else {
             // Take the filtered probe-side column using compute::take
             Arc::clone(filtered_probe_batch.column(column_index.index))

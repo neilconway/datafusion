@@ -16,13 +16,15 @@
 // under the License.
 
 use std::mem::size_of;
+use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayAccessor, ArrayDataBuilder, ByteView, LargeStringArray,
+    Array, ArrayAccessor, ArrayDataBuilder, ArrayRef, ByteView, LargeStringArray,
     NullBufferBuilder, StringArray, StringViewArray, StringViewBuilder, make_view,
 };
 use arrow::buffer::{MutableBuffer, NullBuffer};
 use arrow::datatypes::DataType;
+use datafusion_common::ScalarValue;
 
 /// Optimized version of the StringBuilder in Arrow that:
 /// 1. Precalculating the expected length of the result, avoiding reallocations.
@@ -292,6 +294,78 @@ impl LargeStringArrayBuilder {
         // and offsets were created correctly
         let array_data = unsafe { array_builder.build_unchecked() };
         LargeStringArray::from(array_data)
+    }
+}
+
+/// Return a null `ScalarValue` of the appropriate string type.
+pub fn typed_null_string(dt: &DataType) -> ScalarValue {
+    match dt {
+        DataType::Utf8View => ScalarValue::Utf8View(None),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(None),
+        _ => ScalarValue::Utf8(None),
+    }
+}
+
+/// Return a `ScalarValue` wrapping `s` in the appropriate string type.
+pub fn typed_string(dt: &DataType, s: String) -> ScalarValue {
+    match dt {
+        DataType::Utf8View => ScalarValue::Utf8View(Some(s)),
+        DataType::LargeUtf8 => ScalarValue::LargeUtf8(Some(s)),
+        _ => ScalarValue::Utf8(Some(s)),
+    }
+}
+
+/// Trait abstracting over the optimized columnar string builders which write
+/// directly from [`ColumnarValueRef`] slices with pre-calculated buffer sizes.
+pub trait ColumnarStringBuilder {
+    fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self;
+    fn write<const CHECK_VALID: bool>(&mut self, column: &ColumnarValueRef, i: usize);
+    fn append_offset(&mut self);
+    fn finish(self, null_buffer: Option<NullBuffer>) -> ArrayRef;
+}
+
+impl ColumnarStringBuilder for StringArrayBuilder {
+    fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
+        StringArrayBuilder::with_capacity(item_capacity, data_capacity)
+    }
+    fn write<const CHECK_VALID: bool>(&mut self, column: &ColumnarValueRef, i: usize) {
+        self.write::<CHECK_VALID>(column, i);
+    }
+    fn append_offset(&mut self) {
+        self.append_offset();
+    }
+    fn finish(self, null_buffer: Option<NullBuffer>) -> ArrayRef {
+        Arc::new(self.finish(null_buffer))
+    }
+}
+
+impl ColumnarStringBuilder for StringViewArrayBuilder {
+    fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
+        StringViewArrayBuilder::with_capacity(item_capacity, data_capacity)
+    }
+    fn write<const CHECK_VALID: bool>(&mut self, column: &ColumnarValueRef, i: usize) {
+        self.write::<CHECK_VALID>(column, i);
+    }
+    fn append_offset(&mut self) {
+        self.append_offset();
+    }
+    fn finish(self, null_buffer: Option<NullBuffer>) -> ArrayRef {
+        Arc::new(self.finish(null_buffer))
+    }
+}
+
+impl ColumnarStringBuilder for LargeStringArrayBuilder {
+    fn with_capacity(item_capacity: usize, data_capacity: usize) -> Self {
+        LargeStringArrayBuilder::with_capacity(item_capacity, data_capacity)
+    }
+    fn write<const CHECK_VALID: bool>(&mut self, column: &ColumnarValueRef, i: usize) {
+        self.write::<CHECK_VALID>(column, i);
+    }
+    fn append_offset(&mut self) {
+        self.append_offset();
+    }
+    fn finish(self, null_buffer: Option<NullBuffer>) -> ArrayRef {
+        Arc::new(self.finish(null_buffer))
     }
 }
 

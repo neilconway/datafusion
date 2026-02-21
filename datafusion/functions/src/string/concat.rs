@@ -19,11 +19,11 @@ use arrow::array::{Array, as_largestring_array};
 use arrow::datatypes::DataType;
 use datafusion_expr::sort_properties::ExprProperties;
 use std::any::Any;
-use std::sync::Arc;
 
 use crate::string::concat;
 use crate::strings::{
-    ColumnarValueRef, LargeStringArrayBuilder, StringArrayBuilder, StringViewArrayBuilder,
+    ColumnarStringBuilder, ColumnarValueRef, LargeStringArrayBuilder, StringArrayBuilder,
+    StringViewArrayBuilder, typed_string,
 };
 use datafusion_common::cast::{as_string_array, as_string_view_array};
 use datafusion_common::{Result, ScalarValue, internal_err, plan_err};
@@ -140,20 +140,10 @@ impl ScalarUDFImpl for ConcatFunc {
             }
             let result = values.concat();
 
-            return match return_datatype {
-                DataType::Utf8View => {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Utf8View(Some(result))))
-                }
-                DataType::Utf8 => {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(result))))
-                }
-                DataType::LargeUtf8 => {
-                    Ok(ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(result))))
-                }
-                other => {
-                    plan_err!("Concat function does not support datatype of {other}")
-                }
-            };
+            return Ok(ColumnarValue::Scalar(typed_string(
+                &return_datatype,
+                result,
+            )));
         }
 
         // Array
@@ -221,45 +211,15 @@ impl ScalarUDFImpl for ConcatFunc {
             }
         }
 
-        match return_datatype {
-            DataType::Utf8 => {
-                let mut builder = StringArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    columns
-                        .iter()
-                        .for_each(|column| builder.write::<true>(column, i));
-                    builder.append_offset();
-                }
-
-                let string_array = builder.finish(None);
-                Ok(ColumnarValue::Array(Arc::new(string_array)))
-            }
+        Ok(match return_datatype {
             DataType::Utf8View => {
-                let mut builder = StringViewArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    columns
-                        .iter()
-                        .for_each(|column| builder.write::<true>(column, i));
-                    builder.append_offset();
-                }
-
-                let string_array = builder.finish(None);
-                Ok(ColumnarValue::Array(Arc::new(string_array)))
+                build_concat_array::<StringViewArrayBuilder>(len, data_size, &columns)
             }
             DataType::LargeUtf8 => {
-                let mut builder = LargeStringArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    columns
-                        .iter()
-                        .for_each(|column| builder.write::<true>(column, i));
-                    builder.append_offset();
-                }
-
-                let string_array = builder.finish(None);
-                Ok(ColumnarValue::Array(Arc::new(string_array)))
+                build_concat_array::<LargeStringArrayBuilder>(len, data_size, &columns)
             }
-            _ => unreachable!(),
-        }
+            _ => build_concat_array::<StringArrayBuilder>(len, data_size, &columns),
+        })
     }
 
     /// Simplify the `concat` function by
@@ -285,6 +245,22 @@ impl ScalarUDFImpl for ConcatFunc {
     fn preserves_lex_ordering(&self, _inputs: &[ExprProperties]) -> Result<bool> {
         Ok(true)
     }
+}
+
+/// Build the output array for `concat` using a generic builder.
+fn build_concat_array<B: ColumnarStringBuilder>(
+    len: usize,
+    data_size: usize,
+    columns: &[ColumnarValueRef],
+) -> ColumnarValue {
+    let mut builder = B::with_capacity(len, data_size);
+    for i in 0..len {
+        columns
+            .iter()
+            .for_each(|column| builder.write::<true>(column, i));
+        builder.append_offset();
+    }
+    ColumnarValue::Array(builder.finish(None))
 }
 
 pub(crate) fn simplify_concat(args: Vec<Expr>) -> Result<ExprSimplifyResult> {
@@ -331,14 +307,7 @@ pub(crate) fn simplify_concat(args: Vec<Expr>) -> Result<ExprSimplifyResult> {
             // Then pushing this arg to the `new_args`.
             arg => {
                 if !contiguous_scalar.is_empty() {
-                    match return_type {
-                        DataType::Utf8 => new_args.push(lit(contiguous_scalar)),
-                        DataType::LargeUtf8 => new_args
-                            .push(lit(ScalarValue::LargeUtf8(Some(contiguous_scalar)))),
-                        DataType::Utf8View => new_args
-                            .push(lit(ScalarValue::Utf8View(Some(contiguous_scalar)))),
-                        _ => unreachable!(),
-                    }
+                    new_args.push(lit(typed_string(&return_type, contiguous_scalar)));
                     contiguous_scalar = "".to_string();
                 }
                 new_args.push(arg);
@@ -347,16 +316,7 @@ pub(crate) fn simplify_concat(args: Vec<Expr>) -> Result<ExprSimplifyResult> {
     }
 
     if !contiguous_scalar.is_empty() {
-        match return_type {
-            DataType::Utf8 => new_args.push(lit(contiguous_scalar)),
-            DataType::LargeUtf8 => {
-                new_args.push(lit(ScalarValue::LargeUtf8(Some(contiguous_scalar))))
-            }
-            DataType::Utf8View => {
-                new_args.push(lit(ScalarValue::Utf8View(Some(contiguous_scalar))))
-            }
-            _ => unreachable!(),
-        }
+        new_args.push(lit(typed_string(&return_type, contiguous_scalar)));
     }
 
     if !args.eq(&new_args) {
@@ -380,6 +340,7 @@ mod tests {
     use arrow::array::{ArrayRef, StringArray};
     use arrow::datatypes::Field;
     use datafusion_common::config::ConfigOptions;
+    use std::sync::Arc;
 
     #[test]
     fn test_functions() -> Result<()> {

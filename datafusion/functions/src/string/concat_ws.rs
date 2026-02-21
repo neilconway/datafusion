@@ -17,7 +17,6 @@
 
 use arrow::array::Array;
 use std::any::Any;
-use std::sync::Arc;
 
 use arrow::datatypes::DataType;
 
@@ -25,7 +24,8 @@ use crate::string::concat;
 use crate::string::concat::simplify_concat;
 use crate::string::concat_ws;
 use crate::strings::{
-    ColumnarValueRef, LargeStringArrayBuilder, StringArrayBuilder, StringViewArrayBuilder,
+    ColumnarStringBuilder, ColumnarValueRef, LargeStringArrayBuilder, StringArrayBuilder,
+    StringViewArrayBuilder, typed_null_string, typed_string,
 };
 use datafusion_common::cast::{
     as_large_string_array, as_string_array, as_string_view_array,
@@ -150,15 +150,9 @@ impl ScalarUDFImpl for ConcatWsFunc {
                 Some(Some(s)) => s,
                 Some(None) => {
                     // null literal string
-                    return match return_datatype {
-                        DataType::Utf8View => {
-                            Ok(ColumnarValue::Scalar(ScalarValue::Utf8View(None)))
-                        }
-                        DataType::LargeUtf8 => {
-                            Ok(ColumnarValue::Scalar(ScalarValue::LargeUtf8(None)))
-                        }
-                        _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-                    };
+                    return Ok(ColumnarValue::Scalar(typed_null_string(
+                        &return_datatype,
+                    )));
                 }
                 None => return internal_err!("Expected string literal, got {scalar:?}"),
             };
@@ -179,15 +173,10 @@ impl ScalarUDFImpl for ConcatWsFunc {
             }
             let result = values.join(sep);
 
-            return match return_datatype {
-                DataType::Utf8View => {
-                    Ok(ColumnarValue::Scalar(ScalarValue::Utf8View(Some(result))))
-                }
-                DataType::LargeUtf8 => {
-                    Ok(ColumnarValue::Scalar(ScalarValue::LargeUtf8(Some(result))))
-                }
-                _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(result)))),
-            };
+            return Ok(ColumnarValue::Scalar(typed_string(
+                &return_datatype,
+                result,
+            )));
         }
 
         // Array
@@ -202,15 +191,9 @@ impl ScalarUDFImpl for ConcatWsFunc {
                     ColumnarValueRef::Scalar(s.as_bytes())
                 }
                 Some(None) => {
-                    return match return_datatype {
-                        DataType::Utf8View => {
-                            Ok(ColumnarValue::Scalar(ScalarValue::Utf8View(None)))
-                        }
-                        DataType::LargeUtf8 => {
-                            Ok(ColumnarValue::Scalar(ScalarValue::LargeUtf8(None)))
-                        }
-                        _ => Ok(ColumnarValue::Scalar(ScalarValue::Utf8(None))),
-                    };
+                    return Ok(ColumnarValue::Scalar(typed_null_string(
+                        &return_datatype,
+                    )));
                 }
                 None => {
                     return internal_err!("Expected string separator, got {scalar:?}");
@@ -314,71 +297,17 @@ impl ScalarUDFImpl for ConcatWsFunc {
             }
         }
 
-        match return_datatype {
-            DataType::Utf8View => {
-                let mut builder = StringViewArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    if !sep.is_valid(i) {
-                        builder.append_offset();
-                        continue;
-                    }
-                    let mut first = true;
-                    for column in &columns {
-                        if column.is_valid(i) {
-                            if !first {
-                                builder.write::<false>(&sep, i);
-                            }
-                            builder.write::<false>(column, i);
-                            first = false;
-                        }
-                    }
-                    builder.append_offset();
-                }
-                Ok(ColumnarValue::Array(Arc::new(builder.finish(sep.nulls()))))
-            }
-            DataType::LargeUtf8 => {
-                let mut builder = LargeStringArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    if !sep.is_valid(i) {
-                        builder.append_offset();
-                        continue;
-                    }
-                    let mut first = true;
-                    for column in &columns {
-                        if column.is_valid(i) {
-                            if !first {
-                                builder.write::<false>(&sep, i);
-                            }
-                            builder.write::<false>(column, i);
-                            first = false;
-                        }
-                    }
-                    builder.append_offset();
-                }
-                Ok(ColumnarValue::Array(Arc::new(builder.finish(sep.nulls()))))
-            }
-            _ => {
-                let mut builder = StringArrayBuilder::with_capacity(len, data_size);
-                for i in 0..len {
-                    if !sep.is_valid(i) {
-                        builder.append_offset();
-                        continue;
-                    }
-                    let mut first = true;
-                    for column in &columns {
-                        if column.is_valid(i) {
-                            if !first {
-                                builder.write::<false>(&sep, i);
-                            }
-                            builder.write::<false>(column, i);
-                            first = false;
-                        }
-                    }
-                    builder.append_offset();
-                }
-                Ok(ColumnarValue::Array(Arc::new(builder.finish(sep.nulls()))))
-            }
-        }
+        Ok(match return_datatype {
+            DataType::Utf8View => build_concat_ws_array::<StringViewArrayBuilder>(
+                len, data_size, &sep, &columns,
+            ),
+            DataType::LargeUtf8 => build_concat_ws_array::<LargeStringArrayBuilder>(
+                len, data_size, &sep, &columns,
+            ),
+            _ => build_concat_ws_array::<StringArrayBuilder>(
+                len, data_size, &sep, &columns,
+            ),
+        })
     }
 
     /// Simply the `concat_ws` function by
@@ -402,6 +331,34 @@ impl ScalarUDFImpl for ConcatWsFunc {
     }
 }
 
+/// Build the output array for `concat_ws` using a generic builder.
+fn build_concat_ws_array<B: ColumnarStringBuilder>(
+    len: usize,
+    data_size: usize,
+    sep: &ColumnarValueRef,
+    columns: &[ColumnarValueRef],
+) -> ColumnarValue {
+    let mut builder = B::with_capacity(len, data_size);
+    for i in 0..len {
+        if !sep.is_valid(i) {
+            builder.append_offset();
+            continue;
+        }
+        let mut first = true;
+        for column in columns {
+            if column.is_valid(i) {
+                if !first {
+                    builder.write::<false>(sep, i);
+                }
+                builder.write::<false>(column, i);
+                first = false;
+            }
+        }
+        builder.append_offset();
+    }
+    ColumnarValue::Array(builder.finish(sep.nulls()))
+}
+
 fn simplify_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<ExprSimplifyResult> {
     // Preserve the delimiter's string type for any new literals produced
     // during simplification.
@@ -410,13 +367,7 @@ fn simplify_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<ExprSimplifyRes
         _ => DataType::Utf8,
     };
 
-    let typed_lit = |s: String| -> Expr {
-        match delimiter_type {
-            DataType::LargeUtf8 => lit(ScalarValue::LargeUtf8(Some(s))),
-            DataType::Utf8View => lit(ScalarValue::Utf8View(Some(s))),
-            _ => lit(s),
-        }
-    };
+    let typed_lit = |s: String| -> Expr { lit(typed_string(&delimiter_type, s)) };
 
     match delimiter {
         Expr::Literal(
@@ -496,17 +447,10 @@ fn simplify_concat_ws(delimiter: &Expr, args: &[Expr]) -> Result<ExprSimplifyRes
                     )))
                 }
                 // If the delimiter is null, then the value of the whole expression is null.
-                None => {
-                    let null_scalar = match delimiter_type {
-                        DataType::LargeUtf8 => ScalarValue::LargeUtf8(None),
-                        DataType::Utf8View => ScalarValue::Utf8View(None),
-                        _ => ScalarValue::Utf8(None),
-                    };
-                    Ok(ExprSimplifyResult::Simplified(Expr::Literal(
-                        null_scalar,
-                        None,
-                    )))
-                }
+                None => Ok(ExprSimplifyResult::Simplified(Expr::Literal(
+                    typed_null_string(&delimiter_type),
+                    None,
+                ))),
             }
         }
         Expr::Literal(d, _) => internal_err!(

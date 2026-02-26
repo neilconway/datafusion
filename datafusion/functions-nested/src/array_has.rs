@@ -304,6 +304,14 @@ impl<'a> ArrayWrapper<'a> {
         }
     }
 
+    fn is_null(&self, i: usize) -> bool {
+        match self {
+            ArrayWrapper::FixedSizeList(arr) => arr.is_null(i),
+            ArrayWrapper::List(arr) => arr.is_null(i),
+            ArrayWrapper::LargeList(arr) => arr.is_null(i),
+        }
+    }
+
     fn offsets(&self) -> Box<dyn Iterator<Item = usize> + 'a> {
         match self {
             ArrayWrapper::FixedSizeList(arr) => {
@@ -453,24 +461,24 @@ fn array_has_all_and_any_string_internal<'a>(
     needle: ArrayWrapper<'a>,
     comparison_type: ComparisonType,
 ) -> Result<ArrayRef> {
+    let haystack_all = string_array_to_vec(haystack.values().as_ref());
+    let needle_all = string_array_to_vec(needle.values().as_ref());
+
     let mut boolean_builder = BooleanArray::builder(haystack.len());
-    for (arr, sub_arr) in haystack.iter().zip(needle.iter()) {
-        match (arr, sub_arr) {
-            (Some(arr), Some(sub_arr)) => {
-                let haystack_array = string_array_to_vec(&arr);
-                let needle_array = string_array_to_vec(&sub_arr);
-                boolean_builder.append_value(array_has_string_kernel(
-                    &haystack_array,
-                    &needle_array,
-                    comparison_type,
-                ));
-            }
-            (_, _) => {
-                boolean_builder.append_null();
-            }
+    let h_offsets: Vec<usize> = haystack.offsets().collect();
+    let n_offsets: Vec<usize> = needle.offsets().collect();
+
+    for i in 0..haystack.len() {
+        if haystack.is_null(i) || needle.is_null(i) {
+            boolean_builder.append_null();
+        } else {
+            boolean_builder.append_value(array_has_string_kernel(
+                &haystack_all[h_offsets[i]..h_offsets[i + 1]],
+                &needle_all[n_offsets[i]..n_offsets[i + 1]],
+                comparison_type,
+            ));
         }
     }
-
     Ok(Arc::new(boolean_builder.finish()))
 }
 

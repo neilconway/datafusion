@@ -58,7 +58,7 @@ pub struct ScalarSubqueryExec {
     /// Shared one-time async computation of subquery results.
     subquery_results: Arc<OnceAsync<Vec<ScalarValue>>>,
     /// Cached plan properties (copied from input).
-    cache: PlanProperties,
+    cache: Arc<PlanProperties>,
 }
 
 impl ScalarSubqueryExec {
@@ -108,7 +108,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
 

@@ -42,6 +42,7 @@ use crate::utils::make_scalar_function;
 
 use hashbrown::HashSet;
 use std::any::Any;
+use std::ops::Range;
 use std::sync::Arc;
 
 // Create static instances of ScalarUDFs for each function
@@ -416,24 +417,45 @@ fn general_array_has_for_all_and_any<'a>(
     needle: ArrayWrapper<'a>,
     comparison_type: ComparisonType,
 ) -> Result<ArrayRef> {
-    let mut boolean_builder = BooleanArray::builder(haystack.len());
+    let num_rows = haystack.len();
     let converter = RowConverter::new(vec![SortField::new(haystack.value_type())])?;
 
-    for (arr, sub_arr) in haystack.iter().zip(needle.iter()) {
-        if let (Some(arr), Some(sub_arr)) = (arr, sub_arr) {
-            let arr_values = converter.convert_columns(&[arr])?;
-            let sub_arr_values = converter.convert_columns(&[sub_arr])?;
-            boolean_builder.append_value(general_array_has_all_and_any_kernel(
-                &arr_values,
-                &sub_arr_values,
-                comparison_type,
-            ));
-        } else {
-            boolean_builder.append_null();
+    let h_offsets: Vec<usize> = haystack.offsets().collect();
+    let n_offsets: Vec<usize> = needle.offsets().collect();
+
+    // For sliced ListArrays, values() returns the full underlying buffer
+    // but offsets start at a non-zero position. Slice to the visible range
+    // so we only convert the elements we actually need.
+    let h_base = h_offsets[0];
+    let n_base = n_offsets[0];
+    let h_vals = haystack.values().slice(h_base, h_offsets[num_rows] - h_base);
+    let n_vals = needle.values().slice(n_base, n_offsets[num_rows] - n_base);
+
+    // Bulk-convert all haystack and needle values to rows up front
+    let all_h_rows = converter.convert_columns(&[h_vals])?;
+    let all_n_rows = converter.convert_columns(&[n_vals])?;
+
+    let h_nulls = haystack.nulls();
+    let n_nulls = needle.nulls();
+    let mut builder = BooleanArray::builder(num_rows);
+
+    for i in 0..num_rows {
+        if h_nulls.is_some_and(|n| n.is_null(i))
+            || n_nulls.is_some_and(|n| n.is_null(i))
+        {
+            builder.append_null();
+            continue;
         }
+        builder.append_value(general_array_has_all_and_any_kernel(
+            &all_h_rows,
+            (h_offsets[i] - h_base)..(h_offsets[i + 1] - h_base),
+            &all_n_rows,
+            (n_offsets[i] - n_base)..(n_offsets[i + 1] - n_base),
+            comparison_type,
+        ));
     }
 
-    Ok(Arc::new(boolean_builder.finish()))
+    Ok(Arc::new(builder.finish()))
 }
 
 // String comparison for array_has_all and array_has_any
@@ -442,25 +464,46 @@ fn array_has_all_and_any_string_internal<'a>(
     needle: ArrayWrapper<'a>,
     comparison_type: ComparisonType,
 ) -> Result<ArrayRef> {
-    let mut boolean_builder = BooleanArray::builder(haystack.len());
-    for (arr, sub_arr) in haystack.iter().zip(needle.iter()) {
-        match (arr, sub_arr) {
-            (Some(arr), Some(sub_arr)) => {
-                let haystack_array = string_array_to_vec(&arr);
-                let needle_array = string_array_to_vec(&sub_arr);
-                boolean_builder.append_value(array_has_string_kernel(
-                    &haystack_array,
-                    &needle_array,
-                    comparison_type,
-                ));
-            }
-            (_, _) => {
-                boolean_builder.append_null();
-            }
+    let num_rows = haystack.len();
+
+    let h_offsets: Vec<usize> = haystack.offsets().collect();
+    let n_offsets: Vec<usize> = needle.offsets().collect();
+
+    // For sliced ListArrays, values() returns the full underlying buffer
+    // but offsets start at a non-zero position. Slice to the visible range
+    // so we only convert the elements we actually need.
+    let h_base = h_offsets[0];
+    let n_base = n_offsets[0];
+    let h_vals = haystack.values().slice(h_base, h_offsets[num_rows] - h_base);
+    let n_vals = needle.values().slice(n_base, n_offsets[num_rows] - n_base);
+
+    // One-time Vec allocation on visible values only
+    let all_h_strings = string_array_to_vec(h_vals.as_ref());
+    let all_n_strings = string_array_to_vec(n_vals.as_ref());
+
+    let h_nulls = haystack.nulls();
+    let n_nulls = needle.nulls();
+    let mut builder = BooleanArray::builder(num_rows);
+
+    for i in 0..num_rows {
+        if h_nulls.is_some_and(|n| n.is_null(i))
+            || n_nulls.is_some_and(|n| n.is_null(i))
+        {
+            builder.append_null();
+            continue;
         }
+        let h_start = h_offsets[i] - h_base;
+        let h_end = h_offsets[i + 1] - h_base;
+        let n_start = n_offsets[i] - n_base;
+        let n_end = n_offsets[i + 1] - n_base;
+        builder.append_value(array_has_string_kernel(
+            &all_h_strings[h_start..h_end],
+            &all_n_strings[n_start..n_end],
+            comparison_type,
+        ));
     }
 
-    Ok(Arc::new(boolean_builder.finish()))
+    Ok(Arc::new(builder.finish()))
 }
 
 fn array_has_all_and_any_dispatch<'a>(
@@ -893,19 +936,19 @@ fn array_has_string_kernel(
 
 fn general_array_has_all_and_any_kernel(
     haystack_rows: &Rows,
+    h_range: Range<usize>,
     needle_rows: &Rows,
+    n_range: Range<usize>,
     comparison_type: ComparisonType,
 ) -> bool {
     match comparison_type {
-        ComparisonType::All => needle_rows.iter().all(|needle_row| {
-            haystack_rows
-                .iter()
-                .any(|haystack_row| haystack_row == needle_row)
+        ComparisonType::All => n_range.clone().all(|ni| {
+            let needle_row = needle_rows.row(ni);
+            h_range.clone().any(|hi| haystack_rows.row(hi) == needle_row)
         }),
-        ComparisonType::Any => needle_rows.iter().any(|needle_row| {
-            haystack_rows
-                .iter()
-                .any(|haystack_row| haystack_row == needle_row)
+        ComparisonType::Any => n_range.clone().any(|ni| {
+            let needle_row = needle_rows.row(ni);
+            h_range.clone().any(|hi| haystack_rows.row(hi) == needle_row)
         }),
     }
 }
@@ -931,7 +974,7 @@ mod tests {
 
     use crate::expr_fn::make_array;
 
-    use super::ArrayHas;
+    use super::{ArrayHas, ArrayHasAll, ArrayHasAny};
 
     #[test]
     fn test_simplify_array_has_to_in_list() {
@@ -1092,6 +1135,97 @@ mod tests {
         for i in 0..3 {
             assert!(output.is_null(i));
         }
+
+        Ok(())
+    }
+
+    /// Test that array_has_all and array_has_any produce correct results
+    /// when the haystack is a sliced ListArray. Slicing a ListArray
+    /// preserves the full underlying values buffer but shifts the offsets,
+    /// so the bulk-conversion path must handle non-zero starting offsets.
+    #[test]
+    fn test_array_has_all_sliced_list() -> Result<(), DataFusionError> {
+        // Build a ListArray with 4 rows, each containing 2 i32 elements:
+        //   row 0: [10, 20]
+        //   row 1: [30, 40]
+        //   row 2: [50, 60]
+        //   row 3: [70, 80]
+        let values = Arc::new(Int32Array::from(vec![10, 20, 30, 40, 50, 60, 70, 80]));
+        let offsets = OffsetBuffer::new(vec![0, 2, 4, 6, 8].into());
+        let field: Arc<Field> = Arc::new(Field::new("item", DataType::Int32, false));
+        let full = ListArray::new(Arc::clone(&field), offsets, values, None);
+
+        // Slice to rows 1..3 → [[30, 40], [50, 60]]
+        let sliced_haystack: ArrayRef = Arc::new(full.slice(1, 2));
+
+        // Build a needle ListArray with 2 rows:
+        //   row 0: [30, 40]  (matches haystack row 0 after slice)
+        //   row 1: [50, 60]  (matches haystack row 1 after slice)
+        let needle_values =
+            Arc::new(Int32Array::from(vec![30, 40, 50, 60]));
+        let needle_offsets = OffsetBuffer::new(vec![0, 2, 4].into());
+        let needle: ArrayRef = Arc::new(ListArray::new(
+            field,
+            needle_offsets,
+            needle_values,
+            None,
+        ));
+
+        let list_type = sliced_haystack.data_type().clone();
+        let haystack_field =
+            Arc::new(Field::new("haystack", list_type.clone(), false));
+        let needle_field = Arc::new(Field::new("needle", list_type, false));
+        let return_field =
+            Arc::new(Field::new("return", DataType::Boolean, true));
+        let config_options = Arc::new(ConfigOptions::default());
+
+        // array_has_all: every needle element should be found in haystack
+        let result = ArrayHasAll::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(Arc::clone(&sliced_haystack)),
+                ColumnarValue::Array(Arc::clone(&needle)),
+            ],
+            arg_fields: vec![
+                Arc::clone(&haystack_field),
+                Arc::clone(&needle_field),
+            ],
+            number_rows: 2,
+            return_field: Arc::clone(&return_field),
+            config_options: Arc::clone(&config_options),
+        })?;
+
+        let output = result.into_array(2)?;
+        let output = output.as_boolean();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output.value(0), true); // [30,40] has all of [30,40]
+        assert_eq!(output.value(1), true); // [50,60] has all of [50,60]
+
+        // array_has_any: with a needle that doesn't match, should return false
+        let no_match_values = Arc::new(Int32Array::from(vec![99, 100, 99, 100]));
+        let no_match_offsets = OffsetBuffer::new(vec![0, 2, 4].into());
+        let no_match_needle: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Int32, false)),
+            no_match_offsets,
+            no_match_values,
+            None,
+        ));
+
+        let result = ArrayHasAny::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(sliced_haystack),
+                ColumnarValue::Array(no_match_needle),
+            ],
+            arg_fields: vec![haystack_field, needle_field],
+            number_rows: 2,
+            return_field,
+            config_options,
+        })?;
+
+        let output = result.into_array(2)?;
+        let output = output.as_boolean();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output.value(0), false); // [30,40] has none of [99,100]
+        assert_eq!(output.value(1), false); // [50,60] has none of [99,100]
 
         Ok(())
     }

@@ -937,15 +937,15 @@ fn general_array_has_all_and_any_kernel(
     haystack_rows: &Rows,
     h_range: Range<usize>,
     needle_rows: &Rows,
-    n_range: Range<usize>,
+    mut n_range: Range<usize>,
     comparison_type: ComparisonType,
 ) -> bool {
     match comparison_type {
-        ComparisonType::All => n_range.clone().all(|ni| {
+        ComparisonType::All => n_range.all(|ni| {
             let needle_row = needle_rows.row(ni);
             h_range.clone().any(|hi| haystack_rows.row(hi) == needle_row)
         }),
-        ComparisonType::Any => n_range.clone().any(|ni| {
+        ComparisonType::Any => n_range.any(|ni| {
             let needle_row = needle_rows.row(ni);
             h_range.clone().any(|hi| haystack_rows.row(hi) == needle_row)
         }),

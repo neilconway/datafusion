@@ -36,9 +36,9 @@ use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
 use datafusion_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, expr};
 
-/// Optimizer rule for rewriting correlated scalar subquery filters to joins
-/// and places additional projection on top of the filter, to preserve
-/// original schema.
+/// Optimizer rule that rewrites correlated scalar subquery filters to joins and
+/// places an additional projection on top of the filter, to preserve original
+/// schema.
 #[derive(Default, Debug)]
 pub struct ScalarSubqueryToJoin {}
 
@@ -48,10 +48,14 @@ impl ScalarSubqueryToJoin {
         Self::default()
     }
 
-    /// Finds expressions that have a scalar subquery in them (and recurses when found)
+    /// Finds expressions that contain scalar subqueries (and recurses when found)
     ///
     /// # Arguments
-    /// * `predicate` - A conjunction to split and search
+    /// * `predicate` - A conjunction to split and search.
+    /// * `alias_gen` - Generator used to produce unique aliases for each
+    ///   extracted scalar subquery (e.g. `__scalar_sq_1`, `__scalar_sq_2`).
+    ///   Each subquery is replaced by a column reference using the generated
+    ///   alias, and the same alias is later used to construct the join.
     ///
     /// Returns a tuple (subqueries, alias)
     fn extract_subquery_exprs(
@@ -222,10 +226,9 @@ impl OptimizerRule for ScalarSubqueryToJoin {
     }
 }
 
-/// Returns true if the expression has a correlated scalar subquery
-/// (one with outer reference columns) somewhere in it, false otherwise.
-/// Uncorrelated scalar subqueries are handled by the physical planner
-/// via `ScalarSubqueryExec` and do not need to be converted to joins.
+/// Returns true if the expression contains a correlated scalar subquery, false
+/// otherwise.  Uncorrelated scalar subqueries are handled by the physical
+/// planner via `ScalarSubqueryExec` and do not need to be converted to joins.
 fn contains_scalar_subquery(expr: &Expr) -> bool {
     expr.exists(|expr| {
         Ok(matches!(expr, Expr::ScalarSubquery(sq) if !sq.outer_ref_columns.is_empty()))
@@ -243,6 +246,7 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
 
     fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
         match expr {
+            // Skip uncorrelated scalar subqueries
             Expr::ScalarSubquery(ref subquery)
                 if !subquery.outer_ref_columns.is_empty() =>
             {

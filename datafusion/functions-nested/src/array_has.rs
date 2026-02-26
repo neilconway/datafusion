@@ -477,7 +477,6 @@ fn array_has_all_and_any_string_internal<'a>(
     let h_vals = haystack.values().slice(h_base, h_offsets[num_rows] - h_base);
     let n_vals = needle.values().slice(n_base, n_offsets[num_rows] - n_base);
 
-    // One-time Vec allocation on visible values only
     let all_h_strings = string_array_to_vec(h_vals.as_ref());
     let all_n_strings = string_array_to_vec(n_vals.as_ref());
 

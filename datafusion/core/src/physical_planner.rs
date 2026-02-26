@@ -1408,8 +1408,8 @@ impl DefaultPhysicalPlanner {
                         (
                             true,
                             LogicalPlan::Projection(Projection { input, expr, .. }),
-                        ) => self.create_project_physical_exec(
-                            session_state,
+                        ) => self.create_project_physical_exec_with_props(
+                            execution_props,
                             physical_left,
                             input,
                             expr,
@@ -1421,8 +1421,8 @@ impl DefaultPhysicalPlanner {
                         (
                             true,
                             LogicalPlan::Projection(Projection { input, expr, .. }),
-                        ) => self.create_project_physical_exec(
-                            session_state,
+                        ) => self.create_project_physical_exec_with_props(
+                            execution_props,
                             physical_right,
                             input,
                             expr,
@@ -1788,7 +1788,12 @@ impl DefaultPhysicalPlanner {
                 // If plan was mutated previously then need to create the ExecutionPlan
                 // for the new Projection that was applied on top.
                 let join = if let Some((input, expr)) = new_project {
-                    self.create_project_physical_exec(session_state, join, input, expr)?
+                    self.create_project_physical_exec_with_props(
+                        execution_props,
+                        join,
+                        input,
+                        expr,
+                    )?
                 } else {
                     join
                 };
@@ -2900,21 +2905,6 @@ impl DefaultPhysicalPlanner {
         }
     }
 
-    fn create_project_physical_exec(
-        &self,
-        session_state: &SessionState,
-        input_exec: Arc<dyn ExecutionPlan>,
-        input: &Arc<LogicalPlan>,
-        expr: &[Expr],
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.create_project_physical_exec_with_props(
-            session_state.execution_props(),
-            input_exec,
-            input,
-            expr,
-        )
-    }
-
     fn create_project_physical_exec_with_props(
         &self,
         execution_props: &ExecutionProps,
@@ -3182,7 +3172,7 @@ mod tests {
     use arrow_schema::SchemaRef;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::{
-        DFSchemaRef, TableReference, ToDFSchema as _, assert_contains,
+        DFSchemaRef, TableReference, ToDFSchema as _, assert_batches_eq, assert_contains,
     };
     use datafusion_execution::TaskContext;
     use datafusion_execution::runtime_env::RuntimeEnv;
@@ -3219,6 +3209,11 @@ mod tests {
     async fn plan_sql(query: &str) -> Result<Arc<dyn ExecutionPlan>> {
         let ctx = SessionContext::new();
         ctx.sql(query).await?.create_physical_plan().await
+    }
+
+    async fn collect_sql(query: &str) -> Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        ctx.sql(query).await?.collect().await
     }
 
     #[tokio::test]
@@ -3258,6 +3253,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scalar_subquery_in_sort_expr_executes() -> Result<()> {
+        let batches = collect_sql(
+            "SELECT x \
+             FROM (VALUES (2), (1), (3)) AS t(x) \
+             ORDER BY x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y)) DESC",
+        )
+        .await?;
+
+        assert_batches_eq!(
+            &[
+                "+---+", "| x |", "+---+", "| 3 |", "| 2 |", "| 1 |", "+---+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scalar_subquery_in_aggregate_arg_plans() -> Result<()> {
         let plan = plan_sql(
             "SELECT sum(x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y))) \
@@ -3266,6 +3279,41 @@ mod tests {
         .await?;
 
         assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scalar_subquery_in_aggregate_arg_executes() -> Result<()> {
+        let batches = collect_sql(
+            "SELECT sum(x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y))) AS s \
+             FROM (VALUES (2), (1)) AS t(x)",
+        )
+        .await?;
+
+        assert_batches_eq!(
+            &["+----+", "| s  |", "+----+", "| 43 |", "+----+",],
+            &batches
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scalar_subquery_in_join_on_plans() -> Result<()> {
+        let plan = plan_sql(
+            "SELECT l.x, r.y \
+             FROM (VALUES (1), (2)) AS l(x) \
+             JOIN (VALUES (11), (12)) AS r(y) \
+             ON l.x + (SELECT 10) = r.y",
+        )
+        .await?;
+
+        let formatted = format!("{plan:?}");
+        assert_contains!(&formatted, "ScalarSubqueryExec");
+        assert!(
+            formatted.contains("HashJoinExec")
+                || formatted.contains("SortMergeJoinExec")
+                || formatted.contains("NestedLoopJoinExec")
+        );
         Ok(())
     }
 

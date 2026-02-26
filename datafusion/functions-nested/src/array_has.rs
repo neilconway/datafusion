@@ -336,6 +336,22 @@ impl<'a> ArrayWrapper<'a> {
     }
 }
 
+/// Returns the child values slice referenced by this parent list slice,
+/// along with offsets normalized to the returned child slice.
+fn referenced_child_values_and_offsets(array: ArrayWrapper<'_>) -> (ArrayRef, Vec<usize>) {
+    let mut offsets: Vec<usize> = array.offsets().collect();
+    let start = offsets.first().copied().unwrap_or(0);
+    let end = offsets.last().copied().unwrap_or(start);
+
+    if start != 0 {
+        for offset in &mut offsets {
+            *offset -= start;
+        }
+    }
+
+    (array.values().slice(start, end - start), offsets)
+}
+
 fn array_has_dispatch_for_array<'a>(
     haystack: ArrayWrapper<'a>,
     needle: &ArrayRef,
@@ -426,10 +442,10 @@ fn general_array_has_for_all_and_any<'a>(
 ) -> Result<ArrayRef> {
     let mut boolean_builder = BooleanArray::builder(haystack.len());
     let converter = RowConverter::new(vec![SortField::new(haystack.value_type())])?;
-    let haystack_rows = converter.convert_columns(&[Arc::clone(haystack.values())])?;
-    let needle_rows = converter.convert_columns(&[Arc::clone(needle.values())])?;
-    let haystack_offsets: Vec<usize> = haystack.offsets().collect();
-    let needle_offsets: Vec<usize> = needle.offsets().collect();
+    let (haystack_values, haystack_offsets) = referenced_child_values_and_offsets(haystack);
+    let (needle_values, needle_offsets) = referenced_child_values_and_offsets(needle);
+    let haystack_rows = converter.convert_columns(&[haystack_values])?;
+    let needle_rows = converter.convert_columns(&[needle_values])?;
     let haystack_nulls = haystack.nulls();
     let needle_nulls = needle.nulls();
 
@@ -954,7 +970,7 @@ mod tests {
 
     use crate::expr_fn::make_array;
 
-    use super::ArrayHas;
+    use super::{ArrayHas, ArrayHasAny};
 
     #[test]
     fn test_simplify_array_has_to_in_list() {
@@ -1115,6 +1131,49 @@ mod tests {
         for i in 0..3 {
             assert!(output.is_null(i));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_has_any_sliced_list_inputs() -> Result<(), DataFusionError> {
+        let haystack_full = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(100)]),
+            Some(vec![Some(1), Some(2)]),
+            Some(vec![Some(5), Some(6)]),
+            Some(vec![Some(9)]),
+        ]);
+        let needle_full = ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+            Some(vec![Some(0)]),
+            Some(vec![Some(2), Some(20)]),
+            Some(vec![Some(10)]),
+            Some(vec![Some(9)]),
+        ]);
+
+        // Slice away the first row so the list offsets are non-zero.
+        let haystack: ArrayRef = Arc::new(haystack_full.slice(1, 2));
+        let needle: ArrayRef = Arc::new(needle_full.slice(1, 2));
+        let list_type = haystack.data_type().clone();
+
+        let result = ArrayHasAny::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(haystack),
+                ColumnarValue::Array(needle),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("haystack", list_type.clone(), true)),
+                Arc::new(Field::new("needle", list_type, true)),
+            ],
+            number_rows: 2,
+            return_field: Arc::new(Field::new("result", DataType::Boolean, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })?;
+
+        let output = result.into_array(2)?;
+        let output = output.as_boolean();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output.value(0), true);
+        assert_eq!(output.value(1), false);
 
         Ok(())
     }

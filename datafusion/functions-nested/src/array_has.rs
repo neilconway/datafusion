@@ -418,19 +418,30 @@ fn general_array_has_for_all_and_any<'a>(
 ) -> Result<ArrayRef> {
     let mut boolean_builder = BooleanArray::builder(haystack.len());
     let converter = RowConverter::new(vec![SortField::new(haystack.value_type())])?;
+    let haystack_rows = converter.convert_columns(&[Arc::clone(haystack.values())])?;
+    let needle_rows = converter.convert_columns(&[Arc::clone(needle.values())])?;
+    let haystack_offsets: Vec<usize> = haystack.offsets().collect();
+    let needle_offsets: Vec<usize> = needle.offsets().collect();
+    let haystack_nulls = haystack.nulls();
+    let needle_nulls = needle.nulls();
 
-    for (arr, sub_arr) in haystack.iter().zip(needle.iter()) {
-        if let (Some(arr), Some(sub_arr)) = (arr, sub_arr) {
-            let arr_values = converter.convert_columns(&[arr])?;
-            let sub_arr_values = converter.convert_columns(&[sub_arr])?;
-            boolean_builder.append_value(general_array_has_all_and_any_kernel(
-                &arr_values,
-                &sub_arr_values,
-                comparison_type,
-            ));
-        } else {
+    for i in 0..haystack.len() {
+        if haystack_nulls.is_some_and(|v| v.is_null(i))
+            || needle_nulls.is_some_and(|v| v.is_null(i))
+        {
             boolean_builder.append_null();
+            continue;
         }
+
+        boolean_builder.append_value(general_array_has_all_and_any_kernel(
+            &haystack_rows,
+            haystack_offsets[i],
+            haystack_offsets[i + 1],
+            &needle_rows,
+            needle_offsets[i],
+            needle_offsets[i + 1],
+            comparison_type,
+        ));
     }
 
     Ok(Arc::new(boolean_builder.finish()))
@@ -893,19 +904,23 @@ fn array_has_string_kernel(
 
 fn general_array_has_all_and_any_kernel(
     haystack_rows: &Rows,
+    haystack_start: usize,
+    haystack_end: usize,
     needle_rows: &Rows,
+    needle_start: usize,
+    needle_end: usize,
     comparison_type: ComparisonType,
 ) -> bool {
     match comparison_type {
-        ComparisonType::All => needle_rows.iter().all(|needle_row| {
-            haystack_rows
-                .iter()
-                .any(|haystack_row| haystack_row == needle_row)
+        ComparisonType::All => (needle_start..needle_end).all(|needle_idx| {
+            let needle_row = needle_rows.row(needle_idx);
+            (haystack_start..haystack_end)
+                .any(|haystack_idx| haystack_rows.row(haystack_idx) == needle_row)
         }),
-        ComparisonType::Any => needle_rows.iter().any(|needle_row| {
-            haystack_rows
-                .iter()
-                .any(|haystack_row| haystack_row == needle_row)
+        ComparisonType::Any => (needle_start..needle_end).any(|needle_idx| {
+            let needle_row = needle_rows.row(needle_idx);
+            (haystack_start..haystack_end)
+                .any(|haystack_idx| haystack_rows.row(haystack_idx) == needle_row)
         }),
     }
 }

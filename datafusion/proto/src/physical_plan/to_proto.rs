@@ -512,16 +512,12 @@ pub fn serialize_physical_expr_with_converter(
     } else if let Some(expr) = expr.downcast_ref::<ScalarSubqueryExpr>() {
         Ok(protobuf::PhysicalExprNode {
             expr_id: None,
-            expr_type: Some(
-                protobuf::physical_expr_node::ExprType::ScalarSubquery(
-                    protobuf::PhysicalScalarSubqueryExprNode {
-                        data_type: Some(
-                            (&expr.data_type(&Schema::empty())?).try_into()?,
-                        ),
-                        nullable: expr.nullable(&Schema::empty())?,
-                    },
-                ),
-            ),
+            expr_type: Some(protobuf::physical_expr_node::ExprType::ScalarSubquery(
+                protobuf::PhysicalScalarSubqueryExprNode {
+                    data_type: Some((&expr.data_type(&Schema::empty())?).try_into()?),
+                    nullable: expr.nullable(&Schema::empty())?,
+                },
+            )),
         })
     } else {
         let mut buf: Vec<u8> = vec![];

@@ -321,14 +321,8 @@ impl protobuf::PhysicalPlanNode {
             PhysicalPlanType::Buffer(buffer) => {
                 self.try_into_buffer_physical_plan(buffer, ctx, codec, proto_converter)
             }
-            PhysicalPlanType::ScalarSubquery(sq) => {
-                self.try_into_scalar_subquery_physical_plan(
-                    sq,
-                    ctx,
-                    codec,
-                    proto_converter,
-                )
-            }
+            PhysicalPlanType::ScalarSubquery(sq) => self
+                .try_into_scalar_subquery_physical_plan(sq, ctx, codec, proto_converter),
         }
     }
 

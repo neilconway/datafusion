@@ -62,10 +62,7 @@ pub struct ScalarSubqueryExec {
 }
 
 impl ScalarSubqueryExec {
-    pub fn new(
-        input: Arc<dyn ExecutionPlan>,
-        subqueries: Vec<SubqueryPlan>,
-    ) -> Self {
+    pub fn new(input: Arc<dyn ExecutionPlan>, subqueries: Vec<SubqueryPlan>) -> Self {
         let cache = input.properties().clone();
         Self {
             input,
@@ -90,7 +87,11 @@ impl DisplayAs for ScalarSubqueryExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(f, "ScalarSubqueryExec: subqueries={}", self.subqueries.len())
+                write!(
+                    f,
+                    "ScalarSubqueryExec: subqueries={}",
+                    self.subqueries.len()
+                )
             }
             DisplayFormatType::TreeRender => {
                 write!(f, "")
@@ -149,9 +150,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
         // Use OnceAsync to ensure all subqueries are executed exactly once,
         // even when multiple partitions call execute() concurrently.
         let mut once_fut = self.subquery_results.try_once(move || {
-            Ok(async move {
-                execute_subqueries(subqueries, ctx).await
-            })
+            Ok(async move { execute_subqueries(subqueries, ctx).await })
         })?;
 
         let input = self.input.execute(partition, context)?;
@@ -163,15 +162,14 @@ impl ExecutionPlan for ScalarSubqueryExec {
             Arc::clone(&schema),
             futures::stream::once(async move {
                 // Wait for subquery execution to complete.
-                let result: Result<()> = std::future::poll_fn(|cx| {
-                    once_fut.get(cx).map(|r| r.map(|_| ()))
-                })
-                .await;
+                let result: Result<()> =
+                    std::future::poll_fn(|cx| once_fut.get(cx).map(|r| r.map(|_| ())))
+                        .await;
                 result
             })
             .filter_map(|result| async move {
                 match result {
-                    Ok(()) => None, // Subqueries done, proceed to input
+                    Ok(()) => None,         // Subqueries done, proceed to input
                     Err(e) => Some(Err(e)), // Propagate error
                 }
             })
@@ -200,7 +198,8 @@ async fn execute_subqueries(
 ) -> Result<Vec<ScalarValue>> {
     let mut results = Vec::with_capacity(subqueries.len());
     for sq in &subqueries {
-        let value = execute_scalar_subquery(Arc::clone(&sq.plan), Arc::clone(&context)).await?;
+        let value =
+            execute_scalar_subquery(Arc::clone(&sq.plan), Arc::clone(&context)).await?;
         // Populate the shared OnceLock. It's fine if another thread beat us
         // (the OnceAsync ensures this function runs only once, but this is
         // defensive).
@@ -279,9 +278,9 @@ mod tests {
         };
 
         // Use a PlaceholderRowExec as the main input
-        let main_input = Arc::new(
-            crate::placeholder_row::PlaceholderRowExec::new(test::aggr_test_schema()),
-        );
+        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            test::aggr_test_schema(),
+        ));
         let exec = ScalarSubqueryExec::new(main_input, vec![sq]);
 
         let ctx = Arc::new(TaskContext::default());
@@ -296,8 +295,10 @@ mod tests {
     #[tokio::test]
     async fn test_zero_row_subquery_returns_null() -> Result<()> {
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-        let batch =
-            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int64Array::from(vec![] as Vec<i64>))])?;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![] as Vec<i64>))],
+        )?;
 
         let subquery_plan = make_subquery_plan(vec![batch]);
         let value = Arc::new(OnceLock::new());
@@ -306,9 +307,9 @@ mod tests {
             value: Arc::clone(&value),
         };
 
-        let main_input = Arc::new(
-            crate::placeholder_row::PlaceholderRowExec::new(test::aggr_test_schema()),
-        );
+        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            test::aggr_test_schema(),
+        ));
         let exec = ScalarSubqueryExec::new(main_input, vec![sq]);
 
         let ctx = Arc::new(TaskContext::default());
@@ -334,9 +335,9 @@ mod tests {
             value: Arc::clone(&value),
         };
 
-        let main_input = Arc::new(
-            crate::placeholder_row::PlaceholderRowExec::new(test::aggr_test_schema()),
-        );
+        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            test::aggr_test_schema(),
+        ));
         let exec = ScalarSubqueryExec::new(main_input, vec![sq]);
 
         let ctx = Arc::new(TaskContext::default());

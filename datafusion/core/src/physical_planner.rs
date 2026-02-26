@@ -598,18 +598,31 @@ impl DefaultPhysicalPlanner {
                 }
             }
             LogicalPlan::Values(Values { values, schema }) => {
+                let values_exprs = values
+                    .iter()
+                    .flat_map(|row| row.iter().cloned())
+                    .collect::<Vec<_>>();
+                let (execution_props, subquery_plans) = self
+                    .create_execution_props_with_scalar_subqueries(
+                        &values_exprs,
+                        session_state,
+                    )
+                    .await?;
                 let exprs = values
                     .iter()
                     .map(|row| {
                         row.iter()
                             .map(|expr| {
-                                self.create_physical_expr(expr, schema, session_state)
+                                create_physical_expr(expr, schema, &execution_props)
                             })
                             .collect::<Result<Vec<Arc<dyn PhysicalExpr>>>>()
                     })
                     .collect::<Result<Vec<_>>>()?;
-                MemorySourceConfig::try_new_as_values(Arc::clone(schema.inner()), exprs)?
-                    as _
+                let values_exec = MemorySourceConfig::try_new_as_values(
+                    Arc::clone(schema.inner()),
+                    exprs,
+                )?;
+                Self::wrap_scalar_subquery_exec_if_needed(values_exec, subquery_plans)
             }
             LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
@@ -831,6 +844,12 @@ impl DefaultPhysicalPlanner {
                 );
 
                 let input_exec = children.one()?;
+                let (execution_props, subquery_plans) = self
+                    .create_execution_props_with_scalar_subqueries(
+                        window_expr,
+                        session_state,
+                    )
+                    .await?;
 
                 let get_sort_keys = |expr: &Expr| match expr {
                     Expr::WindowFunction(window_fun) => {
@@ -870,13 +889,7 @@ impl DefaultPhysicalPlanner {
                 let logical_schema = node.schema();
                 let window_expr = window_expr
                     .iter()
-                    .map(|e| {
-                        create_window_expr(
-                            e,
-                            logical_schema,
-                            session_state.execution_props(),
-                        )
-                    })
+                    .map(|e| create_window_expr(e, logical_schema, &execution_props))
                     .collect::<Result<Vec<_>>>()?;
 
                 let can_repartition = session_state.config().target_partitions() > 1
@@ -886,7 +899,7 @@ impl DefaultPhysicalPlanner {
                     window_expr.iter().all(|e| e.uses_bounded_memory());
                 // If all window expressions can run with bounded memory,
                 // choose the bounded window variant:
-                if uses_bounded_memory {
+                let window_exec: Arc<dyn ExecutionPlan> = if uses_bounded_memory {
                     Arc::new(BoundedWindowAggExec::try_new(
                         window_expr,
                         input_exec,
@@ -899,7 +912,8 @@ impl DefaultPhysicalPlanner {
                         input_exec,
                         can_repartition,
                     )?)
-                }
+                };
+                Self::wrap_scalar_subquery_exec_if_needed(window_exec, subquery_plans)
             }
             LogicalPlan::Aggregate(Aggregate {
                 input,
@@ -977,11 +991,22 @@ impl DefaultPhysicalPlanner {
                     );
                 }
 
+                let mut aggregate_exprs =
+                    Vec::with_capacity(group_expr.len() + aggr_expr.len());
+                aggregate_exprs.extend(group_expr.iter().cloned());
+                aggregate_exprs.extend(aggr_expr.iter().cloned());
+                let (execution_props, subquery_plans) = self
+                    .create_execution_props_with_scalar_subqueries(
+                        &aggregate_exprs,
+                        session_state,
+                    )
+                    .await?;
+
                 let groups = self.create_grouping_physical_expr(
                     group_expr,
                     logical_input_schema,
                     &physical_input_schema,
-                    session_state,
+                    &execution_props,
                 )?;
 
                 let agg_filter = aggr_expr
@@ -991,7 +1016,7 @@ impl DefaultPhysicalPlanner {
                             e,
                             logical_input_schema,
                             &physical_input_schema,
-                            session_state.execution_props(),
+                            &execution_props,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -1075,14 +1100,16 @@ impl DefaultPhysicalPlanner {
 
                 let final_grouping_set = initial_aggr.group_expr().as_final();
 
-                Arc::new(AggregateExec::try_new(
-                    next_partition_mode,
-                    final_grouping_set,
-                    updated_aggregates,
-                    filters,
-                    initial_aggr,
-                    Arc::clone(&physical_input_schema),
-                )?)
+                let aggregate_exec: Arc<dyn ExecutionPlan> =
+                    Arc::new(AggregateExec::try_new(
+                        next_partition_mode,
+                        final_grouping_set,
+                        updated_aggregates,
+                        filters,
+                        initial_aggr,
+                        Arc::clone(&physical_input_schema),
+                    )?);
+                Self::wrap_scalar_subquery_exec_if_needed(aggregate_exec, subquery_plans)
             }
             LogicalPlan::Projection(Projection { input, expr, .. }) => {
                 let subqueries = Self::collect_scalar_subqueries(expr);
@@ -1183,22 +1210,24 @@ impl DefaultPhysicalPlanner {
             }) => {
                 let physical_input = children.one()?;
                 let input_dfschema = input.as_ref().schema();
-                let physical_partitioning = match partitioning_scheme {
+                let (physical_partitioning, subquery_plans) = match partitioning_scheme {
                     LogicalPartitioning::RoundRobinBatch(n) => {
-                        Partitioning::RoundRobinBatch(*n)
+                        (Partitioning::RoundRobinBatch(*n), vec![])
                     }
                     LogicalPartitioning::Hash(expr, n) => {
+                        let (execution_props, subquery_plans) = self
+                            .create_execution_props_with_scalar_subqueries(
+                                expr,
+                                session_state,
+                            )
+                            .await?;
                         let runtime_expr = expr
                             .iter()
                             .map(|e| {
-                                self.create_physical_expr(
-                                    e,
-                                    input_dfschema,
-                                    session_state,
-                                )
+                                create_physical_expr(e, input_dfschema, &execution_props)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        Partitioning::Hash(runtime_expr, *n)
+                        (Partitioning::Hash(runtime_expr, *n), subquery_plans)
                     }
                     LogicalPartitioning::DistributeBy(_) => {
                         return not_impl_err!(
@@ -1206,28 +1235,39 @@ impl DefaultPhysicalPlanner {
                         );
                     }
                 };
-                Arc::new(RepartitionExec::try_new(
-                    physical_input,
-                    physical_partitioning,
-                )?)
+                let repartition_exec: Arc<dyn ExecutionPlan> = Arc::new(
+                    RepartitionExec::try_new(physical_input, physical_partitioning)?,
+                );
+                Self::wrap_scalar_subquery_exec_if_needed(
+                    repartition_exec,
+                    subquery_plans,
+                )
             }
             LogicalPlan::Sort(Sort {
                 expr, input, fetch, ..
             }) => {
                 let physical_input = children.one()?;
                 let input_dfschema = input.as_ref().schema();
-                let sort_exprs = create_physical_sort_exprs(
-                    expr,
-                    input_dfschema,
-                    session_state.execution_props(),
-                )?;
+                let sort_exprs_for_subqueries =
+                    expr.iter().map(|e| e.expr.clone()).collect::<Vec<_>>();
+                let (execution_props, subquery_plans) = self
+                    .create_execution_props_with_scalar_subqueries(
+                        &sort_exprs_for_subqueries,
+                        session_state,
+                    )
+                    .await?;
+                let sort_exprs =
+                    create_physical_sort_exprs(expr, input_dfschema, &execution_props)?;
                 let Some(ordering) = LexOrdering::new(sort_exprs) else {
                     return internal_err!(
                         "SortExec requires at least one sort expression"
                     );
                 };
                 let new_sort = SortExec::new(ordering, physical_input).with_fetch(*fetch);
-                Arc::new(new_sort)
+                Self::wrap_scalar_subquery_exec_if_needed(
+                    Arc::new(new_sort),
+                    subquery_plans,
+                )
             }
             LogicalPlan::Subquery(_) => todo!(),
             LogicalPlan::SubqueryAlias(_) => children.one()?,
@@ -1419,13 +1459,29 @@ impl DefaultPhysicalPlanner {
                 // All equi-join keys are columns now, create physical join plan
                 let left_df_schema = left.schema();
                 let right_df_schema = right.schema();
-                let execution_props = session_state.execution_props();
+                let mut join_exprs = Vec::with_capacity(
+                    keys.len() * 2 + if filter.is_some() { 1 } else { 0 },
+                );
+                for (l, r) in keys {
+                    join_exprs.push(l.clone());
+                    join_exprs.push(r.clone());
+                }
+                if let Some(expr) = filter {
+                    join_exprs.push(expr.clone());
+                }
+                let (execution_props, subquery_plans) = self
+                    .create_execution_props_with_scalar_subqueries(
+                        &join_exprs,
+                        session_state,
+                    )
+                    .await?;
                 let join_on = keys
                     .iter()
                     .map(|(l, r)| {
-                        let l = create_physical_expr(l, left_df_schema, execution_props)?;
+                        let l =
+                            create_physical_expr(l, left_df_schema, &execution_props)?;
                         let r =
-                            create_physical_expr(r, right_df_schema, execution_props)?;
+                            create_physical_expr(r, right_df_schema, &execution_props)?;
                         Ok((l, r))
                     })
                     .collect::<Result<join_utils::JoinOn>>()?;
@@ -1525,7 +1581,7 @@ impl DefaultPhysicalPlanner {
                         let filter_expr = create_physical_expr(
                             expr,
                             &filter_df_schema,
-                            session_state.execution_props(),
+                            &execution_props,
                         )?;
                         let column_indices = join_utils::JoinFilter::build_column_indices(
                             left_field_indices,
@@ -1645,12 +1701,12 @@ impl DefaultPhysicalPlanner {
                         let on_left = create_physical_expr(
                             lhs_logical,
                             left_df_schema,
-                            session_state.execution_props(),
+                            &execution_props,
                         )?;
                         let on_right = create_physical_expr(
                             rhs_logical,
                             right_df_schema,
-                            session_state.execution_props(),
+                            &execution_props,
                         )?;
 
                         Arc::new(PiecewiseMergeJoinExec::try_new(
@@ -1719,11 +1775,12 @@ impl DefaultPhysicalPlanner {
 
                 // If plan was mutated previously then need to create the ExecutionPlan
                 // for the new Projection that was applied on top.
-                if let Some((input, expr)) = new_project {
+                let join = if let Some((input, expr)) = new_project {
                     self.create_project_physical_exec(session_state, join, input, expr)?
                 } else {
                     join
-                }
+                };
+                Self::wrap_scalar_subquery_exec_if_needed(join, subquery_plans)
             }
             LogicalPlan::RecursiveQuery(RecursiveQuery {
                 name, is_distinct, ..
@@ -1814,7 +1871,7 @@ impl DefaultPhysicalPlanner {
         group_expr: &[Expr],
         input_dfschema: &DFSchema,
         input_schema: &Schema,
-        session_state: &SessionState,
+        execution_props: &ExecutionProps,
     ) -> Result<PhysicalGroupBy> {
         if group_expr.len() == 1 {
             match &group_expr[0] {
@@ -1823,25 +1880,25 @@ impl DefaultPhysicalPlanner {
                         grouping_sets,
                         input_dfschema,
                         input_schema,
-                        session_state,
+                        execution_props,
                     )
                 }
                 Expr::GroupingSet(GroupingSet::Cube(exprs)) => create_cube_physical_expr(
                     exprs,
                     input_dfschema,
                     input_schema,
-                    session_state,
+                    execution_props,
                 ),
                 Expr::GroupingSet(GroupingSet::Rollup(exprs)) => {
                     create_rollup_physical_expr(
                         exprs,
                         input_dfschema,
                         input_schema,
-                        session_state,
+                        execution_props,
                     )
                 }
                 expr => Ok(PhysicalGroupBy::new_single(vec![tuple_err((
-                    self.create_physical_expr(expr, input_dfschema, session_state),
+                    create_physical_expr(expr, input_dfschema, execution_props),
                     physical_name(expr),
                 ))?])),
             }
@@ -1855,7 +1912,7 @@ impl DefaultPhysicalPlanner {
                     .iter()
                     .map(|e| {
                         tuple_err((
-                            self.create_physical_expr(e, input_dfschema, session_state),
+                            create_physical_expr(e, input_dfschema, execution_props),
                             physical_name(e),
                         ))
                     })
@@ -1879,7 +1936,7 @@ fn merge_grouping_set_physical_expr(
     grouping_sets: &[Vec<Expr>],
     input_dfschema: &DFSchema,
     input_schema: &Schema,
-    session_state: &SessionState,
+    execution_props: &ExecutionProps,
 ) -> Result<PhysicalGroupBy> {
     let num_groups = grouping_sets.len();
     let mut all_exprs: Vec<Expr> = vec![];
@@ -1893,14 +1950,14 @@ fn merge_grouping_set_physical_expr(
             grouping_set_expr.push(get_physical_expr_pair(
                 expr,
                 input_dfschema,
-                session_state,
+                execution_props,
             )?);
 
             null_exprs.push(get_null_physical_expr_pair(
                 expr,
                 input_dfschema,
                 input_schema,
-                session_state,
+                execution_props,
             )?);
         }
     }
@@ -1930,7 +1987,7 @@ fn create_cube_physical_expr(
     exprs: &[Expr],
     input_dfschema: &DFSchema,
     input_schema: &Schema,
-    session_state: &SessionState,
+    execution_props: &ExecutionProps,
 ) -> Result<PhysicalGroupBy> {
     let num_of_exprs = exprs.len();
     let num_groups = num_of_exprs * num_of_exprs;
@@ -1945,10 +2002,14 @@ fn create_cube_physical_expr(
             expr,
             input_dfschema,
             input_schema,
-            session_state,
+            execution_props,
         )?);
 
-        all_exprs.push(get_physical_expr_pair(expr, input_dfschema, session_state)?)
+        all_exprs.push(get_physical_expr_pair(
+            expr,
+            input_dfschema,
+            execution_props,
+        )?)
     }
 
     let mut groups: Vec<Vec<bool>> = Vec::with_capacity(num_groups);
@@ -1972,7 +2033,7 @@ fn create_rollup_physical_expr(
     exprs: &[Expr],
     input_dfschema: &DFSchema,
     input_schema: &Schema,
-    session_state: &SessionState,
+    execution_props: &ExecutionProps,
 ) -> Result<PhysicalGroupBy> {
     let num_of_exprs = exprs.len();
 
@@ -1988,10 +2049,14 @@ fn create_rollup_physical_expr(
             expr,
             input_dfschema,
             input_schema,
-            session_state,
+            execution_props,
         )?);
 
-        all_exprs.push(get_physical_expr_pair(expr, input_dfschema, session_state)?)
+        all_exprs.push(get_physical_expr_pair(
+            expr,
+            input_dfschema,
+            execution_props,
+        )?)
     }
 
     for total in 0..=num_of_exprs {
@@ -2016,10 +2081,9 @@ fn get_null_physical_expr_pair(
     expr: &Expr,
     input_dfschema: &DFSchema,
     input_schema: &Schema,
-    session_state: &SessionState,
+    execution_props: &ExecutionProps,
 ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, session_state.execution_props())?;
+    let physical_expr = create_physical_expr(expr, input_dfschema, execution_props)?;
     let physical_name = physical_name(&expr.clone())?;
 
     let data_type = physical_expr.data_type(input_schema)?;
@@ -2088,10 +2152,9 @@ fn qualify_join_schema_sides(
 fn get_physical_expr_pair(
     expr: &Expr,
     input_dfschema: &DFSchema,
-    session_state: &SessionState,
+    execution_props: &ExecutionProps,
 ) -> Result<(Arc<dyn PhysicalExpr>, String)> {
-    let physical_expr =
-        create_physical_expr(expr, input_dfschema, session_state.execution_props())?;
+    let physical_expr = create_physical_expr(expr, input_dfschema, execution_props)?;
     let physical_name = physical_name(expr)?;
     Ok((physical_expr, physical_name))
 }
@@ -2791,6 +2854,39 @@ impl DefaultPhysicalPlanner {
         Ok((plans, map))
     }
 
+    /// Build execution properties for planning expressions that may contain
+    /// uncorrelated scalar subqueries, along with the subquery execs needed to
+    /// populate their shared result slots.
+    async fn create_execution_props_with_scalar_subqueries(
+        &self,
+        exprs: &[Expr],
+        session_state: &SessionState,
+    ) -> Result<(ExecutionProps, Vec<SubqueryPlan>)> {
+        let subqueries = Self::collect_scalar_subqueries(exprs);
+        if subqueries.is_empty() {
+            return Ok((session_state.execution_props().clone(), vec![]));
+        }
+
+        let (plans, map) = self
+            .plan_scalar_subqueries(&subqueries, session_state)
+            .await?;
+
+        let mut props = session_state.execution_props().clone();
+        props.scalar_subqueries = map;
+        Ok((props, plans))
+    }
+
+    fn wrap_scalar_subquery_exec_if_needed(
+        input: Arc<dyn ExecutionPlan>,
+        subqueries: Vec<SubqueryPlan>,
+    ) -> Arc<dyn ExecutionPlan> {
+        if subqueries.is_empty() {
+            input
+        } else {
+            Arc::new(ScalarSubqueryExec::new(input, subqueries))
+        }
+    }
+
     /// Create a `create_physical_expr` call that resolves scalar subqueries,
     /// returning the physical expression and optional `ScalarSubqueryExec` wrapper
     /// (if any subqueries were found).
@@ -2801,19 +2897,9 @@ impl DefaultPhysicalPlanner {
         session_state: &SessionState,
     ) -> Result<(Arc<dyn PhysicalExpr>, Vec<SubqueryPlan>)> {
         let exprs = [expr.clone()];
-        let subqueries = Self::collect_scalar_subqueries(&exprs);
-        if subqueries.is_empty() {
-            let physical_expr =
-                self.create_physical_expr(expr, input_dfschema, session_state)?;
-            return Ok((physical_expr, vec![]));
-        }
-
-        let (plans, map) = self
-            .plan_scalar_subqueries(&subqueries, session_state)
+        let (props, plans) = self
+            .create_execution_props_with_scalar_subqueries(&exprs, session_state)
             .await?;
-
-        let mut props = session_state.execution_props().clone();
-        props.scalar_subqueries = map;
 
         let physical_expr = create_physical_expr(expr, input_dfschema, &props)?;
         Ok((physical_expr, plans))
@@ -2848,9 +2934,7 @@ impl DefaultPhysicalPlanner {
             .map(|e| {
                 let physical_name = if let Expr::Column(col) = e {
                     match input_logical_schema.index_of_column(col) {
-                        Ok(idx) => {
-                            Ok(input_exec.schema().field(idx).name().to_string())
-                        }
+                        Ok(idx) => Ok(input_exec.schema().field(idx).name().to_string()),
                         Err(_) => physical_name(e),
                     }
                 } else {
@@ -3137,6 +3221,11 @@ mod tests {
             .await
     }
 
+    async fn plan_sql(query: &str) -> Result<Arc<dyn ExecutionPlan>> {
+        let ctx = SessionContext::new();
+        ctx.sql(query).await?.create_physical_plan().await
+    }
+
     #[tokio::test]
     async fn test_all_operators() -> Result<()> {
         let logical_plan = test_csv_scan()
@@ -3161,6 +3250,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scalar_subquery_in_sort_expr_plans() -> Result<()> {
+        let plan = plan_sql(
+            "SELECT x \
+             FROM (VALUES (2), (1)) AS t(x) \
+             ORDER BY x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y))",
+        )
+        .await?;
+
+        assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scalar_subquery_in_aggregate_arg_plans() -> Result<()> {
+        let plan = plan_sql(
+            "SELECT sum(x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y))) \
+             FROM (VALUES (2), (1)) AS t(x)",
+        )
+        .await?;
+
+        assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_create_cube_expr() -> Result<()> {
         let logical_plan = test_csv_scan().await?.build()?;
 
@@ -3177,7 +3291,7 @@ mod tests {
             &exprs,
             logical_input_schema,
             physical_input_schema,
-            &session_state,
+            session_state.execution_props(),
         );
 
         insta::assert_debug_snapshot!(cube, @r#"
@@ -3308,7 +3422,7 @@ mod tests {
             &exprs,
             logical_input_schema,
             physical_input_schema,
-            &session_state,
+            session_state.execution_props(),
         );
 
         insta::assert_debug_snapshot!(rollup, @r#"

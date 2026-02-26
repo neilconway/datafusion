@@ -47,7 +47,8 @@ pub struct ExecutionProps {
     /// Populated by the physical planner before calling `create_physical_expr`.
     /// Each entry maps a subquery to a shared `OnceLock` that will be filled
     /// at execution time by `ScalarSubqueryExec`.
-    pub scalar_subqueries: HashMap<crate::logical_plan::Subquery, Arc<OnceLock<ScalarValue>>>,
+    pub scalar_subqueries:
+        HashMap<crate::logical_plan::Subquery, Arc<OnceLock<ScalarValue>>>,
 }
 
 impl Default for ExecutionProps {

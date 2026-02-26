@@ -160,8 +160,7 @@ mod tests {
     fn test_evaluate_before_populated() {
         let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let a = Int32Array::from(vec![1]);
-        let batch =
-            RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
+        let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
 
         let value = Arc::new(OnceLock::new());
         let expr = ScalarSubqueryExpr::new(DataType::Int32, false, value);

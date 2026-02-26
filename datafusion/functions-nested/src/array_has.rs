@@ -428,7 +428,9 @@ fn general_array_has_for_all_and_any<'a>(
     // so we only convert the elements we actually need.
     let h_base = h_offsets[0];
     let n_base = n_offsets[0];
-    let h_vals = haystack.values().slice(h_base, h_offsets[num_rows] - h_base);
+    let h_vals = haystack
+        .values()
+        .slice(h_base, h_offsets[num_rows] - h_base);
     let n_vals = needle.values().slice(n_base, n_offsets[num_rows] - n_base);
 
     // Bulk-convert all haystack and needle values to rows up front
@@ -440,8 +442,7 @@ fn general_array_has_for_all_and_any<'a>(
     let mut builder = BooleanArray::builder(num_rows);
 
     for i in 0..num_rows {
-        if h_nulls.is_some_and(|n| n.is_null(i))
-            || n_nulls.is_some_and(|n| n.is_null(i))
+        if h_nulls.is_some_and(|n| n.is_null(i)) || n_nulls.is_some_and(|n| n.is_null(i))
         {
             builder.append_null();
             continue;
@@ -474,7 +475,9 @@ fn array_has_all_and_any_string_internal<'a>(
     // so we only convert the elements we actually need.
     let h_base = h_offsets[0];
     let n_base = n_offsets[0];
-    let h_vals = haystack.values().slice(h_base, h_offsets[num_rows] - h_base);
+    let h_vals = haystack
+        .values()
+        .slice(h_base, h_offsets[num_rows] - h_base);
     let n_vals = needle.values().slice(n_base, n_offsets[num_rows] - n_base);
 
     let all_h_strings = string_array_to_vec(h_vals.as_ref());
@@ -485,8 +488,7 @@ fn array_has_all_and_any_string_internal<'a>(
     let mut builder = BooleanArray::builder(num_rows);
 
     for i in 0..num_rows {
-        if h_nulls.is_some_and(|n| n.is_null(i))
-            || n_nulls.is_some_and(|n| n.is_null(i))
+        if h_nulls.is_some_and(|n| n.is_null(i)) || n_nulls.is_some_and(|n| n.is_null(i))
         {
             builder.append_null();
             continue;
@@ -976,7 +978,7 @@ mod tests {
 
     use crate::expr_fn::make_array;
 
-    use super::ArrayHas;
+    use super::{ArrayHas, ArrayHasAll, ArrayHasAny};
 
     #[test]
     fn test_simplify_array_has_to_in_list() {
@@ -1137,6 +1139,82 @@ mod tests {
         for i in 0..3 {
             assert!(output.is_null(i));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sliced_list_offsets() -> Result<(), DataFusionError> {
+        // Full rows:
+        //   row 0: [1, 2]   (not visible after slicing)
+        //   row 1: [11, 12] (visible row 0)
+        //   row 2: [21, 22] (visible row 1)
+        //   row 3: [31, 32] (not visible after slicing)
+        let field: Arc<Field> = Arc::new(Field::new("item", DataType::Int32, false));
+        let full_values = Arc::new(Int32Array::from(vec![1, 2, 11, 12, 21, 22, 31, 32]));
+        let full_offsets = OffsetBuffer::new(vec![0, 2, 4, 6, 8].into());
+        let full = ListArray::new(Arc::clone(&field), full_offsets, full_values, None);
+
+        // Slice with offset=1 and len=2, so only rows 1 and 2 are visible.
+        let sliced_haystack: ArrayRef = Arc::new(full.slice(1, 2));
+
+        let list_type = sliced_haystack.data_type();
+        let haystack_field = Arc::new(Field::new("haystack", list_type.clone(), false));
+        let needle_field = Arc::new(Field::new("needle", list_type.clone(), false));
+        let return_field = Arc::new(Field::new("return", DataType::Boolean, true));
+        let config_options = Arc::new(ConfigOptions::default());
+
+        // array_has_all should be true for both rows.
+        let needle_all_values = Arc::new(Int32Array::from(vec![11, 21]));
+        let needle_all_offsets = OffsetBuffer::new(vec![0, 1, 2].into());
+        let needle_all: ArrayRef = Arc::new(ListArray::new(
+            Arc::clone(&field),
+            needle_all_offsets,
+            needle_all_values,
+            None,
+        ));
+        let all_result = ArrayHasAll::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(Arc::clone(&sliced_haystack)),
+                ColumnarValue::Array(needle_all),
+            ],
+            arg_fields: vec![Arc::clone(&haystack_field), Arc::clone(&needle_field)],
+            number_rows: 2,
+            return_field: Arc::clone(&return_field),
+            config_options: Arc::clone(&config_options),
+        })?;
+
+        let all_output = all_result.into_array(2)?;
+        assert_eq!(
+            all_output.as_boolean().iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(true)],
+        );
+
+        // array_has_any should be true for both rows as well.
+        let needle_any_values = Arc::new(Int32Array::from(vec![99, 11, 99, 21]));
+        let needle_any_offsets = OffsetBuffer::new(vec![0, 2, 4].into());
+        let needle_any: ArrayRef = Arc::new(ListArray::new(
+            field,
+            needle_any_offsets,
+            needle_any_values,
+            None,
+        ));
+        let any_result = ArrayHasAny::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(sliced_haystack),
+                ColumnarValue::Array(needle_any),
+            ],
+            arg_fields: vec![haystack_field, needle_field],
+            number_rows: 2,
+            return_field,
+            config_options,
+        })?;
+
+        let any_output = any_result.into_array(2)?;
+        assert_eq!(
+            any_output.as_boolean().iter().collect::<Vec<_>>(),
+            vec![Some(true), Some(true)],
+        );
 
         Ok(())
     }

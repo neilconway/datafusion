@@ -23,7 +23,7 @@ use arrow::array::{
 };
 use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::DataType;
-use arrow::row::{RowConverter, Rows, SortField};
+use arrow::row::{RowConverter, SortField};
 use datafusion_common::cast::{as_fixed_size_list_array, as_generic_list_array};
 use datafusion_common::utils::string_utils::string_array_to_vec;
 use datafusion_common::utils::take_function_args;
@@ -36,13 +36,11 @@ use datafusion_expr::{
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::datum::compare_with_eq;
 use itertools::Itertools;
-
 use crate::make_array::make_array_udf;
 use crate::utils::make_scalar_function;
 
 use hashbrown::HashSet;
 use std::any::Any;
-use std::ops::Range;
 use std::sync::Arc;
 
 // Create static instances of ScalarUDFs for each function
@@ -440,6 +438,7 @@ fn general_array_has_for_all_and_any<'a>(
     let h_nulls = haystack.nulls();
     let n_nulls = needle.nulls();
     let mut builder = BooleanArray::builder(num_rows);
+    let mut lookup_set: HashSet<&[u8]> = HashSet::new();
 
     for i in 0..num_rows {
         if h_nulls.is_some_and(|n| n.is_null(i)) || n_nulls.is_some_and(|n| n.is_null(i))
@@ -447,13 +446,43 @@ fn general_array_has_for_all_and_any<'a>(
             builder.append_null();
             continue;
         }
-        builder.append_value(general_array_has_all_and_any_kernel(
-            &all_h_rows,
-            (h_offsets[i] - h_base)..(h_offsets[i + 1] - h_base),
-            &all_n_rows,
-            (n_offsets[i] - n_base)..(n_offsets[i + 1] - n_base),
-            comparison_type,
-        ));
+        let h_start = h_offsets[i] - h_base;
+        let h_end = h_offsets[i + 1] - h_base;
+        let n_start = n_offsets[i] - n_base;
+        let n_end = n_offsets[i + 1] - n_base;
+
+        lookup_set.clear();
+        let result = match comparison_type {
+            ComparisonType::All => {
+                // Build set from haystack, probe with each needle element.
+                // Short-circuits on first needle miss.
+                for hi in h_start..h_end {
+                    lookup_set.insert(all_h_rows.row(hi).data());
+                }
+                (n_start..n_end)
+                    .all(|ni| lookup_set.contains(all_n_rows.row(ni).data()))
+            }
+            ComparisonType::Any => {
+                // Build set from whichever side is smaller, iterate the
+                // larger side with early exit on first match.
+                let h_len = h_end - h_start;
+                let n_len = n_end - n_start;
+                if h_len <= n_len {
+                    for hi in h_start..h_end {
+                        lookup_set.insert(all_h_rows.row(hi).data());
+                    }
+                    (n_start..n_end)
+                        .any(|ni| lookup_set.contains(all_n_rows.row(ni).data()))
+                } else {
+                    for ni in n_start..n_end {
+                        lookup_set.insert(all_n_rows.row(ni).data());
+                    }
+                    (h_start..h_end)
+                        .any(|hi| lookup_set.contains(all_h_rows.row(hi).data()))
+                }
+            }
+        };
+        builder.append_value(result);
     }
 
     Ok(Arc::new(builder.finish()))
@@ -486,6 +515,7 @@ fn array_has_all_and_any_string_internal<'a>(
     let h_nulls = haystack.nulls();
     let n_nulls = needle.nulls();
     let mut builder = BooleanArray::builder(num_rows);
+    let mut lookup_set: HashSet<Option<&str>> = HashSet::new();
 
     for i in 0..num_rows {
         if h_nulls.is_some_and(|n| n.is_null(i)) || n_nulls.is_some_and(|n| n.is_null(i))
@@ -497,11 +527,34 @@ fn array_has_all_and_any_string_internal<'a>(
         let h_end = h_offsets[i + 1] - h_base;
         let n_start = n_offsets[i] - n_base;
         let n_end = n_offsets[i + 1] - n_base;
-        builder.append_value(array_has_string_kernel(
-            &all_h_strings[h_start..h_end],
-            &all_n_strings[n_start..n_end],
-            comparison_type,
-        ));
+
+        lookup_set.clear();
+        let result = match comparison_type {
+            ComparisonType::All => {
+                lookup_set.extend(all_h_strings[h_start..h_end].iter().copied());
+                all_n_strings[n_start..n_end]
+                    .iter()
+                    .all(|n| lookup_set.contains(n))
+            }
+            ComparisonType::Any => {
+                let h_len = h_end - h_start;
+                let n_len = n_end - n_start;
+                if h_len <= n_len {
+                    lookup_set
+                        .extend(all_h_strings[h_start..h_end].iter().copied());
+                    all_n_strings[n_start..n_end]
+                        .iter()
+                        .any(|n| lookup_set.contains(n))
+                } else {
+                    lookup_set
+                        .extend(all_n_strings[n_start..n_end].iter().copied());
+                    all_h_strings[h_start..h_end]
+                        .iter()
+                        .any(|h| lookup_set.contains(h))
+                }
+            }
+        };
+        builder.append_value(result);
     }
 
     Ok(Arc::new(builder.finish()))
@@ -916,45 +969,6 @@ enum ComparisonType {
     All,
     // array_has_any
     Any,
-}
-
-fn array_has_string_kernel(
-    haystack: &[Option<&str>],
-    needle: &[Option<&str>],
-    comparison_type: ComparisonType,
-) -> bool {
-    match comparison_type {
-        ComparisonType::All => needle
-            .iter()
-            .dedup()
-            .all(|x| haystack.iter().dedup().any(|y| y == x)),
-        ComparisonType::Any => needle
-            .iter()
-            .dedup()
-            .any(|x| haystack.iter().dedup().any(|y| y == x)),
-    }
-}
-
-fn general_array_has_all_and_any_kernel(
-    haystack_rows: &Rows,
-    h_range: Range<usize>,
-    needle_rows: &Rows,
-    mut n_range: Range<usize>,
-    comparison_type: ComparisonType,
-) -> bool {
-    let h_start = h_range.start;
-    let h_end = h_range.end;
-
-    match comparison_type {
-        ComparisonType::All => n_range.all(|ni| {
-            let needle_row = needle_rows.row(ni);
-            (h_start..h_end).any(|hi| haystack_rows.row(hi) == needle_row)
-        }),
-        ComparisonType::Any => n_range.any(|ni| {
-            let needle_row = needle_rows.row(ni);
-            (h_start..h_end).any(|hi| haystack_rows.row(hi) == needle_row)
-        }),
-    }
 }
 
 #[cfg(test)]

@@ -243,11 +243,8 @@ fn array_position_scalar<O: OffsetSizeTrait>(
     // `array_position`
     let eq_array = arrow_ord::cmp::not_distinct(list_array.values(), &element_datum)?;
     let eq_bits = eq_array.values();
-
-    // If no elements match anywhere, every row's result is null.
-    if eq_bits.count_set_bits() == 0 {
-        return Ok(Arc::new(UInt64Array::new_null(list_array.len())));
-    }
+    let bit_data = eq_bits.values();
+    let bit_offset = eq_bits.offset();
 
     let mut result: Vec<Option<u64>> = Vec::with_capacity(list_array.len());
 
@@ -266,22 +263,97 @@ fn array_position_scalar<O: OffsetSizeTrait>(
             return exec_err!("start_from out of bounds: {}", from + 1);
         }
         let search_start = start + from as usize;
-        let search_len = end - search_start;
 
-        // Slice the equality bitmap to this row's search range and find the
-        // first match. `slice()` is O(1) (no data copy) and `set_indices()`
-        // uses word-level scanning internally, so it both skips zero regions
-        // efficiently and stops after the first match.
-        let found = eq_bits
-            .slice(search_start, search_len)
-            .set_indices()
-            .next()
-            .map(|local_pos| (search_start + local_pos - start + 1) as u64);
+        let found = first_set_bit_in_range(bit_data, bit_offset, search_start, end)
+            .map(|pos| (pos - start + 1) as u64);
         result.push(found);
     }
 
     debug_assert_eq!(result.len(), list_array.len());
     Ok(Arc::new(UInt64Array::from(result)))
+}
+
+/// Finds the first set bit in the range [start, end) of a bit-packed buffer.
+///
+/// `data` is the raw byte buffer, `bit_offset` is the global bit offset
+/// (from `BooleanBuffer::offset()`), and `start`/`end` are positions
+/// relative to that offset.
+///
+/// Uses u64 word-level scanning with `trailing_zeros()` so that zero-heavy
+/// regions (no matches) are skipped ~64 bits at a time, while still
+/// stopping immediately on the first match.
+#[inline]
+fn first_set_bit_in_range(
+    data: &[u8],
+    bit_offset: usize,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    if start >= end {
+        return None;
+    }
+    let abs_start = bit_offset + start;
+    let abs_end = bit_offset + end;
+
+    let first_byte = abs_start / 8;
+    let last_byte = (abs_end - 1) / 8;
+    let start_bit = (abs_start % 8) as u32;
+
+    // All bits within a single byte
+    if first_byte == last_byte {
+        let end_bit = (abs_end % 8) as u32;
+        let mask = if end_bit == 0 {
+            0xFFu8
+        } else {
+            (1u8 << end_bit) - 1
+        };
+        let byte = data[first_byte] & mask & (0xFFu8 << start_bit);
+        return if byte != 0 {
+            Some(first_byte * 8 + byte.trailing_zeros() as usize - bit_offset)
+        } else {
+            None
+        };
+    }
+
+    // First partial byte
+    let byte = data[first_byte] & (0xFFu8 << start_bit);
+    if byte != 0 {
+        return Some(first_byte * 8 + byte.trailing_zeros() as usize - bit_offset);
+    }
+
+    // Middle bytes: scan in u64 words where possible
+    let mut idx = first_byte + 1;
+    while idx + 8 <= last_byte {
+        let word = u64::from_le_bytes(
+            data[idx..idx + 8].try_into().expect("slice is 8 bytes"),
+        );
+        if word != 0 {
+            return Some(idx * 8 + word.trailing_zeros() as usize - bit_offset);
+        }
+        idx += 8;
+    }
+
+    // Remaining middle bytes (< 8)
+    while idx < last_byte {
+        if data[idx] != 0 {
+            return Some(idx * 8 + data[idx].trailing_zeros() as usize - bit_offset);
+        }
+        idx += 1;
+    }
+
+    // Last partial byte
+    let end_bit = (abs_end % 8) as u32;
+    let mask = if end_bit == 0 {
+        0xFFu8
+    } else {
+        (1u8 << end_bit) - 1
+    };
+    let byte = data[last_byte] & mask;
+    if byte != 0 {
+        Some(last_byte * 8 + byte.trailing_zeros() as usize - bit_offset)
+    } else {
+        None
+    }
 }
 
 fn general_position_dispatch<O: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {

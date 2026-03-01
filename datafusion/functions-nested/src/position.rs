@@ -244,18 +244,18 @@ fn array_position_scalar<O: OffsetSizeTrait>(
     let eq_array = arrow_ord::cmp::not_distinct(list_array.values(), &element_datum)?;
     let eq_bits = eq_array.values();
 
+    // If no elements match anywhere, every row's result is null.
+    if eq_bits.count_set_bits() == 0 {
+        return Ok(Arc::new(UInt64Array::new_null(list_array.len())));
+    }
+
     let mut result: Vec<Option<u64>> = Vec::with_capacity(list_array.len());
-    let mut matches = eq_bits.set_indices().peekable();
 
     for i in 0..list_array.len() {
         let start = offsets[i].as_usize();
         let end = offsets[i + 1].as_usize();
 
         if validity.is_some_and(|v| v.is_null(i)) {
-            // Null row -> null output; advance past matches in range
-            while matches.peek().is_some_and(|&p| p < end) {
-                matches.next();
-            }
             result.push(None);
             continue;
         }
@@ -266,23 +266,18 @@ fn array_position_scalar<O: OffsetSizeTrait>(
             return exec_err!("start_from out of bounds: {}", from + 1);
         }
         let search_start = start + from as usize;
+        let search_len = end - search_start;
 
-        // Advance past matches before search_start
-        while matches.peek().is_some_and(|&p| p < search_start) {
-            matches.next();
-        }
-
-        // First match in [search_start, end)?
-        if matches.peek().is_some_and(|&p| p < end) {
-            let pos = *matches.peek().unwrap();
-            result.push(Some((pos - start + 1) as u64));
-            // Advance past remaining matches in this row
-            while matches.peek().is_some_and(|&p| p < end) {
-                matches.next();
-            }
-        } else {
-            result.push(None);
-        }
+        // Slice the equality bitmap to this row's search range and find the
+        // first match. `slice()` is O(1) (no data copy) and `set_indices()`
+        // uses word-level scanning internally, so it both skips zero regions
+        // efficiently and stops after the first match.
+        let found = eq_bits
+            .slice(search_start, search_len)
+            .set_indices()
+            .next()
+            .map(|local_pos| (search_start + local_pos - start + 1) as u64);
+        result.push(found);
     }
 
     debug_assert_eq!(result.len(), list_array.len());

@@ -18,12 +18,12 @@
 //! [`ScalarUDFImpl`] definitions for range and gen_series functions.
 
 use crate::utils::make_scalar_function;
-use arrow::buffer::OffsetBuffer;
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::TimeUnit;
 use arrow::datatypes::{DataType, Field, IntervalUnit::MonthDayNano};
 use arrow::{
     array::{
-        Array, ArrayRef, Int64Array, ListArray, ListBuilder, NullBufferBuilder,
+        Array, ArrayRef, Int64Array, ListArray, ListBuilder,
         builder::{Date32Builder, TimestampNanosecondBuilder},
         temporal_conversions::as_datetime_with_timezone,
         timezone::Tz,
@@ -322,41 +322,49 @@ impl Range {
 
         let mut values = vec![];
         let mut offsets = vec![0];
-        let mut valid = NullBufferBuilder::new(stop_array.len());
-        for (idx, stop) in stop_array.iter().enumerate() {
-            match retrieve_range_args(start_array, stop, step_array, idx) {
-                Some((_, _, 0)) => {
-                    return exec_err!(
-                        "step can't be 0 for function {}(start [, stop, step])",
-                        self.name()
-                    );
-                }
-                Some((start, stop, step)) => {
-                    // Below, we utilize `usize` to represent steps.
-                    // On 32-bit targets, the absolute value of `i64` may fail to fit into `usize`.
-                    let step_abs =
-                        usize::try_from(step.unsigned_abs()).map_err(|_| {
-                            not_impl_datafusion_err!("step {} can't fit into usize", step)
-                        })?;
-                    values.extend(
-                        gen_range_iter(start, stop, step < 0, self.include_upper_bound)
-                            .step_by(step_abs),
-                    );
-                    offsets.push(values.len() as i32);
-                    valid.append_non_null();
-                }
-                // If any of the arguments is NULL, append a NULL value to the result.
-                None => {
-                    offsets.push(values.len() as i32);
-                    valid.append_null();
-                }
-            };
+
+        // Precompute null buffer: a row is null if any input is null.
+        let mut valid = stop_array.nulls().cloned();
+        if let Some(start_arr) = start_array {
+            valid = NullBuffer::union(valid.as_ref(), start_arr.nulls());
+        }
+        if let Some(step_arr) = step_array {
+            valid = NullBuffer::union(valid.as_ref(), step_arr.nulls());
+        }
+
+        for idx in 0..stop_array.len() {
+            if valid.as_ref().is_some_and(|v| v.is_null(idx)) {
+                offsets.push(values.len() as i32);
+                continue;
+            }
+
+            let start = start_array.map_or(0, |arr| arr.value(idx));
+            let stop = stop_array.value(idx);
+            let step = step_array.map_or(1, |arr| arr.value(idx));
+
+            if step == 0 {
+                return exec_err!(
+                    "step can't be 0 for function {}(start [, stop, step])",
+                    self.name()
+                );
+            }
+
+            // Below, we utilize `usize` to represent steps.
+            // On 32-bit targets, the absolute value of `i64` may fail to fit into `usize`.
+            let step_abs = usize::try_from(step.unsigned_abs()).map_err(|_| {
+                not_impl_datafusion_err!("step {} can't fit into usize", step)
+            })?;
+            values.extend(
+                gen_range_iter(start, stop, step < 0, self.include_upper_bound)
+                    .step_by(step_abs),
+            );
+            offsets.push(values.len() as i32);
         }
         let arr = Arc::new(ListArray::try_new(
             Arc::new(Field::new_list_field(DataType::Int64, true)),
             OffsetBuffer::new(offsets.into()),
             Arc::new(Int64Array::from(values)),
-            valid.finish(),
+            valid,
         )?);
         Ok(arr)
     }
@@ -530,24 +538,6 @@ impl Range {
 
         Ok(arr)
     }
-}
-
-/// Get the (start, stop, step) args for the range and generate_series function.
-/// If any of the arguments is NULL, returns None.
-fn retrieve_range_args(
-    start_array: Option<&Int64Array>,
-    stop: Option<i64>,
-    step_array: Option<&Int64Array>,
-    idx: usize,
-) -> Option<(i64, i64, i64)> {
-    // Default start value is 0 if not provided
-    let start =
-        start_array.map_or(Some(0), |arr| arr.is_valid(idx).then(|| arr.value(idx)))?;
-    let stop = stop?;
-    // Default step value is 1 if not provided
-    let step =
-        step_array.map_or(Some(1), |arr| arr.is_valid(idx).then(|| arr.value(idx)))?;
-    Some((start, stop, step))
 }
 
 /// Returns an iterator of i64 values from start to stop

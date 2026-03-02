@@ -19,7 +19,7 @@
 
 use arrow::array::{
     Array, ArrayRef, AsArray, Capacities, GenericListArray, MutableArrayData,
-    NullBufferBuilder, OffsetSizeTrait, new_null_array,
+    OffsetSizeTrait, new_null_array,
 };
 use arrow::datatypes::{DataType, Field};
 
@@ -344,12 +344,9 @@ fn general_replace<O: OffsetSizeTrait>(
         capacity,
     );
 
-    let mut valid = NullBufferBuilder::new(list_array.len());
-
     for (row_index, offset_window) in list_array.offsets().windows(2).enumerate() {
         if list_array.is_null(row_index) {
             offsets.push(offsets[row_index]);
-            valid.append_null();
             continue;
         }
 
@@ -376,7 +373,6 @@ fn general_replace<O: OffsetSizeTrait>(
                 end.to_usize().unwrap(),
             );
             offsets.push(offsets[row_index] + (end - start));
-            valid.append_non_null();
             continue;
         }
 
@@ -405,7 +401,6 @@ fn general_replace<O: OffsetSizeTrait>(
         }
 
         offsets.push(offsets[row_index] + (end - start));
-        valid.append_non_null();
     }
 
     let data = mutable.freeze();
@@ -414,7 +409,7 @@ fn general_replace<O: OffsetSizeTrait>(
         Arc::new(Field::new_list_field(list_array.value_type(), true)),
         OffsetBuffer::<O>::new(offsets.into()),
         arrow::array::make_array(data),
-        valid.finish(),
+        list_array.nulls().cloned(),
     )?))
 }
 

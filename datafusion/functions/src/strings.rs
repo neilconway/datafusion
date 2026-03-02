@@ -296,13 +296,15 @@ impl LargeStringArrayBuilder {
 ///
 /// # Arguments
 /// - views_buffer: The buffer to append the new view to
-/// - null_builder: The buffer to append the null value to
+/// - null_builder: Optional buffer to append the null value to. If `Some`,
+///   marks the row as non-null. Pass `None` when null tracking is handled
+///   separately (e.g., via a precomputed null buffer).
 /// - original_view: The original view value
 /// - substr: The substring to append. Must be a valid substring of the original view
 /// - start_offset: The start offset of the substring in the view
 pub fn make_and_append_view(
     views_buffer: &mut Vec<u128>,
-    null_builder: &mut NullBufferBuilder,
+    null_builder: Option<&mut NullBufferBuilder>,
     original_view: &u128,
     substr: &str,
     start_offset: u32,
@@ -320,7 +322,9 @@ pub fn make_and_append_view(
         make_view(substr.as_bytes(), 0, 0)
     };
     views_buffer.push(sub_view);
-    null_builder.append_non_null();
+    if let Some(null_builder) = null_builder {
+        null_builder.append_non_null();
+    }
 }
 
 #[derive(Debug)]

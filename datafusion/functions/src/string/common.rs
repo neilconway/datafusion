@@ -154,7 +154,7 @@ fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     let (trimmed, offset) = Tr::trim_ascii_char(src_str, b' ');
                     make_and_append_view(
                         &mut views_buf,
-                        &mut null_builder,
+                        Some(&mut null_builder),
                         raw_view,
                         trimmed,
                         offset,
@@ -206,7 +206,7 @@ fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
                         let (trimmed, offset) = Tr::trim(src_str, &pattern);
                         make_and_append_view(
                             &mut views_buf,
-                            &mut null_builder,
+                            Some(&mut null_builder),
                             raw_view,
                             trimmed,
                             offset,
@@ -261,7 +261,7 @@ fn trim_and_append_view<Tr: Trimmer>(
 ) {
     if let Some(src_str) = src_str_opt {
         let (trimmed, offset) = Tr::trim(src_str, pattern);
-        make_and_append_view(views_buf, null_builder, original_view, trimmed, offset);
+        make_and_append_view(views_buf, Some(null_builder), original_view, trimmed, offset);
     } else {
         null_builder.append_null();
         views_buf.push(0);

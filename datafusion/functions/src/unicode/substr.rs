@@ -21,10 +21,10 @@ use std::sync::Arc;
 use crate::strings::make_and_append_view;
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    Array, ArrayIter, ArrayRef, AsArray, Int64Array, NullBufferBuilder, StringArrayType,
-    StringViewArray, StringViewBuilder,
+    Array, ArrayIter, ArrayRef, AsArray, Int64Array, StringArrayType, StringViewArray,
+    StringViewBuilder,
 };
-use arrow::buffer::ScalarBuffer;
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::types::{
@@ -282,7 +282,6 @@ fn string_view_substr(
     args: &[ArrayRef],
 ) -> Result<ArrayRef> {
     let mut views_buf = Vec::with_capacity(string_view_array.len());
-    let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
     let start_array = as_int64_array(&args[0])?;
     let count_array_opt = if args.len() == 2 {
@@ -294,8 +293,15 @@ fn string_view_substr(
     let enable_ascii_fast_path =
         enable_ascii_fast_path(&string_view_array, start_array, count_array_opt);
 
-    // In either case of `substr(s, i)` or `substr(s, i, cnt)`
-    // If any of input argument is `NULL`, the result is `NULL`
+    // Precompute null buffer: a row is null if any input is null.
+    let mut nulls_buf = NullBuffer::union(
+        string_view_array.nulls(),
+        start_array.nulls(),
+    );
+    if let Some(count_array) = count_array_opt {
+        nulls_buf = NullBuffer::union(nulls_buf.as_ref(), count_array.nulls());
+    }
+
     match args.len() {
         1 => {
             for ((str_opt, raw_view), start_opt) in string_view_array
@@ -310,13 +316,12 @@ fn string_view_substr(
 
                     make_and_append_view(
                         &mut views_buf,
-                        &mut null_builder,
+                        None,
                         raw_view,
                         substr,
                         start as u32,
                     );
                 } else {
-                    null_builder.append_null();
                     views_buf.push(0);
                 }
             }
@@ -352,14 +357,13 @@ fn string_view_substr(
 
                         make_and_append_view(
                             &mut views_buf,
-                            &mut null_builder,
+                            None,
                             raw_view,
                             substr,
                             start as u32,
                         );
                     }
                 } else {
-                    null_builder.append_null();
                     views_buf.push(0);
                 }
             }
@@ -372,7 +376,6 @@ fn string_view_substr(
     }
 
     let views_buf = ScalarBuffer::from(views_buf);
-    let nulls_buf = null_builder.finish();
 
     // Safety:
     // (1) The blocks of the given views are all provided

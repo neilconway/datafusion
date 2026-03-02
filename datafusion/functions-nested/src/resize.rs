@@ -20,7 +20,7 @@
 use crate::utils::make_scalar_function;
 use arrow::array::{
     Array, ArrayRef, Capacities, GenericListArray, Int64Array, MutableArrayData,
-    NullBufferBuilder, OffsetSizeTrait, new_null_array,
+    OffsetSizeTrait, new_null_array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::DataType;
@@ -224,15 +224,11 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         capacity,
     );
 
-    let mut null_builder = NullBufferBuilder::new(array.len());
-
     for (row_index, offset_window) in array.offsets().windows(2).enumerate() {
         if array.is_null(row_index) {
-            null_builder.append_null();
             offsets.push(offsets[row_index]);
             continue;
         }
-        null_builder.append_non_null();
 
         let count = count_array.value(row_index).to_usize().ok_or_else(|| {
             internal_datafusion_err!("array_resize: failed to convert size to usize")
@@ -265,6 +261,6 @@ fn general_list_resize<O: OffsetSizeTrait + TryInto<i64>>(
         Arc::clone(field),
         OffsetBuffer::<O>::new(offsets.into()),
         arrow::array::make_array(data),
-        null_builder.finish(),
+        array.nulls().cloned(),
     )?))
 }

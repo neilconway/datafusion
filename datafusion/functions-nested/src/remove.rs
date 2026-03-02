@@ -20,8 +20,8 @@
 use crate::utils;
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    Array, ArrayRef, Capacities, GenericListArray, MutableArrayData, NullBufferBuilder,
-    OffsetSizeTrait, cast::AsArray, make_array,
+    Array, ArrayRef, Capacities, GenericListArray, MutableArrayData, OffsetSizeTrait,
+    cast::AsArray, make_array,
 };
 use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, FieldRef};
@@ -387,12 +387,9 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
         false,
         Capacities::Array(original_data.len()),
     );
-    let mut valid = NullBufferBuilder::new(list_array.len());
-
     for (row_index, offset_window) in list_array.offsets().windows(2).enumerate() {
         if list_array.is_null(row_index) {
             offsets.push(offsets[row_index]);
-            valid.append_null();
             continue;
         }
 
@@ -415,7 +412,6 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
         if num_to_remove == 0 {
             mutable.extend(0, start, end);
             offsets.push(offsets[row_index] + OffsetSize::usize_as(end - start));
-            valid.append_non_null();
             continue;
         }
 
@@ -446,7 +442,6 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
         }
 
         offsets.push(offsets[row_index] + OffsetSize::usize_as(copied));
-        valid.append_non_null();
     }
 
     let new_values = make_array(mutable.freeze());
@@ -454,7 +449,7 @@ fn general_remove<OffsetSize: OffsetSizeTrait>(
         Arc::clone(list_field),
         OffsetBuffer::new(offsets.into()),
         new_values,
-        valid.finish(),
+        list_array.nulls().cloned(),
     )?))
 }
 

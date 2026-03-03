@@ -20,8 +20,8 @@
 use ahash::RandomState;
 use arrow::array::{
     Array, ArrayRef, ArrowPrimitiveType, DictionaryArray, GenericStringArray, Int32Array,
-    Int64Array, ListArray, MapArray, NullBufferBuilder, OffsetSizeTrait, PrimitiveArray,
-    RunArray, StringViewArray, StructArray, UnionArray, make_array,
+    Int64Array, ListArray, ListViewArray, MapArray, NullBufferBuilder, OffsetSizeTrait,
+    PrimitiveArray, RunArray, StringViewArray, StructArray, UnionArray, make_array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{
@@ -82,6 +82,11 @@ fn criterion_benchmark(c: &mut Criterion) {
         BenchData {
             name: "list_array",
             array: list_array(BATCH_SIZE),
+            supports_nulls: true,
+        },
+        BenchData {
+            name: "list_view_array",
+            array: list_view_array(BATCH_SIZE),
             supports_nulls: true,
         },
         BenchData {
@@ -319,6 +324,24 @@ fn sliced_array_benchmark(c: &mut Criterion) {
             );
         }
 
+        // Sliced ListViewArray
+        {
+            let full_array = list_view_array(total_rows);
+            let sliced: ArrayRef = Arc::new(
+                full_array
+                    .as_any()
+                    .downcast_ref::<ListViewArray>()
+                    .unwrap()
+                    .slice(slice_offset, slice_len),
+            );
+            c.bench_function(
+                &format!("list_view_array_sliced: 1/{ratio} of {total_rows} rows"),
+                |b| {
+                    do_hash_test_with_len(b, std::slice::from_ref(&sliced), slice_len);
+                },
+            );
+        }
+
         // Sliced MapArray
         {
             let full_array = map_array(total_rows);
@@ -383,6 +406,28 @@ fn list_array(num_rows: usize) -> ArrayRef {
     Arc::new(ListArray::new(
         Arc::new(Field::new("item", DataType::Int64, true)),
         OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Arc::new(values),
+        None,
+    ))
+}
+
+fn list_view_array(num_rows: usize) -> ArrayRef {
+    let mut rng = make_rng();
+    let elements_per_row = 5;
+    let total_elements = num_rows * elements_per_row;
+
+    let values: Int64Array = (0..total_elements)
+        .map(|_| Some(rng.random::<i64>()))
+        .collect();
+    let offsets: Vec<i32> = (0..num_rows)
+        .map(|i| (i * elements_per_row) as i32)
+        .collect();
+    let sizes: Vec<i32> = vec![elements_per_row as i32; num_rows];
+
+    Arc::new(ListViewArray::new(
+        Arc::new(Field::new("item", DataType::Int64, true)),
+        ScalarBuffer::from(offsets),
+        ScalarBuffer::from(sizes),
         Arc::new(values),
         None,
     ))

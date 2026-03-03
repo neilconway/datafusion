@@ -648,13 +648,50 @@ where
     let offsets = array.value_offsets();
     let sizes = array.value_sizes();
     let nulls = array.nulls();
-    let mut values_hashes = vec![0u64; values.len()];
-    create_hashes([values], random_state, &mut values_hashes)?;
+
+    // For sliced ListViewArrays, values() returns the full underlying
+    // buffer but only a subset of rows are visible. Compute the bounding
+    // range of referenced values so we only hash what is needed.
+    // When the first offset is 0, the array is likely unsliced, so skip
+    // the scan and hash the full buffer.
+    let first_offset = offsets.first().map(|o| o.as_usize()).unwrap_or(0);
+    let (min_offset, visible_len) = if first_offset > 0 {
+        let (lo, hi) = offsets
+            .iter()
+            .zip(sizes.iter())
+            .enumerate()
+            .filter(|(i, (_, size))| {
+                size.as_usize() > 0 && nulls.is_none_or(|n| n.is_valid(*i))
+            })
+            .fold((usize::MAX, 0usize), |(lo, hi), (_, (off, sz))| {
+                let start = off.as_usize();
+                let end = start + sz.as_usize();
+                (lo.min(start), hi.max(end))
+            });
+        if lo >= hi {
+            return Ok(());
+        }
+        (lo, hi - lo)
+    } else {
+        (0, values.len())
+    };
+
+    let mut values_hashes = vec![0u64; visible_len];
+    if min_offset == 0 {
+        create_hashes([values], random_state, &mut values_hashes)?;
+    } else {
+        create_hashes(
+            [values.slice(min_offset, visible_len)],
+            random_state,
+            &mut values_hashes,
+        )?;
+    }
+
     if let Some(nulls) = nulls {
         for (i, (offset, size)) in offsets.iter().zip(sizes.iter()).enumerate() {
             if nulls.is_valid(i) {
                 let hash = &mut hashes_buffer[i];
-                let start = offset.as_usize();
+                let start = offset.as_usize() - min_offset;
                 let end = start + size.as_usize();
                 for values_hash in &values_hashes[start..end] {
                     *hash = combine_hashes(*hash, *values_hash);
@@ -664,7 +701,7 @@ where
     } else {
         for (i, (offset, size)) in offsets.iter().zip(sizes.iter()).enumerate() {
             let hash = &mut hashes_buffer[i];
-            let start = offset.as_usize();
+            let start = offset.as_usize() - min_offset;
             let end = start + size.as_usize();
             for values_hash in &values_hashes[start..end] {
                 *hash = combine_hashes(*hash, *values_hash);

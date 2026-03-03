@@ -414,7 +414,7 @@ fn array_has_all_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
 /// Number of rows to process per chunk when doing batched row conversion.
 /// Keeps the converted data cache-friendly while amortizing the per-call
 /// overhead of `RowConverter::convert_columns`.
-const ROW_CONVERSION_CHUNK_SIZE: usize = 256;
+const ROW_CONVERSION_CHUNK_SIZE: usize = 512;
 
 // General row comparison for array_has_all and array_has_any
 fn general_array_has_for_all_and_any<'a>(

@@ -355,7 +355,7 @@ where
         None
     };
 
-    let enable_ascii_fast_path = string_array.is_ascii();
+    let is_ascii = string_array.is_ascii();
 
     match args.len() {
         1 => {
@@ -364,12 +364,8 @@ where
             for (string, start) in iter.zip(start_array.iter()) {
                 match (string, start) {
                     (Some(string), Some(start)) => {
-                        let (start, end) = get_true_start_end(
-                            string,
-                            start,
-                            None,
-                            enable_ascii_fast_path,
-                        ); // start, end is byte-based
+                        let (start, end) =
+                            get_true_start_end(string, start, None, is_ascii); // start, end is byte-based
                         let substr = &string[start..end];
                         result_builder.append_value(substr);
                     }
@@ -404,7 +400,7 @@ where
                                 string,
                                 start,
                                 Some(count as u64),
-                                enable_ascii_fast_path,
+                                is_ascii,
                             ); // start, end is byte-based
                             let substr = &string[start..end];
                             result_builder.append_value(substr);

@@ -432,13 +432,10 @@ fn substr_array_with_scalar_args(args: &[ColumnarValue]) -> Option<Result<ArrayR
     let ColumnarValue::Scalar(ScalarValue::Int64(Some(start))) = &args[1] else {
         return None;
     };
-    let count = if args.len() == 3 {
-        let ColumnarValue::Scalar(ScalarValue::Int64(Some(count))) = &args[2] else {
-            return None;
-        };
-        Some(*count)
-    } else {
-        None
+    let count = match args.get(2) {
+        Some(ColumnarValue::Scalar(ScalarValue::Int64(Some(c)))) => Some(*c),
+        Some(_) => return None,
+        None => None,
     };
     Some(substr_scalar_args(string_array, *start, count))
 }

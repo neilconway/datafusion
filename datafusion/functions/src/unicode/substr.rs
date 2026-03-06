@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::strings::make_and_append_view;
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    Array, ArrayIter, ArrayRef, AsArray, Int64Array, NullBufferBuilder, StringArrayType,
+    Array, ArrayIter, ArrayRef, AsArray, NullBufferBuilder, StringArrayType,
     StringViewArray, StringViewBuilder,
 };
 use arrow::buffer::ScalarBuffer;
@@ -169,11 +169,11 @@ fn substr(args: &[ArrayRef]) -> Result<ArrayRef> {
 // Convert the given `start` and `count` to valid byte indices within `input` string
 //
 // Input `start` and `count` are equivalent to PostgreSQL's `substr(s, start, count)`
-// `start` is 1-based, if `count` is not provided count to the end of the string
-// Input indices are character-based, and return values are byte indices
+// `start` is 1-based, if `count` is not provided count to the end of the string.
+// Input indices are character-based, and return values are byte indices.
 // The input bounds can be outside string bounds, this function will return
-// the intersection between input bounds and valid string bounds
-// `input_ascii_only` is used to optimize this function if `input` is ASCII-only
+// the intersection between input bounds and valid string bounds.
+// `input_ascii_only` is used to optimize this function if `input` is ASCII-only.
 //
 // * Example
 // 'Hi🌏' in-mem (`[]` for one char, `x` for one byte): [x][x][xxxx]
@@ -232,53 +232,6 @@ pub fn get_true_start_end(
     (st, ed)
 }
 
-// String characters are variable length encoded in UTF-8, `substr()` function's
-// arguments are character-based, converting them into byte-based indices
-// requires expensive decoding.
-// However, checking if a string is ASCII-only is relatively cheap.
-// If strings are ASCII only, use byte-based indices instead.
-//
-// A common pattern to call `substr()` is taking a small prefix of a long
-// string, such as `substr(long_str_with_1k_chars, 1, 32)`.
-// In such case the overhead of ASCII-validation may not be worth it, so
-// skip the validation for short prefix for now.
-pub fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
-    string_array: &V,
-    start: &Int64Array,
-    count: Option<&Int64Array>,
-) -> bool {
-    let is_short_prefix = match count {
-        Some(count) => {
-            let short_prefix_threshold = 32.0;
-            let n_sample = 10;
-
-            // HACK: can be simplified if function has specialized
-            // implementation for `ScalarValue` (implement without `make_scalar_function()`)
-            let total_prefix_len = start
-                .iter()
-                .zip(count.iter())
-                .take(n_sample)
-                .map(|(start, count)| {
-                    let start = start.unwrap_or(0);
-                    let count = count.unwrap_or(0);
-                    // To get substring, need to decode from 0 to start+count instead of start to start+count
-                    start.saturating_add(count)
-                })
-                .fold(0i64, |acc, val| acc.saturating_add(val));
-
-            (total_prefix_len as f64 / n_sample as f64) <= short_prefix_threshold
-        }
-        None => false,
-    };
-
-    if is_short_prefix {
-        // Skip ASCII validation for short prefix
-        false
-    } else {
-        string_array.is_ascii()
-    }
-}
-
 // The decoding process refs the trait at: arrow/arrow-data/src/byte_view.rs:44
 // From<u128> for ByteView
 fn string_view_substr(
@@ -295,8 +248,7 @@ fn string_view_substr(
         None
     };
 
-    let enable_ascii_fast_path =
-        enable_ascii_fast_path(&string_view_array, start_array, count_array_opt);
+    let enable_ascii_fast_path = string_view_array.is_ascii();
 
     // In either case of `substr(s, i)` or `substr(s, i, cnt)`
     // If any of input argument is `NULL`, the result is `NULL`
@@ -343,7 +295,7 @@ fn string_view_substr(
                     } else {
                         if start == i64::MIN {
                             return exec_err!(
-                                "negative overflow when calculating skip value"
+                                "negative overflow when calculating substring start position"
                             );
                         }
                         let (start, end) = get_true_start_end(
@@ -403,8 +355,7 @@ where
         None
     };
 
-    let enable_ascii_fast_path =
-        enable_ascii_fast_path(&string_array, start_array, count_array_opt);
+    let enable_ascii_fast_path = string_array.is_ascii();
 
     match args.len() {
         1 => {
@@ -446,7 +397,7 @@ where
                         } else {
                             if start == i64::MIN {
                                 return exec_err!(
-                                    "negative overflow when calculating skip value"
+                                    "negative overflow when calculating substring start position"
                                 );
                             }
                             let (start, end) = get_true_start_end(
@@ -473,7 +424,7 @@ where
 }
 
 /// Fast path: handle substr(array_str, scalar_start[, scalar_count]).
-/// Returns None if the args don't match this pattern (falls back to general path).
+/// Returns None if the args don't match this pattern.
 fn substr_array_with_scalar_args(args: &[ColumnarValue]) -> Option<Result<ArrayRef>> {
     let ColumnarValue::Array(string_array) = &args[0] else {
         return None;
@@ -504,7 +455,9 @@ fn substr_scalar_args(
             );
         }
         if start == i64::MIN {
-            return exec_err!("negative overflow when calculating skip value");
+            return exec_err!(
+                "negative overflow when calculating substring start position"
+            );
         }
     }
     match string_array.data_type() {
@@ -979,7 +932,7 @@ mod tests {
                 ColumnarValue::Scalar(ScalarValue::from(i64::MIN)),
                 ColumnarValue::Scalar(ScalarValue::from(1i64)),
             ],
-            exec_err!("negative overflow when calculating skip value"),
+            exec_err!("negative overflow when calculating substring start position"),
             &str,
             Utf8View,
             StringViewArray

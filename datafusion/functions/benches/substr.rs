@@ -21,7 +21,7 @@ use arrow::util::bench_util::{
     create_string_array_with_len, create_string_view_array_with_len,
 };
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use datafusion_common::DataFusionError;
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_common::config::ConfigOptions;
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion_functions::unicode;
@@ -93,6 +93,62 @@ fn create_args_with_count<O: OffsetSizeTrait>(
             ColumnarValue::Array(string_array),
             ColumnarValue::Array(Arc::clone(&start_array) as ArrayRef),
             ColumnarValue::Array(Arc::clone(&count_array) as ArrayRef),
+        ]
+    }
+}
+
+fn create_args_scalar_without_count<O: OffsetSizeTrait>(
+    size: usize,
+    str_len: usize,
+    start_half_way: bool,
+    force_view_types: bool,
+) -> Vec<ColumnarValue> {
+    let start = if start_half_way {
+        (str_len / 2) as i64
+    } else {
+        1i64
+    };
+
+    if force_view_types {
+        let string_array =
+            Arc::new(create_string_view_array_with_len(size, 0.1, str_len, false));
+        vec![
+            ColumnarValue::Array(string_array),
+            ColumnarValue::Scalar(ScalarValue::from(start)),
+        ]
+    } else {
+        let string_array =
+            Arc::new(create_string_array_with_len::<O>(size, 0.1, str_len));
+        vec![
+            ColumnarValue::Array(string_array),
+            ColumnarValue::Scalar(ScalarValue::from(start)),
+        ]
+    }
+}
+
+fn create_args_scalar_with_count<O: OffsetSizeTrait>(
+    size: usize,
+    str_len: usize,
+    count_max: usize,
+    force_view_types: bool,
+) -> Vec<ColumnarValue> {
+    let count = count_max.min(str_len) as i64;
+
+    if force_view_types {
+        let string_array =
+            Arc::new(create_string_view_array_with_len(size, 0.1, str_len, false));
+        vec![
+            ColumnarValue::Array(string_array),
+            ColumnarValue::Scalar(ScalarValue::from(1i64)),
+            ColumnarValue::Scalar(ScalarValue::from(count)),
+        ]
+    } else {
+        let string_array =
+            Arc::new(create_string_array_with_len::<O>(size, 0.1, str_len));
+        vec![
+            ColumnarValue::Array(string_array),
+            ColumnarValue::Scalar(ScalarValue::from(1i64)),
+            ColumnarValue::Scalar(ScalarValue::from(count)),
         ]
     }
 }
@@ -194,6 +250,53 @@ fn criterion_benchmark(c: &mut Criterion) {
         let args = create_args_with_count::<i64>(size, len, count, false);
         group.bench_function(
             format!("substr_large_string [size={size}, count={count}, strlen={len}]",),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        group.finish();
+
+        // Scalar start, no count
+        let len = 12;
+        let mut group = c.benchmark_group("SCALAR START, SHORTER THAN 12");
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+
+        let args = create_args_scalar_without_count::<i32>(size, len, true, true);
+        group.bench_function(
+            format!("substr_string_view [size={size}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        let args = create_args_scalar_without_count::<i32>(size, len, false, false);
+        group.bench_function(
+            format!("substr_string [size={size}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        group.finish();
+
+        // Scalar start and count, longer strings
+        let len = 128;
+        let count = 64;
+        let mut group = c.benchmark_group("SCALAR ARGS, LONGER THAN 12");
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+
+        let args = create_args_scalar_with_count::<i32>(size, len, count, true);
+        group.bench_function(
+            format!("substr_string_view [size={size}, count={count}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        let args = create_args_scalar_with_count::<i32>(size, len, count, false);
+        group.bench_function(
+            format!("substr_string [size={size}, count={count}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        let args = create_args_scalar_with_count::<i64>(size, len, count, false);
+        group.bench_function(
+            format!("substr_large_string [size={size}, count={count}, strlen={len}]"),
             |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
         );
 

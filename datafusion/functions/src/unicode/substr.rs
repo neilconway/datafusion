@@ -30,7 +30,7 @@ use datafusion_common::cast::as_int64_array;
 use datafusion_common::types::{
     NativeType, logical_int32, logical_int64, logical_string,
 };
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{
     Coercion, ColumnarValue, Documentation, ScalarUDFImpl, Signature, TypeSignature,
     TypeSignatureClass, Volatility,
@@ -125,6 +125,10 @@ impl ScalarUDFImpl for SubstrFunc {
         &self,
         args: datafusion_expr::ScalarFunctionArgs,
     ) -> Result<ColumnarValue> {
+        // Fast path for array string with scalar start/count
+        if let Some(result) = substr_array_with_scalar_args(&args.args) {
+            return result.map(ColumnarValue::Array);
+        }
         make_scalar_function(substr, vec![])(&args.args)
     }
 
@@ -466,6 +470,154 @@ where
             exec_err!("substr was called with {other} arguments. It requires 2 or 3.")
         }
     }
+}
+
+/// Fast path: handle substr(array_str, scalar_start[, scalar_count]).
+/// Returns None if the args don't match this pattern (falls back to general path).
+fn substr_array_with_scalar_args(args: &[ColumnarValue]) -> Option<Result<ArrayRef>> {
+    let ColumnarValue::Array(string_array) = &args[0] else {
+        return None;
+    };
+    let ColumnarValue::Scalar(ScalarValue::Int64(Some(start))) = &args[1] else {
+        return None;
+    };
+    let count = if args.len() == 3 {
+        let ColumnarValue::Scalar(ScalarValue::Int64(Some(count))) = &args[2] else {
+            return None;
+        };
+        Some(*count)
+    } else {
+        None
+    };
+    Some(substr_scalar_args(string_array, *start, count))
+}
+
+fn substr_scalar_args(
+    string_array: &ArrayRef,
+    start: i64,
+    count: Option<i64>,
+) -> Result<ArrayRef> {
+    if let Some(c) = count {
+        if c < 0 {
+            return exec_err!(
+                "negative substring length not allowed: substr(<str>, {start}, {c})"
+            );
+        }
+        if start == i64::MIN {
+            return exec_err!("negative overflow when calculating skip value");
+        }
+    }
+    match string_array.data_type() {
+        DataType::Utf8 => {
+            let string_array = string_array.as_string::<i32>();
+            string_substr_scalar_args(string_array, start, count)
+        }
+        DataType::LargeUtf8 => {
+            let string_array = string_array.as_string::<i64>();
+            string_substr_scalar_args(string_array, start, count)
+        }
+        DataType::Utf8View => {
+            let string_array = string_array.as_string_view();
+            string_view_substr_scalar_args(string_array, start, count)
+        }
+        other => exec_err!(
+            "Unsupported data type {other:?} for function substr,\
+            expected Utf8View, Utf8 or LargeUtf8."
+        ),
+    }
+}
+
+/// Decide whether to use the ASCII fast path when start/count are scalar.
+/// When taking a short prefix (start + count <= 32), the char-based decoding
+/// is cheaper than scanning the entire array for ASCII, so skip the check.
+fn is_ascii_for_scalar_args<'a, V: StringArrayType<'a>>(
+    string_array: &V,
+    start: i64,
+    count: Option<i64>,
+) -> bool {
+    let is_short_prefix = match count {
+        Some(c) => start.saturating_add(c) <= 32,
+        None => false,
+    };
+    if is_short_prefix {
+        false
+    } else {
+        string_array.is_ascii()
+    }
+}
+
+fn string_view_substr_scalar_args(
+    string_view_array: &StringViewArray,
+    start: i64,
+    count: Option<i64>,
+) -> Result<ArrayRef> {
+    let mut views_buf = Vec::with_capacity(string_view_array.len());
+    let mut null_builder = NullBufferBuilder::new(string_view_array.len());
+
+    let is_ascii = is_ascii_for_scalar_args(&string_view_array, start, count);
+    let count_u64 = count.map(|c| c as u64);
+
+    for (str_opt, raw_view) in string_view_array
+        .iter()
+        .zip(string_view_array.views().iter())
+    {
+        if let Some(s) = str_opt {
+            let (st, ed) = get_true_start_end(s, start, count_u64, is_ascii);
+            let substr = &s[st..ed];
+            make_and_append_view(
+                &mut views_buf,
+                &mut null_builder,
+                raw_view,
+                substr,
+                st as u32,
+            );
+        } else {
+            null_builder.append_null();
+            views_buf.push(0);
+        }
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let nulls_buf = null_builder.finish();
+
+    // Safety:
+    // (1) The blocks of the given views are all provided
+    // (2) Each of the range `view.offset+start..end` of view in views_buf is within
+    // the bounds of each of the blocks
+    unsafe {
+        let array = StringViewArray::new_unchecked(
+            views_buf,
+            string_view_array.data_buffers().to_vec(),
+            nulls_buf,
+        );
+        Ok(Arc::new(array) as ArrayRef)
+    }
+}
+
+fn string_substr_scalar_args<'a, V>(
+    string_array: V,
+    start: i64,
+    count: Option<i64>,
+) -> Result<ArrayRef>
+where
+    V: StringArrayType<'a>,
+{
+    let is_ascii = is_ascii_for_scalar_args(&string_array, start, count);
+    let count_u64 = count.map(|c| c as u64);
+
+    let iter = ArrayIter::new(string_array);
+    let mut result_builder = StringViewBuilder::new();
+
+    for string in iter {
+        if let Some(s) = string {
+            let (st, ed) = get_true_start_end(s, start, count_u64, is_ascii);
+            result_builder.append_value(&s[st..ed]);
+        } else {
+            result_builder.append_null();
+        }
+    }
+
+    Ok(Arc::new(result_builder.finish()) as ArrayRef)
 }
 
 #[cfg(test)]

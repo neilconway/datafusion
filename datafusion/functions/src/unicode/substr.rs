@@ -242,11 +242,6 @@ fn string_view_substr(
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
     let start_array = as_int64_array(&args[0])?;
-    let count_array_opt = if args.len() == 2 {
-        Some(as_int64_array(&args[1])?)
-    } else {
-        None
-    };
 
     let enable_ascii_fast_path = string_view_array.is_ascii();
 
@@ -278,7 +273,7 @@ fn string_view_substr(
             }
         }
         2 => {
-            let count_array = count_array_opt.unwrap();
+            let count_array = as_int64_array(&args[1])?;
             for (((str_opt, raw_view), start_opt), count_opt) in string_view_array
                 .iter()
                 .zip(string_view_array.views().iter())
@@ -349,11 +344,6 @@ where
     V: StringArrayType<'a>,
 {
     let start_array = as_int64_array(&args[0])?;
-    let count_array_opt = if args.len() == 2 {
-        Some(as_int64_array(&args[1])?)
-    } else {
-        None
-    };
 
     let is_ascii = string_array.is_ascii();
 
@@ -378,7 +368,7 @@ where
         }
         2 => {
             let iter = ArrayIter::new(string_array);
-            let count_array = count_array_opt.unwrap();
+            let count_array = as_int64_array(&args[1])?;
             let mut result_builder = StringViewBuilder::new();
 
             for ((string, start), count) in

@@ -208,6 +208,17 @@ SELECT substr('alphabet', NULL, 2)
 ----
 NULL
 
+# i64::MIN as start: returns full string without count, empty string with count
+query T
+SELECT substr('alphabet', arrow_cast(-9223372036854775808, 'Int64'))
+----
+alphabet
+
+query T
+SELECT substr('alphabet', arrow_cast(-9223372036854775808, 'Int64'), 1)
+----
+(empty)
+
 statement error Function 'substr' failed to match any signature
 SELECT substr(1, 3)
 

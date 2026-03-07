@@ -21,8 +21,8 @@ use arrow::util::bench_util::{
     create_string_array_with_len, create_string_view_array_with_len,
 };
 use criterion::{Criterion, SamplingMode, criterion_group, criterion_main};
-use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_expr::{ColumnarValue, ScalarFunctionArgs};
 use datafusion_functions::unicode;
 use std::hint::black_box;
@@ -194,10 +194,9 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
 
         let args = create_args_without_count::<i32>(size, len, false, false, true);
-        group.bench_function(
-            format!("substr_string [size={size}, strlen={len}]"),
-            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
-        );
+        group.bench_function(format!("substr_string [size={size}, strlen={len}]"), |b| {
+            b.iter(|| black_box(invoke_substr_with_args(args.clone(), size)))
+        });
 
         group.finish();
 

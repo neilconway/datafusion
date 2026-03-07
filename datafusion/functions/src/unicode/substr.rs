@@ -126,7 +126,7 @@ impl ScalarUDFImpl for SubstrFunc {
         args: datafusion_expr::ScalarFunctionArgs,
     ) -> Result<ColumnarValue> {
         // Fast path for array string with scalar start/count
-        if let Some(result) = substr_array_with_scalar_args(&args.args) {
+        if let Some(result) = try_substr_scalar_args(&args.args) {
             return result.map(ColumnarValue::Array);
         }
         make_scalar_function(substr, vec![])(&args.args)
@@ -141,10 +141,7 @@ impl ScalarUDFImpl for SubstrFunc {
     }
 }
 
-/// Extracts the substring of string starting at the start'th character, and extending for count characters if that is specified. (Same as substring(string from start for count).)
-/// substr('alphabet', 3) = 'phabet'
-/// substr('alphabet', 3, 2) = 'ph'
-/// The implementation uses UTF-8 code points as characters
+/// Fallback substr implementation for when start and/or count are arrays.
 fn substr(args: &[ArrayRef]) -> Result<ArrayRef> {
     match args[0].data_type() {
         DataType::Utf8 => {
@@ -238,12 +235,10 @@ fn string_view_substr(
     string_view_array: &StringViewArray,
     args: &[ArrayRef],
 ) -> Result<ArrayRef> {
+    let start_array = as_int64_array(&args[0])?;
+    let is_ascii = string_view_array.is_ascii();
     let mut views_buf = Vec::with_capacity(string_view_array.len());
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
-
-    let start_array = as_int64_array(&args[0])?;
-
-    let enable_ascii_fast_path = string_view_array.is_ascii();
 
     // In either case of `substr(s, i)` or `substr(s, i, cnt)`
     // If any of input argument is `NULL`, the result is `NULL`
@@ -255,8 +250,7 @@ fn string_view_substr(
                 .zip(start_array.iter())
             {
                 if let (Some(str), Some(start)) = (str_opt, start_opt) {
-                    let (start, end) =
-                        get_true_start_end(str, start, None, enable_ascii_fast_path);
+                    let (start, end) = get_true_start_end(str, start, None, is_ascii);
                     let substr = &str[start..end];
 
                     make_and_append_view(
@@ -285,20 +279,11 @@ fn string_view_substr(
                 {
                     if count < 0 {
                         return exec_err!(
-                            "negative substring length not allowed: substr(<str>, {start}, {count})"
+                            "negative count not allowed: substr(<str>, {start}, {count})"
                         );
                     }
-                    if start == i64::MIN {
-                        return exec_err!(
-                            "negative overflow when calculating substring start position"
-                        );
-                    }
-                    let (start, end) = get_true_start_end(
-                        str,
-                        start,
-                        Some(count as u64),
-                        enable_ascii_fast_path,
-                    );
+                    let (start, end) =
+                        get_true_start_end(str, start, Some(count as u64), is_ascii);
                     let substr = &str[start..end];
 
                     make_and_append_view(
@@ -343,73 +328,54 @@ where
     V: StringArrayType<'a>,
 {
     let start_array = as_int64_array(&args[0])?;
-
     let is_ascii = string_array.is_ascii();
+    let mut result_builder = StringViewBuilder::new();
 
     match args.len() {
         1 => {
             let iter = ArrayIter::new(string_array);
-            let mut result_builder = StringViewBuilder::new();
             for (string, start) in iter.zip(start_array.iter()) {
-                match (string, start) {
-                    (Some(string), Some(start)) => {
-                        let (start, end) =
-                            get_true_start_end(string, start, None, is_ascii);
-                        let substr = &string[start..end];
-                        result_builder.append_value(substr);
-                    }
-                    _ => {
-                        result_builder.append_null();
-                    }
+                if let (Some(string), Some(start)) = (string, start) {
+                    let (start, end) = get_true_start_end(string, start, None, is_ascii);
+                    result_builder.append_value(&string[start..end]);
+                } else {
+                    result_builder.append_null();
                 }
             }
-            Ok(Arc::new(result_builder.finish()) as ArrayRef)
         }
         2 => {
             let iter = ArrayIter::new(string_array);
             let count_array = as_int64_array(&args[1])?;
-            let mut result_builder = StringViewBuilder::new();
-
             for ((string, start), count) in
                 iter.zip(start_array.iter()).zip(count_array.iter())
             {
-                match (string, start, count) {
-                    (Some(string), Some(start), Some(count)) => {
-                        if count < 0 {
-                            return exec_err!(
-                                "negative substring length not allowed: substr(<str>, {start}, {count})"
-                            );
-                        }
-                        if start == i64::MIN {
-                            return exec_err!(
-                                "negative overflow when calculating substring start position"
-                            );
-                        }
-                        let (start, end) = get_true_start_end(
-                            string,
-                            start,
-                            Some(count as u64),
-                            is_ascii,
+                if let (Some(string), Some(start), Some(count)) = (string, start, count) {
+                    if count < 0 {
+                        return exec_err!(
+                            "negative substring length not allowed: substr(<str>, {start}, {count})"
                         );
-                        let substr = &string[start..end];
-                        result_builder.append_value(substr);
                     }
-                    _ => {
-                        result_builder.append_null();
-                    }
+                    let (start, end) =
+                        get_true_start_end(string, start, Some(count as u64), is_ascii);
+                    result_builder.append_value(&string[start..end]);
+                } else {
+                    result_builder.append_null();
                 }
             }
-            Ok(Arc::new(result_builder.finish()) as ArrayRef)
         }
         other => {
-            exec_err!("substr was called with {other} arguments. It requires 2 or 3.")
+            return exec_err!(
+                "substr was called with {other} arguments. It requires 2 or 3."
+            );
         }
     }
+
+    Ok(Arc::new(result_builder.finish()) as ArrayRef)
 }
 
 /// Fast path: handle substr(array_str, scalar_start[, scalar_count]).
 /// Returns None if the args don't match this pattern.
-fn substr_array_with_scalar_args(args: &[ColumnarValue]) -> Option<Result<ArrayRef>> {
+fn try_substr_scalar_args(args: &[ColumnarValue]) -> Option<Result<ArrayRef>> {
     let ColumnarValue::Array(string_array) = &args[0] else {
         return None;
     };
@@ -433,11 +399,6 @@ fn substr_scalar_args(
         if c < 0 {
             return exec_err!(
                 "negative substring length not allowed: substr(<str>, {start}, {c})"
-            );
-        }
-        if start == i64::MIN {
-            return exec_err!(
-                "negative overflow when calculating substring start position"
             );
         }
     }
@@ -913,7 +874,7 @@ mod tests {
                 ColumnarValue::Scalar(ScalarValue::from(i64::MIN)),
                 ColumnarValue::Scalar(ScalarValue::from(1i64)),
             ],
-            exec_err!("negative overflow when calculating substring start position"),
+            Ok(Some("")),
             &str,
             Utf8View,
             StringViewArray

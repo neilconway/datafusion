@@ -287,28 +287,27 @@ fn string_view_substr(
                         return exec_err!(
                             "negative substring length not allowed: substr(<str>, {start}, {count})"
                         );
-                    } else {
-                        if start == i64::MIN {
-                            return exec_err!(
-                                "negative overflow when calculating substring start position"
-                            );
-                        }
-                        let (start, end) = get_true_start_end(
-                            str,
-                            start,
-                            Some(count as u64),
-                            enable_ascii_fast_path,
-                        );
-                        let substr = &str[start..end];
-
-                        make_and_append_view(
-                            &mut views_buf,
-                            &mut null_builder,
-                            raw_view,
-                            substr,
-                            start as u32,
+                    }
+                    if start == i64::MIN {
+                        return exec_err!(
+                            "negative overflow when calculating substring start position"
                         );
                     }
+                    let (start, end) = get_true_start_end(
+                        str,
+                        start,
+                        Some(count as u64),
+                        enable_ascii_fast_path,
+                    );
+                    let substr = &str[start..end];
+
+                    make_and_append_view(
+                        &mut views_buf,
+                        &mut null_builder,
+                        raw_view,
+                        substr,
+                        start as u32,
+                    );
                 } else {
                     null_builder.append_null();
                     views_buf.push(0);
@@ -355,7 +354,7 @@ where
                 match (string, start) {
                     (Some(string), Some(start)) => {
                         let (start, end) =
-                            get_true_start_end(string, start, None, is_ascii); // start, end is byte-based
+                            get_true_start_end(string, start, None, is_ascii);
                         let substr = &string[start..end];
                         result_builder.append_value(substr);
                     }
@@ -380,21 +379,20 @@ where
                             return exec_err!(
                                 "negative substring length not allowed: substr(<str>, {start}, {count})"
                             );
-                        } else {
-                            if start == i64::MIN {
-                                return exec_err!(
-                                    "negative overflow when calculating substring start position"
-                                );
-                            }
-                            let (start, end) = get_true_start_end(
-                                string,
-                                start,
-                                Some(count as u64),
-                                is_ascii,
-                            ); // start, end is byte-based
-                            let substr = &string[start..end];
-                            result_builder.append_value(substr);
                         }
+                        if start == i64::MIN {
+                            return exec_err!(
+                                "negative overflow when calculating substring start position"
+                            );
+                        }
+                        let (start, end) = get_true_start_end(
+                            string,
+                            start,
+                            Some(count as u64),
+                            is_ascii,
+                        );
+                        let substr = &string[start..end];
+                        result_builder.append_value(substr);
                     }
                     _ => {
                         result_builder.append_null();

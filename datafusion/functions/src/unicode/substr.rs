@@ -53,7 +53,7 @@ use datafusion_macros::user_doc;
     standard_argument(name = "str", prefix = "String"),
     argument(
         name = "start_pos",
-        description = "Character position to start the substring at. The first character in the string has a position of 1."
+        description = "Character position to start the substring at. The first character in the string has a position of 1. If the start position is less than 1, it is treated as if it is before the start of the string and the (absolute) number of characters before position 1 is subtracted from `length` (if given). For example, `substr('abc', -3, 6)` returns `'ab'`."
     ),
     argument(
         name = "length",

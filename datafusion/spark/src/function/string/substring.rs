@@ -247,7 +247,7 @@ where
         let (byte_start, byte_end) = get_true_start_end(
             string,
             adjusted_start,
-            len_opt.map(|l| l as u64),
+            len_opt,
             is_ascii,
         );
         let substr = &string[byte_start..byte_end];

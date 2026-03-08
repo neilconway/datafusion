@@ -180,16 +180,13 @@ fn substr(args: &[ArrayRef]) -> Result<ArrayRef> {
 pub fn get_true_start_end(
     input: &str,
     start: i64,
-    count: Option<u64>,
+    count: Option<i64>,
     is_input_ascii_only: bool,
 ) -> (usize, usize) {
     let start = start.checked_sub(1).unwrap_or(start);
 
     let end = match count {
-        Some(count) => {
-            let count_i64 = i64::try_from(count).unwrap_or(i64::MAX);
-            start.saturating_add(count_i64)
-        }
+        Some(count) => start.saturating_add(count),
         None => input.len() as i64,
     };
     let count_to_end = count.is_some();
@@ -283,7 +280,7 @@ fn string_view_substr(
                         );
                     }
                     let (start, end) =
-                        get_true_start_end(str, start, Some(count as u64), is_ascii);
+                        get_true_start_end(str, start, Some(count), is_ascii);
                     let substr = &str[start..end];
 
                     make_and_append_view(
@@ -329,11 +326,11 @@ where
 {
     let start_array = as_int64_array(&args[0])?;
     let is_ascii = string_array.is_ascii();
+    let iter = ArrayIter::new(string_array);
     let mut result_builder = StringViewBuilder::new();
 
     match args.len() {
         1 => {
-            let iter = ArrayIter::new(string_array);
             for (string, start) in iter.zip(start_array.iter()) {
                 if let (Some(string), Some(start)) = (string, start) {
                     let (start, end) = get_true_start_end(string, start, None, is_ascii);
@@ -344,19 +341,19 @@ where
             }
         }
         2 => {
-            let iter = ArrayIter::new(string_array);
             let count_array = as_int64_array(&args[1])?;
+
             for ((string, start), count) in
                 iter.zip(start_array.iter()).zip(count_array.iter())
             {
                 if let (Some(string), Some(start), Some(count)) = (string, start, count) {
                     if count < 0 {
                         return exec_err!(
-                            "negative substring length not allowed: substr(<str>, {start}, {count})"
+                            "negative count not allowed: substr(<str>, {start}, {count})"
                         );
                     }
                     let (start, end) =
-                        get_true_start_end(string, start, Some(count as u64), is_ascii);
+                        get_true_start_end(string, start, Some(count), is_ascii);
                     result_builder.append_value(&string[start..end]);
                 } else {
                     result_builder.append_null();
@@ -398,7 +395,7 @@ fn substr_scalar_args(
     if let Some(c) = count {
         if c < 0 {
             return exec_err!(
-                "negative substring length not allowed: substr(<str>, {start}, {c})"
+                "negative count not allowed: substr(<str>, {start}, {c})"
             );
         }
     }
@@ -450,14 +447,14 @@ fn string_view_substr_scalar_args(
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
     let is_ascii = is_ascii_for_scalar_args(&string_view_array, start, count);
-    let count_u64 = count.map(|c| c as u64);
+
 
     for (str_opt, raw_view) in string_view_array
         .iter()
         .zip(string_view_array.views().iter())
     {
         if let Some(s) = str_opt {
-            let (st, ed) = get_true_start_end(s, start, count_u64, is_ascii);
+            let (st, ed) = get_true_start_end(s, start, count, is_ascii);
             let substr = &s[st..ed];
             make_and_append_view(
                 &mut views_buf,
@@ -498,14 +495,14 @@ where
     V: StringArrayType<'a>,
 {
     let is_ascii = is_ascii_for_scalar_args(&string_array, start, count);
-    let count_u64 = count.map(|c| c as u64);
+
 
     let iter = ArrayIter::new(string_array);
     let mut result_builder = StringViewBuilder::new();
 
     for string in iter {
         if let Some(s) = string {
-            let (st, ed) = get_true_start_end(s, start, count_u64, is_ascii);
+            let (st, ed) = get_true_start_end(s, start, count, is_ascii);
             result_builder.append_value(&s[st..ed]);
         } else {
             result_builder.append_null();
@@ -825,7 +822,7 @@ mod tests {
                 ColumnarValue::Scalar(ScalarValue::from(1i64)),
                 ColumnarValue::Scalar(ScalarValue::from(-1i64)),
             ],
-            exec_err!("negative substring length not allowed: substr(<str>, 1, -1)"),
+            exec_err!("negative count not allowed: substr(<str>, 1, -1)"),
             &str,
             Utf8View,
             StringViewArray

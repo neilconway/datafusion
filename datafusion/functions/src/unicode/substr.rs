@@ -182,7 +182,15 @@ pub fn get_true_start_end(
     start: i64,
     count: Option<i64>,
     is_input_ascii_only: bool,
-) -> (usize, usize) {
+) -> Result<(usize, usize)> {
+    if let Some(count) = count {
+        if count < 0 {
+            return exec_err!(
+                "negative count not allowed: {count}"
+            );
+        }
+    }
+
     let start = start.checked_sub(1).unwrap_or(start);
 
     let end = match count {
@@ -197,7 +205,7 @@ pub fn get_true_start_end(
 
     // If input is ASCII-only, byte-based indices equals to char-based indices
     if is_input_ascii_only {
-        return (start, end);
+        return Ok((start, end));
     }
 
     // Otherwise, calculate byte indices from char indices
@@ -223,7 +231,7 @@ pub fn get_true_start_end(
             cnt += 1;
         }
     }
-    (st, ed)
+    Ok((st, ed))
 }
 
 // The decoding process refs the trait at: arrow/arrow-data/src/byte_view.rs:44
@@ -247,7 +255,7 @@ fn string_view_substr(
                 .zip(start_array.iter())
             {
                 if let (Some(str), Some(start)) = (str_opt, start_opt) {
-                    let (start, end) = get_true_start_end(str, start, None, is_ascii);
+                    let (start, end) = get_true_start_end(str, start, None, is_ascii)?;
                     let substr = &str[start..end];
 
                     make_and_append_view(
@@ -274,13 +282,8 @@ fn string_view_substr(
                 if let (Some(str), Some(start), Some(count)) =
                     (str_opt, start_opt, count_opt)
                 {
-                    if count < 0 {
-                        return exec_err!(
-                            "negative count not allowed: substr(<str>, {start}, {count})"
-                        );
-                    }
                     let (start, end) =
-                        get_true_start_end(str, start, Some(count), is_ascii);
+                        get_true_start_end(str, start, Some(count), is_ascii)?;
                     let substr = &str[start..end];
 
                     make_and_append_view(
@@ -333,7 +336,7 @@ where
         1 => {
             for (string, start) in iter.zip(start_array.iter()) {
                 if let (Some(string), Some(start)) = (string, start) {
-                    let (start, end) = get_true_start_end(string, start, None, is_ascii);
+                    let (start, end) = get_true_start_end(string, start, None, is_ascii)?;
                     result_builder.append_value(&string[start..end]);
                 } else {
                     result_builder.append_null();
@@ -347,13 +350,8 @@ where
                 iter.zip(start_array.iter()).zip(count_array.iter())
             {
                 if let (Some(string), Some(start), Some(count)) = (string, start, count) {
-                    if count < 0 {
-                        return exec_err!(
-                            "negative count not allowed: substr(<str>, {start}, {count})"
-                        );
-                    }
                     let (start, end) =
-                        get_true_start_end(string, start, Some(count), is_ascii);
+                        get_true_start_end(string, start, Some(count), is_ascii)?;
                     result_builder.append_value(&string[start..end]);
                 } else {
                     result_builder.append_null();
@@ -392,13 +390,6 @@ fn substr_scalar_args(
     start: i64,
     count: Option<i64>,
 ) -> Result<ArrayRef> {
-    if let Some(c) = count {
-        if c < 0 {
-            return exec_err!(
-                "negative count not allowed: substr(<str>, {start}, {c})"
-            );
-        }
-    }
     match string_array.data_type() {
         DataType::Utf8 => {
             let string_array = string_array.as_string::<i32>();
@@ -454,7 +445,7 @@ fn string_view_substr_scalar_args(
         .zip(string_view_array.views().iter())
     {
         if let Some(s) = str_opt {
-            let (st, ed) = get_true_start_end(s, start, count, is_ascii);
+            let (st, ed) = get_true_start_end(s, start, count, is_ascii)?;
             let substr = &s[st..ed];
             make_and_append_view(
                 &mut views_buf,
@@ -502,7 +493,7 @@ where
 
     for string in iter {
         if let Some(s) = string {
-            let (st, ed) = get_true_start_end(s, start, count, is_ascii);
+            let (st, ed) = get_true_start_end(s, start, count, is_ascii)?;
             result_builder.append_value(&s[st..ed]);
         } else {
             result_builder.append_null();
@@ -822,7 +813,7 @@ mod tests {
                 ColumnarValue::Scalar(ScalarValue::from(1i64)),
                 ColumnarValue::Scalar(ScalarValue::from(-1i64)),
             ],
-            exec_err!("negative count not allowed: substr(<str>, 1, -1)"),
+            exec_err!("negative count not allowed: -1"),
             &str,
             Utf8View,
             StringViewArray

@@ -249,7 +249,7 @@ where
             adjusted_start,
             len_opt,
             is_ascii,
-        );
+        )?;
         let substr = &string[byte_start..byte_end];
         builder.append_value(substr);
     }

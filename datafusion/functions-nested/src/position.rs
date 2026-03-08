@@ -25,7 +25,8 @@ use arrow::datatypes::{
 };
 use datafusion_common::ScalarValue;
 use datafusion_expr::{
-    ColumnarValue, Documentation, ScalarUDFImpl, Signature, Volatility,
+    ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
+    Volatility,
 };
 use datafusion_macros::user_doc;
 
@@ -122,10 +123,7 @@ impl ScalarUDFImpl for ArrayPosition {
         Ok(UInt64)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: datafusion_expr::ScalarFunctionArgs,
-    ) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let [first_arg, second_arg, third_arg @ ..] = args.args.as_slice() else {
             return exec_err!("array_position expects two or three arguments");
         };
@@ -420,10 +418,7 @@ impl ScalarUDFImpl for ArrayPositions {
         Ok(List(Arc::new(Field::new_list_field(UInt64, true))))
     }
 
-    fn invoke_with_args(
-        &self,
-        args: datafusion_expr::ScalarFunctionArgs,
-    ) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         make_scalar_function(array_positions_inner)(&args.args)
     }
 

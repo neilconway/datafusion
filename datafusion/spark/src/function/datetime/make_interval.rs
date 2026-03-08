@@ -278,6 +278,7 @@ mod tests {
     };
 
     use super::*;
+    use datafusion_expr::ScalarFunctionArgs;
     fn run_make_interval_month_day_nano(arrs: Vec<ArrayRef>) -> Result<ArrayRef> {
         make_interval_kernel(&arrs)
     }

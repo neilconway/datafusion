@@ -209,7 +209,7 @@ pub fn get_true_start_end(
     }
 
     // Otherwise, calculate byte indices from char indices
-    // Note this decoding is relatively expensive for this simple `substr` function,,
+    // Note this decoding is relatively expensive for this simple `substr` function,
     // so the implementation attempts to decode in one pass (and caused the complexity)
     let (mut st, mut ed) = (input.len(), input.len());
     let mut start_counting = false;
@@ -439,7 +439,6 @@ fn string_view_substr_scalar_args(
 
     let is_ascii = is_ascii_for_scalar_args(&string_view_array, start, count);
 
-
     for (str_opt, raw_view) in string_view_array
         .iter()
         .zip(string_view_array.views().iter())
@@ -486,7 +485,6 @@ where
     V: StringArrayType<'a>,
 {
     let is_ascii = is_ascii_for_scalar_args(&string_array, start, count);
-
 
     let iter = ArrayIter::new(string_array);
     let mut result_builder = StringViewBuilder::new();

@@ -181,9 +181,9 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group.finish();
 
-        // Scalar start, no count
+        // Scalar start, no count, short strings
         let len = 12;
-        let mut group = c.benchmark_group("substr, scalar start, short strings");
+        let mut group = c.benchmark_group("substr, scalar start, no count, short strings");
         group.sampling_mode(SamplingMode::Flat);
         group.sample_size(10);
 
@@ -200,7 +200,47 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         group.finish();
 
-        // Scalar start and count, longer strings
+        // Scalar start, no count, long strings
+        let len = 128;
+        let mut group = c.benchmark_group("substr, scalar start, no count, long strings");
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+
+        let args = create_args_without_count::<i32>(size, len, true, true, true);
+        group.bench_function(
+            format!("substr_string_view [size={size}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        let args = create_args_without_count::<i32>(size, len, false, false, true);
+        group.bench_function(format!("substr_string [size={size}, strlen={len}]"), |b| {
+            b.iter(|| black_box(invoke_substr_with_args(args.clone(), size)))
+        });
+
+        group.finish();
+
+        // Scalar start and count, short strings
+        let len = 12;
+        let count = 6;
+        let mut group = c.benchmark_group("substr, scalar args, short strings");
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+
+        let args = create_args_with_count::<i32>(size, len, count, true, true);
+        group.bench_function(
+            format!("substr_string_view [size={size}, count={count}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        let args = create_args_with_count::<i32>(size, len, count, false, true);
+        group.bench_function(
+            format!("substr_string [size={size}, count={count}, strlen={len}]"),
+            |b| b.iter(|| black_box(invoke_substr_with_args(args.clone(), size))),
+        );
+
+        group.finish();
+
+        // Scalar start and count, long strings
         let len = 128;
         let count = 64;
         let mut group = c.benchmark_group("substr, scalar args, long strings");

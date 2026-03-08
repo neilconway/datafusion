@@ -183,7 +183,8 @@ fn criterion_benchmark(c: &mut Criterion) {
 
         // Scalar start, no count, short strings
         let len = 12;
-        let mut group = c.benchmark_group("substr, scalar start, no count, short strings");
+        let mut group =
+            c.benchmark_group("substr, scalar start, no count, short strings");
         group.sampling_mode(SamplingMode::Flat);
         group.sample_size(10);
 

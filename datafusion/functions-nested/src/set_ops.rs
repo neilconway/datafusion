@@ -19,9 +19,11 @@
 
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    Array, ArrayRef, GenericListArray, OffsetSizeTrait, new_empty_array, new_null_array,
+    Array, ArrayRef, GenericListArray, OffsetSizeTrait, UInt32Array, UInt64Array,
+    new_empty_array, new_null_array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::compute::{concat, take};
 use arrow::datatypes::DataType::{LargeList, List, Null};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use arrow::row::{RowConverter, SortField};
@@ -381,12 +383,31 @@ fn generic_set_lists<OffsetSize: OffsetSizeTrait>(
     let r_len = r.offsets()[r.len()].as_usize() - r_first;
     let rows_r = converter.convert_columns(&[r.values().slice(r_first, r_len)])?;
 
+    // Combine the *sliced* value arrays so 0-based indices from the row
+    // converter map directly into the concatenated array.
+    let l_values = l.values().slice(l_first, l_len);
+    let r_values = r.values().slice(r_first, r_len);
+    let combined_values = concat(&[l_values.as_ref(), r_values.as_ref()])?;
+    let r_offset = l_len;
+
     match set_op {
         SetOp::Union => generic_set_loop::<OffsetSize, true>(
-            l, r, &rows_l, &rows_r, field, &converter,
+            l,
+            r,
+            &rows_l,
+            &rows_r,
+            field,
+            &combined_values,
+            r_offset,
         ),
         SetOp::Intersect => generic_set_loop::<OffsetSize, false>(
-            l, r, &rows_l, &rows_r, field, &converter,
+            l,
+            r,
+            &rows_l,
+            &rows_r,
+            field,
+            &combined_values,
+            r_offset,
         ),
     }
 }
@@ -399,7 +420,8 @@ fn generic_set_loop<OffsetSize: OffsetSizeTrait, const IS_UNION: bool>(
     rows_l: &arrow::row::Rows,
     rows_r: &arrow::row::Rows,
     field: Arc<Field>,
-    converter: &RowConverter,
+    combined_values: &ArrayRef,
+    r_offset: usize,
 ) -> Result<ArrayRef> {
     let l_offsets = l.value_offsets();
     let r_offsets = r.value_offsets();
@@ -416,7 +438,7 @@ fn generic_set_loop<OffsetSize: OffsetSizeTrait, const IS_UNION: bool>(
         rows_l.num_rows().min(rows_r.num_rows())
     };
 
-    let mut final_rows = Vec::with_capacity(initial_capacity);
+    let mut indices: Vec<usize> = Vec::with_capacity(initial_capacity);
 
     // Reuse hash sets across iterations
     let mut seen = HashSet::new();
@@ -440,25 +462,27 @@ fn generic_set_loop<OffsetSize: OffsetSizeTrait, const IS_UNION: bool>(
             for idx in l_start..l_end {
                 let row = rows_l.row(idx);
                 if seen.insert(row) {
-                    final_rows.push(row);
+                    indices.push(idx);
                 }
             }
             for idx in r_start..r_end {
                 let row = rows_r.row(idx);
                 if seen.insert(row) {
-                    final_rows.push(row);
+                    indices.push(idx + r_offset);
                 }
             }
         } else {
             let l_len = l_end - l_start;
             let r_len = r_end - r_start;
 
-            // Select shorter side for lookup, longer side for probing
-            let (lookup_rows, lookup_range, probe_rows, probe_range) = if l_len < r_len {
-                (rows_l, l_start..l_end, rows_r, r_start..r_end)
-            } else {
-                (rows_r, r_start..r_end, rows_l, l_start..l_end)
-            };
+            // Select shorter side for lookup, longer side for probing.
+            // Track the probe side's offset into the combined values array.
+            let (lookup_rows, lookup_range, probe_rows, probe_range, probe_offset) =
+                if l_len < r_len {
+                    (rows_l, l_start..l_end, rows_r, r_start..r_end, r_offset)
+                } else {
+                    (rows_r, r_start..r_end, rows_l, l_start..l_end, 0)
+                };
             lookup_set.clear();
             lookup_set.reserve(lookup_range.len());
 
@@ -471,18 +495,25 @@ fn generic_set_loop<OffsetSize: OffsetSizeTrait, const IS_UNION: bool>(
             for idx in probe_range {
                 let row = probe_rows.row(idx);
                 if lookup_set.contains(&row) && seen.insert(row) {
-                    final_rows.push(row);
+                    indices.push(idx + probe_offset);
                 }
             }
         }
         result_offsets.push(last_offset + OffsetSize::usize_as(seen.len()));
     }
 
-    let final_values = if final_rows.is_empty() {
+    // Gather distinct values by index from the combined values array.
+    // Use UInt64Array for LargeList to support values arrays exceeding u32::MAX.
+    let final_values = if indices.is_empty() {
         new_empty_array(&l.value_type())
+    } else if OffsetSize::IS_LARGE {
+        let indices =
+            UInt64Array::from(indices.into_iter().map(|i| i as u64).collect::<Vec<_>>());
+        take(combined_values.as_ref(), &indices, None)?
     } else {
-        let arrays = converter.convert_rows(final_rows)?;
-        Arc::clone(&arrays[0])
+        let indices =
+            UInt32Array::from(indices.into_iter().map(|i| i as u32).collect::<Vec<_>>());
+        take(combined_values.as_ref(), &indices, None)?
     };
 
     let arr = GenericListArray::<OffsetSize>::try_new(
@@ -556,7 +587,7 @@ fn general_array_distinct<OffsetSize: OffsetSizeTrait>(
     let rows =
         converter.convert_columns(&[array.values().slice(first_offset, visible_len)])?;
 
-    let mut final_rows = Vec::with_capacity(rows.num_rows());
+    let mut indices: Vec<usize> = Vec::with_capacity(rows.num_rows());
     let mut seen = HashSet::new();
     for i in 0..array.len() {
         let last_offset = *offsets.last().unwrap();
@@ -576,18 +607,26 @@ fn general_array_distinct<OffsetSize: OffsetSizeTrait>(
         for idx in start..end {
             let row = rows.row(idx);
             if seen.insert(row) {
-                final_rows.push(row);
+                indices.push(idx + first_offset);
             }
         }
         offsets.push(last_offset + OffsetSize::usize_as(seen.len()));
     }
 
-    // Convert all collected distinct rows back
-    let final_values = if final_rows.is_empty() {
+    // Gather distinct values in a single pass, using the computed `indices`.
+    // Indices are absolute positions in array.values() (first_offset was added
+    // back when collecting them), so we can take directly from the full values.
+    // Use UInt64Array for LargeList to support values arrays exceeding u32::MAX.
+    let final_values = if indices.is_empty() {
         new_empty_array(&dt)
+    } else if OffsetSize::IS_LARGE {
+        let indices =
+            UInt64Array::from(indices.into_iter().map(|i| i as u64).collect::<Vec<_>>());
+        take(array.values().as_ref(), &indices, None)?
     } else {
-        let arrays = converter.convert_rows(final_rows)?;
-        Arc::clone(&arrays[0])
+        let indices =
+            UInt32Array::from(indices.into_iter().map(|i| i as u32).collect::<Vec<_>>());
+        take(array.values().as_ref(), &indices, None)?
     };
 
     Ok(Arc::new(GenericListArray::<OffsetSize>::try_new(

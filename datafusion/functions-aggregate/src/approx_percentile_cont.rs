@@ -429,9 +429,8 @@ impl Accumulator for ApproxPercentileAccumulator {
         if values.null_count() > 0 {
             values = filter(&values, &is_not_null(&values)?)?;
         }
-        let sorted_values = &arrow::compute::sort(&values, None)?;
-        let sorted_values = ApproxPercentileAccumulator::convert_to_float(sorted_values)?;
-        self.digest = self.digest.merge_sorted_f64(&sorted_values);
+        let float_values = ApproxPercentileAccumulator::convert_to_float(&values)?;
+        self.digest = self.digest.merge_unsorted_f64(float_values);
         Ok(())
     }
 

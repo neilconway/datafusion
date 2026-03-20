@@ -20,9 +20,9 @@ use std::fmt::Debug;
 use std::mem::size_of_val;
 use std::sync::Arc;
 
-use arrow::array::{Array, Float16Array};
+use arrow::array::{Array, AsArray, Float16Array, ListArray};
 use arrow::compute::{filter, is_not_null};
-use arrow::datatypes::FieldRef;
+use arrow::datatypes::{FieldRef, Float64Type, UInt64Type};
 use arrow::{
     array::{
         ArrayRef, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
@@ -42,7 +42,7 @@ use datafusion_expr::{
     Accumulator, AggregateUDFImpl, Documentation, Expr, Signature, TypeSignature,
     Volatility,
 };
-use datafusion_functions_aggregate_common::tdigest::{DEFAULT_MAX_SIZE, TDigest};
+use datafusion_functions_aggregate_common::tdigest::{Centroid, DEFAULT_MAX_SIZE, TDigest};
 use datafusion_macros::user_doc;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
@@ -463,17 +463,37 @@ impl Accumulator for ApproxPercentileAccumulator {
             return Ok(());
         }
 
-        let states = (0..states[0].len())
-            .map(|index| {
-                states
-                    .iter()
-                    .map(|array| ScalarValue::try_from_array(array, index))
-                    .collect::<Result<Vec<_>>>()
-                    .map(|state| TDigest::from_scalar_state(&state))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let max_sizes = states[0].as_primitive::<UInt64Type>();
+        let sums = states[1].as_primitive::<Float64Type>();
+        let counts = states[2].as_primitive::<Float64Type>();
+        let maxes = states[3].as_primitive::<Float64Type>();
+        let mins = states[4].as_primitive::<Float64Type>();
+        let centroid_lists = states[5]
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("expected ListArray for centroid state");
 
-        self.merge_digests(&states);
+        let digests: Vec<TDigest> = (0..states[0].len())
+            .map(|i| {
+                let centroid_array = centroid_lists.value(i);
+                let centroid_values = centroid_array.as_primitive::<Float64Type>();
+                let centroids = centroid_values
+                    .values()
+                    .chunks(2)
+                    .map(|c| Centroid::new(c[0], c[1]))
+                    .collect();
+                TDigest::new_from_parts(
+                    centroids,
+                    max_sizes.value(i) as usize,
+                    sums.value(i),
+                    counts.value(i),
+                    maxes.value(i),
+                    mins.value(i),
+                )
+            })
+            .collect();
+
+        self.merge_digests(&digests);
 
         Ok(())
     }

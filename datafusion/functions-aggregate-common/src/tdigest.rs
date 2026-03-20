@@ -148,6 +148,25 @@ impl TDigest {
         self.max_size
     }
 
+    /// Construct a TDigest from its constituent parts.
+    pub fn new_from_parts(
+        centroids: Vec<Centroid>,
+        max_size: usize,
+        sum: f64,
+        count: f64,
+        max: f64,
+        min: f64,
+    ) -> Self {
+        Self {
+            centroids,
+            max_size,
+            sum,
+            count,
+            max,
+            min,
+        }
+    }
+
     /// Size in bytes including `Self`.
     pub fn size(&self) -> usize {
         size_of_val(self) + (size_of::<Centroid>() * self.centroids.capacity())

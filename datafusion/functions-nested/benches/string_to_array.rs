@@ -42,8 +42,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     );
 
     // Multi-char delimiter
-    let double_colon =
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some("::".to_string())));
+    let double_colon = ColumnarValue::Scalar(ScalarValue::Utf8(Some("::".to_string())));
     bench_string_to_array(
         c,
         "string_to_array_multi_char_delim",

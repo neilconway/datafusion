@@ -32,40 +32,43 @@ const SEED: u64 = 42;
 
 fn criterion_benchmark(c: &mut Criterion) {
     // Single-char delimiter
+    let comma = ColumnarValue::Scalar(ScalarValue::Utf8(Some(",".to_string())));
     bench_string_to_array(
         c,
         "string_to_array_single_char_delim",
         create_csv_strings,
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(",".to_string()))),
+        &comma,
         None,
     );
 
     // Multi-char delimiter
+    let double_colon =
+        ColumnarValue::Scalar(ScalarValue::Utf8(Some("::".to_string())));
     bench_string_to_array(
         c,
         "string_to_array_multi_char_delim",
         create_multi_delim_strings,
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some("::".to_string()))),
+        &double_colon,
         None,
     );
 
     // With null_str argument
+    let null_str = ColumnarValue::Scalar(ScalarValue::Utf8(Some("NULL".to_string())));
     bench_string_to_array(
         c,
         "string_to_array_with_null_str",
         create_csv_strings_with_nulls,
-        ColumnarValue::Scalar(ScalarValue::Utf8(Some(",".to_string()))),
-        Some(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
-            "NULL".to_string(),
-        )))),
+        &comma,
+        Some(&null_str),
     );
 
     // NULL delimiter
+    let null_delim = ColumnarValue::Scalar(ScalarValue::Utf8(None));
     bench_string_to_array(
         c,
         "string_to_array_null_delim",
         create_short_strings,
-        ColumnarValue::Scalar(ScalarValue::Utf8(None)),
+        &null_delim,
         None,
     );
 
@@ -124,8 +127,8 @@ fn bench_string_to_array(
     c: &mut Criterion,
     group_name: &str,
     make_strings: fn(usize) -> ArrayRef,
-    delimiter: ColumnarValue,
-    null_str: Option<ColumnarValue>,
+    delimiter: &ColumnarValue,
+    null_str: Option<&ColumnarValue>,
 ) {
     let mut group = c.benchmark_group(group_name);
 
@@ -140,7 +143,7 @@ fn bench_string_to_array(
             Field::new("str", DataType::Utf8, true).into(),
             Field::new("delimiter", DataType::Utf8, true).into(),
         ];
-        if let Some(ref ns) = null_str {
+        if let Some(ns) = null_str {
             args.push(ns.clone());
             arg_fields.push(Field::new("null_str", DataType::Utf8, true).into());
         }

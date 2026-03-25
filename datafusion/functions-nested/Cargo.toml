@@ -60,8 +60,8 @@ datafusion-physical-expr-common = { workspace = true }
 hashbrown = { workspace = true }
 itertools = { workspace = true, features = ["use_std"] }
 itoa = { workspace = true }
-memchr = { workspace = true }
 log = { workspace = true }
+memchr = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["async_tokio"] }

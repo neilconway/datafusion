@@ -194,6 +194,21 @@ fn criterion_benchmark(c: &mut Criterion) {
         );
     }
 
+    // Utf8, single-char delimiter, many long parts
+    {
+        let (strings, delimiters) = gen_split_part_data(N_ROWS, 50, 16, ".", false);
+        bench_split_part(
+            &mut group,
+            &split_part_func,
+            &config_options,
+            "utf8_long_strings",
+            "pos_first",
+            strings,
+            delimiters,
+            1,
+        );
+    }
+
     // Utf8View, single-char delimiter, middle position, long parts
     {
         let (strings, delimiters) = gen_split_part_data(N_ROWS, 10, 32, ".", true);

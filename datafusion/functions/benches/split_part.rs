@@ -202,10 +202,10 @@ fn criterion_benchmark(c: &mut Criterion) {
             &split_part_func,
             &config_options,
             "utf8_long_strings",
-            "pos_first",
+            "pos_middle",
             strings,
             delimiters,
-            1,
+            25,
         );
     }
 

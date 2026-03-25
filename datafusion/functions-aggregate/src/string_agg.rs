@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use crate::array_agg::ArrayAgg;
 
-use arrow::array::{ArrayRef, AsArray, BooleanArray, LargeStringArray};
+use arrow::array::{ArrayRef, AsArray, BooleanArray, LargeStringArray, NullBufferBuilder};
+use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
 use datafusion_common::{
@@ -323,49 +324,134 @@ fn filter_index<T: Clone>(values: &[T], index: usize) -> Vec<T> {
         .collect::<Vec<_>>()
 }
 
-/// GroupsAccumulator for `string_agg` without DISTINCT or ORDER BY.
+/// Vectorized grouped accumulator for `string_agg` without DISTINCT or ORDER BY.
+///
+/// Uses a deferred approach: retains references to input arrays and records
+/// `(group_idx, row_idx)` metadata during [`GroupsAccumulator::update_batch`].
+/// Concatenation is deferred to [`GroupsAccumulator::evaluate`], which builds
+/// the output `LargeStringArray` in a single pass with an exact-size buffer,
+/// avoiding per-group `String` heap allocations.
 #[derive(Debug)]
 struct StringAggGroupsAccumulator {
-    /// The delimiter placed between concatenated values.
     delimiter: String,
-    /// Accumulated string per group. `None` means no values have been seen
-    /// (the group's output will be NULL).
-    values: Vec<Option<String>>,
-    /// Running total of string data bytes across all groups.
-    total_data_bytes: usize,
+    /// Retained input arrays (kept alive so evaluate can read from them).
+    batches: Vec<ArrayRef>,
+    /// Per-batch list of (group_idx, row_idx) pairs for non-null,
+    /// non-filtered rows.
+    batch_entries: Vec<Vec<(u32, u32)>>,
+    /// Per-group output byte length including delimiters, tracked
+    /// incrementally so evaluate can pre-allocate an exact-size buffer.
+    output_lengths: Vec<usize>,
+    /// Number of values per group (used to determine delimiter insertion).
+    entry_counts: Vec<u32>,
+    num_groups: usize,
 }
 
 impl StringAggGroupsAccumulator {
     fn new(delimiter: String) -> Self {
         Self {
             delimiter,
-            values: Vec::new(),
-            total_data_bytes: 0,
+            batches: Vec::new(),
+            batch_entries: Vec::new(),
+            output_lengths: Vec::new(),
+            entry_counts: Vec::new(),
+            num_groups: 0,
         }
     }
 
-    fn append_batch<'a>(
-        &mut self,
-        iter: impl Iterator<Item = Option<&'a str>>,
-        group_indices: &[usize],
-    ) {
-        for (opt_value, &group_idx) in iter.zip(group_indices.iter()) {
-            if let Some(value) = opt_value {
-                match &mut self.values[group_idx] {
-                    Some(existing) => {
-                        let added = self.delimiter.len() + value.len();
-                        existing.reserve(added);
-                        existing.push_str(&self.delimiter);
-                        existing.push_str(value);
-                        self.total_data_bytes += added;
-                    }
-                    slot @ None => {
-                        *slot = Some(value.to_string());
-                        self.total_data_bytes += value.len();
-                    }
+    fn clear_state(&mut self) {
+        self.batches = Vec::new();
+        self.batch_entries = Vec::new();
+        self.output_lengths = Vec::new();
+        self.entry_counts = Vec::new();
+        self.num_groups = 0;
+    }
+
+    /// Rebuild retained state after emitting the first `emit_groups` groups,
+    /// compacting batches so fully-emitted arrays can be freed.
+    fn compact_retained_state(&mut self, emit_groups: usize) -> Result<()> {
+        let emit_groups_u32 = emit_groups as u32;
+
+        self.output_lengths.drain(..emit_groups);
+        self.entry_counts.drain(..emit_groups);
+        self.num_groups -= emit_groups;
+
+        let old_batches = std::mem::take(&mut self.batches);
+        let old_entries = std::mem::take(&mut self.batch_entries);
+
+        for (batch, entries) in old_batches.into_iter().zip(old_entries) {
+            let retained_count =
+                entries.iter().filter(|(g, _)| *g >= emit_groups_u32).count();
+
+            if retained_count == 0 {
+                continue;
+            }
+
+            if retained_count == entries.len() {
+                let mut retained = entries;
+                for (g, _) in &mut retained {
+                    *g -= emit_groups_u32;
+                }
+                retained.shrink_to_fit();
+                self.batches.push(batch);
+                self.batch_entries.push(retained);
+                continue;
+            }
+
+            let mut retained_entries = Vec::with_capacity(retained_count);
+            let mut retained_rows = Vec::with_capacity(retained_count);
+            for (g, r) in entries {
+                if g >= emit_groups_u32 {
+                    retained_entries
+                        .push((g - emit_groups_u32, retained_rows.len() as u32));
+                    retained_rows.push(r);
                 }
             }
+
+            let compact_batch = if retained_count == batch.len() {
+                batch
+            } else {
+                let indices = arrow::array::UInt32Array::from(retained_rows);
+                arrow::compute::take(batch.as_ref(), &indices, None)?
+            };
+
+            self.batches.push(compact_batch);
+            self.batch_entries.push(retained_entries);
         }
+
+        Ok(())
+    }
+
+    /// Update output_lengths and entry_counts for a single value.
+    #[inline]
+    fn add_entry_length(&mut self, group_idx: usize, value_len: usize) {
+        if self.entry_counts[group_idx] > 0 {
+            self.output_lengths[group_idx] += self.delimiter.len() + value_len;
+        } else {
+            self.output_lengths[group_idx] += value_len;
+        }
+        self.entry_counts[group_idx] += 1;
+    }
+
+    /// Write a string value into the output buffer for the given group,
+    /// inserting the delimiter if this is not the first value for the group.
+    #[inline]
+    fn write_value(
+        delimiter: &[u8],
+        buf: &mut [u8],
+        pos: &mut usize,
+        started: &mut bool,
+        value: &str,
+    ) {
+        if *started {
+            buf[*pos..*pos + delimiter.len()].copy_from_slice(delimiter);
+            *pos += delimiter.len();
+        } else {
+            *started = true;
+        }
+        let bytes = value.as_bytes();
+        buf[*pos..*pos + bytes.len()].copy_from_slice(bytes);
+        *pos += bytes.len();
     }
 }
 
@@ -377,35 +463,121 @@ impl GroupsAccumulator for StringAggGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        self.values.resize(total_num_groups, None);
+        self.num_groups = self.num_groups.max(total_num_groups);
+        self.output_lengths.resize(total_num_groups, 0);
+        self.entry_counts.resize(total_num_groups, 0);
+
         let array = apply_filter_as_nulls(&values[0], opt_filter)?;
+        let mut entries = Vec::new();
+
+        macro_rules! record_entries {
+            ($arr:expr) => {
+                for (row_idx, &group_idx) in group_indices.iter().enumerate() {
+                    if !array.is_null(row_idx) {
+                        let value_len = $arr.value(row_idx).len();
+                        self.add_entry_length(group_idx, value_len);
+                        entries.push((group_idx as u32, row_idx as u32));
+                    }
+                }
+            };
+        }
+
         match array.data_type() {
-            DataType::Utf8 => {
-                self.append_batch(array.as_string::<i32>().iter(), group_indices)
-            }
-            DataType::LargeUtf8 => {
-                self.append_batch(array.as_string::<i64>().iter(), group_indices)
-            }
-            DataType::Utf8View => {
-                self.append_batch(array.as_string_view().iter(), group_indices)
-            }
+            DataType::Utf8 => record_entries!(array.as_string::<i32>()),
+            DataType::LargeUtf8 => record_entries!(array.as_string::<i64>()),
+            DataType::Utf8View => record_entries!(array.as_string_view()),
             other => {
                 return internal_err!("string_agg unexpected data type: {other}");
             }
         }
+
+        if !entries.is_empty() {
+            self.batches.push(array);
+            self.batch_entries.push(entries);
+        }
+
         Ok(())
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
-        let to_emit = emit_to.take_needed(&mut self.values);
-        let emitted_bytes: usize = to_emit
-            .iter()
-            .filter_map(|opt| opt.as_ref().map(|s| s.len()))
-            .sum();
-        self.total_data_bytes -= emitted_bytes;
+        let emit_groups = match emit_to {
+            EmitTo::All => self.num_groups,
+            EmitTo::First(n) => n,
+        };
 
-        let result: ArrayRef = Arc::new(LargeStringArray::from(to_emit));
-        Ok(result)
+        // Build offsets and null buffer from pre-computed output lengths.
+        let mut offsets = Vec::<i64>::with_capacity(emit_groups + 1);
+        let mut nulls = NullBufferBuilder::new(emit_groups);
+        offsets.push(0);
+        let mut total_bytes = 0i64;
+        for i in 0..emit_groups {
+            if self.entry_counts[i] == 0 {
+                nulls.append_null();
+            } else {
+                nulls.append_non_null();
+            }
+            total_bytes += self.output_lengths[i] as i64;
+            offsets.push(total_bytes);
+        }
+
+        // Allocate exact-size output buffer and per-group write cursors.
+        let mut buf = vec![0u8; total_bytes as usize];
+        let mut positions: Vec<usize> =
+            offsets[..emit_groups].iter().map(|&o| o as usize).collect();
+        let mut started = vec![false; emit_groups];
+        let delim = self.delimiter.as_bytes();
+
+        // Single pass: copy each entry's string into the output buffer.
+        macro_rules! write_entries {
+            ($arr:expr, $entries:expr) => {
+                for &(g, r) in $entries {
+                    let g = g as usize;
+                    if g < emit_groups {
+                        Self::write_value(
+                            delim,
+                            &mut buf,
+                            &mut positions[g],
+                            &mut started[g],
+                            $arr.value(r as usize),
+                        );
+                    }
+                }
+            };
+        }
+
+        for (batch, entries) in
+            self.batches.iter().zip(self.batch_entries.iter())
+        {
+            match batch.data_type() {
+                DataType::Utf8 => write_entries!(batch.as_string::<i32>(), entries),
+                DataType::LargeUtf8 => {
+                    write_entries!(batch.as_string::<i64>(), entries)
+                }
+                DataType::Utf8View => {
+                    write_entries!(batch.as_string_view(), entries)
+                }
+                other => {
+                    return internal_err!(
+                        "string_agg unexpected data type in evaluate: {other}"
+                    );
+                }
+            }
+        }
+
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(offsets));
+        let buf = Buffer::from_vec(buf);
+        // SAFETY: buf contains valid UTF-8 copied from valid string arrays,
+        // and offsets are computed from actual string lengths.
+        let array = unsafe {
+            LargeStringArray::new_unchecked(offsets, buf, nulls.finish())
+        };
+
+        match emit_to {
+            EmitTo::All => self.clear_state(),
+            EmitTo::First(_) => self.compact_retained_state(emit_groups)?,
+        }
+
+        Ok(Arc::new(array))
     }
 
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
@@ -419,7 +591,7 @@ impl GroupsAccumulator for StringAggGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        // State is always LargeUtf8, which update_batch already handles.
+        // State is always LargeUtf8, which update_batch handles.
         self.update_batch(values, group_indices, opt_filter, total_num_groups)
     }
 
@@ -442,9 +614,19 @@ impl GroupsAccumulator for StringAggGroupsAccumulator {
     }
 
     fn size(&self) -> usize {
-        self.total_data_bytes
-            + self.values.capacity() * size_of::<Option<String>>()
-            + self.delimiter.capacity()
+        self.batches
+            .iter()
+            .map(|a| a.get_array_memory_size())
+            .sum::<usize>()
+            + self.batches.capacity() * size_of::<ArrayRef>()
+            + self
+                .batch_entries
+                .iter()
+                .map(|e| e.capacity() * size_of::<(u32, u32)>())
+                .sum::<usize>()
+            + self.batch_entries.capacity() * size_of::<Vec<(u32, u32)>>()
+            + self.output_lengths.capacity() * size_of::<usize>()
+            + self.entry_counts.capacity() * size_of::<u32>()
             + size_of_val(self)
     }
 }

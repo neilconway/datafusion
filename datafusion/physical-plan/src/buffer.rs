@@ -245,7 +245,7 @@ impl ExecutionPlan for BufferExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.input.partition_statistics(partition)
     }
 
@@ -432,7 +432,6 @@ mod tests {
     };
     use std::error::Error;
     use std::fmt::Debug;
-    use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::timeout;
 

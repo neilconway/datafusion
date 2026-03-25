@@ -1424,7 +1424,7 @@ mod tests {
     use super::*;
 
     use crate::expressions;
-    use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null, lit};
+    use crate::expressions::{BinaryExpr, binary, cast, col, is_not_null};
     use arrow::buffer::Buffer;
     use arrow::datatypes::DataType::Float64;
     use arrow::datatypes::Field;

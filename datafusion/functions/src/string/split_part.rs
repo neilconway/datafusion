@@ -161,14 +161,26 @@ impl ScalarUDFImpl for SplitPartFunc {
                 &args[0].as_string_view(),
                 StringViewBuilder::with_capacity(inferred_length)
             ),
-            DataType::Utf8 => split_part_for_delimiter_type!(
-                &args[0].as_string::<i32>(),
-                GenericStringBuilder::<i32>::new()
-            ),
-            DataType::LargeUtf8 => split_part_for_delimiter_type!(
-                &args[0].as_string::<i64>(),
-                GenericStringBuilder::<i64>::new()
-            ),
+            DataType::Utf8 => {
+                let str_arr = &args[0].as_string::<i32>();
+                split_part_for_delimiter_type!(
+                    str_arr,
+                    GenericStringBuilder::<i32>::with_capacity(
+                        inferred_length,
+                        str_arr.value_data().len(),
+                    )
+                )
+            }
+            DataType::LargeUtf8 => {
+                let str_arr = &args[0].as_string::<i64>();
+                split_part_for_delimiter_type!(
+                    str_arr,
+                    GenericStringBuilder::<i64>::with_capacity(
+                        inferred_length,
+                        str_arr.value_data().len(),
+                    )
+                )
+            }
             other => exec_err!("Unsupported string type {other:?} for split_part"),
         };
         if is_scalar {

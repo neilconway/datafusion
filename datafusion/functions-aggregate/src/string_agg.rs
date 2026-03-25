@@ -331,7 +331,7 @@ struct StringAggGroupsAccumulator {
     /// Accumulated string per group. `None` means no values have been seen
     /// (the group's output will be NULL).
     /// A potential improvement is to avoid this String allocation
-    /// See <https://github.com/apache/datafusion/issues/21156> 
+    /// See <https://github.com/apache/datafusion/issues/21156>
     values: Vec<Option<String>>,
     /// Running total of string data bytes across all groups.
     total_data_bytes: usize,

@@ -361,14 +361,17 @@ where
 
     match delimiter {
         Some("") => {
-            // Empty delimiter: each string becomes a single-element list.
+            // Empty delimiter: each non-empty string becomes a single-element list.
+            // Empty strings produce an empty array (PostgreSQL compat).
             for i in 0..string_array.len() {
                 if string_array.is_null(i) {
                     list_builder.append(false);
                     continue;
                 }
                 let string = string_array.value(i);
-                append_part(list_builder.values(), string, null_value);
+                if !string.is_empty() {
+                    append_part(list_builder.values(), string, null_value);
+                }
                 list_builder.append(true);
             }
         }
@@ -385,15 +388,21 @@ where
                     continue;
                 }
                 let string = string_array.value(i);
-                let bytes = string.as_bytes();
-                let mut start = 0;
-                for pos in finder.find_iter(bytes) {
-                    append_part(list_builder.values(), &string[start..pos], null_value);
-                    start = pos + delim_len;
+                if !string.is_empty() {
+                    let bytes = string.as_bytes();
+                    let mut start = 0;
+                    for pos in finder.find_iter(bytes) {
+                        append_part(
+                            list_builder.values(),
+                            &string[start..pos],
+                            null_value,
+                        );
+                        start = pos + delim_len;
+                    }
+                    // Trailing part after last delimiter (or entire string if no
+                    // delimiter was found).
+                    append_part(list_builder.values(), &string[start..], null_value);
                 }
-                // Trailing part after last delimiter (or entire string if no
-                // delimiter was found).
-                append_part(list_builder.values(), &string[start..], null_value);
                 list_builder.append(true);
             }
         }
@@ -473,11 +482,15 @@ where
 
         match delimiter {
             Some("") => {
-                append_part(list_builder.values(), string, null_value);
+                if !string.is_empty() {
+                    append_part(list_builder.values(), string, null_value);
+                }
             }
             Some(delimiter) => {
-                for part in string.split(delimiter) {
-                    append_part(list_builder.values(), part, null_value);
+                if !string.is_empty() {
+                    for part in string.split(delimiter) {
+                        append_part(list_builder.values(), part, null_value);
+                    }
                 }
             }
             None => {

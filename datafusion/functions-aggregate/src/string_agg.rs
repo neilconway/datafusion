@@ -148,9 +148,9 @@ impl Default for StringAgg {
 }
 
 /// Three accumulation strategies depending on query shape:
-/// - No DISTINCT / ORDER BY with GROUP BY: [`StringAggGroupsAccumulator`]
-/// - No DISTINCT / ORDER BY without GROUP BY: [`SimpleStringAggAccumulator`]
-/// - With DISTINCT or ORDER BY: [`StringAggAccumulator`] (delegates to `ArrayAgg`)
+/// - No DISTINCT / ORDER BY with GROUP BY: `StringAggGroupsAccumulator`
+/// - No DISTINCT / ORDER BY without GROUP BY: `SimpleStringAggAccumulator`
+/// - With DISTINCT or ORDER BY: `StringAggAccumulator` (delegates to `ArrayAgg`)
 impl AggregateUDFImpl for StringAgg {
     fn as_any(&self) -> &dyn Any {
         self

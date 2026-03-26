@@ -488,9 +488,9 @@ query error Cannot cast string 'a' to value of Int64 type
 SELECT [1, 'a'];
 
 # MAP with mixed-category list keys should also error
-query error
+query error Cannot cast string 'a' to value of Int64 type
 SELECT MAP {[1,2,3]:1, ['a', 'b']:2};
 
 # MAP with mixed-category list values should also error
-query error
+query error Cannot cast string 'a' to value of Int64 type
 SELECT MAP {'a':[1,2,3], 'b':['a', 'b']};

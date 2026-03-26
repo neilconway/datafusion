@@ -44,7 +44,7 @@ use arrow::datatypes::DataType::{
 use datafusion_common::cast::{
     as_fixed_size_list_array, as_large_list_array, as_list_array,
 };
-use datafusion_common::exec_err;
+use datafusion_common::{exec_datafusion_err, exec_err};
 use datafusion_common::types::logical_string;
 use datafusion_expr::{
     ArrayFunctionArgument, ArrayFunctionSignature, Coercion, ColumnarValue,
@@ -261,27 +261,21 @@ impl ScalarUDFImpl for StringToArray {
 
         // Delimiter and null_str (if given) are scalar, so use the fast path
         let delimiter = match &args[1] {
-            ColumnarValue::Scalar(s) => match s.try_as_str() {
-                Some(s) => s,
-                None => {
-                    return exec_err!(
-                        "unsupported type for string_to_array delimiter: {:?}",
-                        args[1].data_type()
-                    );
-                }
-            },
+            ColumnarValue::Scalar(s) => s.try_as_str().ok_or_else(|| {
+                exec_datafusion_err!(
+                    "unsupported type for string_to_array delimiter: {:?}",
+                    args[1].data_type()
+                )
+            })?,
             _ => unreachable!("delimiter must be scalar in this branch"),
         };
         let null_value = match args.get(2) {
-            Some(ColumnarValue::Scalar(s)) => match s.try_as_str() {
-                Some(s) => s,
-                None => {
-                    return exec_err!(
-                        "unsupported type for string_to_array null_str: {:?}",
-                        args[2].data_type()
-                    );
-                }
-            },
+            Some(ColumnarValue::Scalar(s)) => s.try_as_str().ok_or_else(|| {
+                exec_datafusion_err!(
+                    "unsupported type for string_to_array null_str: {:?}",
+                    args[2].data_type()
+                )
+            })?,
             _ => None,
         };
 

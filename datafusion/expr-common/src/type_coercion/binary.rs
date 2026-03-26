@@ -741,14 +741,13 @@ fn type_union_resolution_coercion(
             Some(DataType::Struct(fields.into()))
         }
         _ => {
-            // Numeric coercion is the same as comparison coercion, both find the narrowest type
-            // that can accommodate both types
             binary_numeric_coercion(lhs_type, rhs_type)
                 .or_else(|| {
                     list_coercion(lhs_type, rhs_type, type_union_resolution_coercion)
                 })
                 .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
                 .or_else(|| string_coercion(lhs_type, rhs_type))
+                .or_else(|| null_coercion(lhs_type, rhs_type))
                 .or_else(|| string_numeric_coercion(lhs_type, rhs_type))
                 .or_else(|| binary_coercion(lhs_type, rhs_type))
         }

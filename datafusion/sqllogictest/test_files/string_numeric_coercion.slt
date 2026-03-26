@@ -306,6 +306,64 @@ small
 small
 
 # -------------------------------------------------
+# GREATEST / LEAST use comparison coercion (numeric preferred)
+# -------------------------------------------------
+
+# GREATEST with mixed int and string: numeric comparison, not lexicographic.
+query I
+SELECT GREATEST(10, '9');
+----
+10
+
+query T
+SELECT arrow_typeof(GREATEST(10, '9'));
+----
+Int64
+
+# LEAST with mixed int and string: numeric comparison.
+query I
+SELECT LEAST(10, '9');
+----
+9
+
+query T
+SELECT arrow_typeof(LEAST(10, '9'));
+----
+Int64
+
+# GREATEST with multiple mixed args
+query I
+SELECT GREATEST(1, '20', 3);
+----
+20
+
+# Non-numeric string in GREATEST errors
+statement error Arrow error: Cast error: Cannot cast string 'hello' to value of Int64 type
+SELECT GREATEST(1, 'hello');
+
+# -------------------------------------------------
+# NULLIF uses comparison coercion (numeric preferred)
+# -------------------------------------------------
+
+# NULLIF with mixed int and string: numeric comparison.
+# 10 != 9 numerically, so returns 10.
+query I
+SELECT NULLIF(10, '9');
+----
+10
+
+query T
+SELECT arrow_typeof(NULLIF(10, '9'));
+----
+Int64
+
+# NULLIF with matching values: 10 = 10 numerically, so returns NULL.
+query I
+SELECT NULLIF(10, '10');
+----
+NULL
+
+# -------------------------------------------------
 # Nested struct/map/list comparisons use comparison coercion
 # (numeric preferred) for their field/element types
 # -------------------------------------------------

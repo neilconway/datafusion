@@ -44,8 +44,8 @@ use arrow::datatypes::DataType::{
 use datafusion_common::cast::{
     as_fixed_size_list_array, as_large_list_array, as_list_array,
 };
-use datafusion_common::{exec_datafusion_err, exec_err};
 use datafusion_common::types::logical_string;
+use datafusion_common::{exec_datafusion_err, exec_err};
 use datafusion_expr::{
     ArrayFunctionArgument, ArrayFunctionSignature, Coercion, ColumnarValue,
     Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,

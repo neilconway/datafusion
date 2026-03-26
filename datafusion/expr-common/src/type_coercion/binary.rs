@@ -740,17 +740,13 @@ fn type_union_resolution_coercion(
                 .collect();
             Some(DataType::Struct(fields.into()))
         }
-        _ => {
-            binary_numeric_coercion(lhs_type, rhs_type)
-                .or_else(|| {
-                    list_coercion(lhs_type, rhs_type, type_union_resolution_coercion)
-                })
-                .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
-                .or_else(|| string_coercion(lhs_type, rhs_type))
-                .or_else(|| null_coercion(lhs_type, rhs_type))
-                .or_else(|| string_numeric_coercion(lhs_type, rhs_type))
-                .or_else(|| binary_coercion(lhs_type, rhs_type))
-        }
+        _ => binary_numeric_coercion(lhs_type, rhs_type)
+            .or_else(|| list_coercion(lhs_type, rhs_type, type_union_resolution_coercion))
+            .or_else(|| temporal_coercion_nonstrict_timezone(lhs_type, rhs_type))
+            .or_else(|| string_coercion(lhs_type, rhs_type))
+            .or_else(|| null_coercion(lhs_type, rhs_type))
+            .or_else(|| string_numeric_coercion(lhs_type, rhs_type))
+            .or_else(|| binary_coercion(lhs_type, rhs_type)),
     }
 }
 

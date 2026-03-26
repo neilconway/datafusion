@@ -579,8 +579,8 @@ impl From<&DataType> for TypeCategory {
 }
 
 /// Coerce dissimilar data types to a single data type.
-/// UNION, INTERSECT, EXCEPT, CASE, ARRAY, VALUES, and the GREATEST and LEAST functions are
-/// examples that has the similar resolution rules.
+/// ARRAY literals, VALUES, COALESCE, and array concatenation are examples
+/// of contexts that use this function.
 /// See <https://www.postgresql.org/docs/current/typeconv-union-case.html> for more information.
 /// The rules in the document provide a clue, but adhering strictly to them doesn't precisely
 /// align with the behavior of Postgres. Therefore, we've made slight adjustments to the rules

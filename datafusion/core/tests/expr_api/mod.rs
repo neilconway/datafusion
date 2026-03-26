@@ -352,7 +352,8 @@ async fn test_create_physical_expr_coercion() {
     // int column vs string literal: the string literal is cast to Int64
     create_expr_test(col("i").eq(lit("202410")), "i@1 = CAST(202410 AS Int64)");
     create_expr_test(lit("202410").eq(col("i")), "CAST(202410 AS Int64) = i@1");
-    // when simplified, the literal cast is constant-folded
+    // The simplifier operates on the logical expression before type
+    // coercion adds the CAST, so the output is unchanged.
     create_simplified_expr_test(
         col("i").eq(lit("202410")),
         "i@1 = CAST(202410 AS Int64)",

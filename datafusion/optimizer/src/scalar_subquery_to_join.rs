@@ -358,14 +358,19 @@ fn build_join(
                 // If expr always returns null when column is null, skip processing
                 continue;
             }
+
+            let indicator_col =
+                Column::new(Some(subquery_alias), UN_MATCHED_ROW_INDICATOR);
+            // Qualify with the subquery alias to avoid ambiguity when the
+            // outer table has a column with the same name as the aggregate.
+            let value_col = Column::new(Some(subquery_alias), name.clone());
+
             let computer_expr = if let Some(filter) = &pull_up.pull_up_having_expr {
                 Expr::Case(expr::Case {
                     expr: None,
                     when_then_expr: vec![
                         (
-                            Box::new(Expr::IsNull(Box::new(Expr::Column(
-                                Column::new_unqualified(UN_MATCHED_ROW_INDICATOR),
-                            )))),
+                            Box::new(Expr::IsNull(Box::new(Expr::Column(indicator_col)))),
                             Box::new(result),
                         ),
                         (
@@ -373,22 +378,16 @@ fn build_join(
                             Box::new(Expr::Literal(ScalarValue::Null, None)),
                         ),
                     ],
-                    else_expr: Some(Box::new(Expr::Column(Column::new_unqualified(
-                        name.clone(),
-                    )))),
+                    else_expr: Some(Box::new(Expr::Column(value_col))),
                 })
             } else {
                 Expr::Case(expr::Case {
                     expr: None,
                     when_then_expr: vec![(
-                        Box::new(Expr::IsNull(Box::new(Expr::Column(
-                            Column::new_unqualified(UN_MATCHED_ROW_INDICATOR),
-                        )))),
+                        Box::new(Expr::IsNull(Box::new(Expr::Column(indicator_col)))),
                         Box::new(result),
                     )],
-                    else_expr: Some(Box::new(Expr::Column(Column::new_unqualified(
-                        name.clone(),
-                    )))),
+                    else_expr: Some(Box::new(Expr::Column(value_col))),
                 })
             };
             let mut expr_rewrite = TypeCoercionRewriter {

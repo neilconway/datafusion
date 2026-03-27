@@ -461,6 +461,16 @@ fn collect_local_correlated_cols(
 }
 
 fn remove_duplicated_filter(filters: Vec<Expr>, in_predicate: &Expr) -> Vec<Expr> {
+    // We assume below that swapping the order of operands to an operator does
+    // not change behavior, which is true only if the operator is commutative.
+    debug_assert!(
+        match in_predicate {
+            Expr::BinaryExpr(b) => b.op.swap() == Some(b.op),
+            _ => true,
+        },
+        "remove_duplicated_filter: in_predicate must use a commutative operator"
+    );
+
     filters
         .into_iter()
         .filter(|filter| {
@@ -468,12 +478,13 @@ fn remove_duplicated_filter(filters: Vec<Expr>, in_predicate: &Expr) -> Vec<Expr
                 return false;
             }
 
-            // ignore the binary order
+            // Treat swapped operand order to a binary operator as equivalent
             !match (filter, in_predicate) {
                 (Expr::BinaryExpr(a_expr), Expr::BinaryExpr(b_expr)) => {
-                    (a_expr.op == b_expr.op)
-                        && (a_expr.left == b_expr.left && a_expr.right == b_expr.right)
-                        || (a_expr.left == b_expr.right && a_expr.right == b_expr.left)
+                    a_expr.op == b_expr.op
+                        && ((a_expr.left == b_expr.left && a_expr.right == b_expr.right)
+                            || (a_expr.left == b_expr.right
+                                && a_expr.right == b_expr.left))
                 }
                 _ => false,
             }

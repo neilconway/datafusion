@@ -1708,6 +1708,32 @@ ORDER BY sq_name_t1.id;
 2 1
 3 0
 
+query I
+SELECT sq_name_t1.id
+FROM sq_name_t1
+WHERE sq_name_t1.id > (
+  SELECT count(*) AS id
+  FROM sq_name_t2
+  WHERE sq_name_t2.outer_id = sq_name_t1.id
+)
+ORDER BY sq_name_t1.id;
+----
+2
+3
+
+query I
+SELECT sq_name_t1.id * 10 + (
+  SELECT count(*) AS id
+  FROM sq_name_t2
+  WHERE sq_name_t2.outer_id = sq_name_t1.id
+) AS total
+FROM sq_name_t1
+ORDER BY sq_name_t1.id;
+----
+12
+21
+30
+
 statement ok
 DROP TABLE sq_name_t1;
 

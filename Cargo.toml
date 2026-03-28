@@ -252,13 +252,13 @@ unused_qualifications = "deny"
 [profile.release]
 codegen-units = 1
 lto = true
-strip = true            # Eliminate debug info to minimize binary size
+strip = true      # Eliminate debug info to minimize binary size
 
 [profile.release-nonlto]
 inherits = "release"
 codegen-units = 16
 lto = false
-strip = false           # Retain debug info for flamegraphs
+strip = false        # Retain debug info for flamegraphs
 
 [profile.profiling]
 inherits = "release"

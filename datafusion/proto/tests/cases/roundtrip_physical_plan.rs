@@ -54,7 +54,6 @@ use datafusion::physical_expr::window::{SlidingAggregateWindowExpr, StandardWind
 use datafusion::physical_expr::{
     LexOrdering, PhysicalSortRequirement, ScalarFunctionExpr,
 };
-use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion::physical_plan::aggregates::{
     AggregateExec, AggregateMode, LimitOptions, PhysicalGroupBy,
 };
@@ -67,7 +66,6 @@ use datafusion::physical_plan::expressions::{
     BinaryExpr, Column, NotExpr, PhysicalSortExpr, binary, cast, col, in_list, like, lit,
 };
 use datafusion::physical_plan::filter::{FilterExec, FilterExecBuilder};
-use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion::physical_plan::joins::{
     HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
     StreamJoinPartitionMode, SymmetricHashJoinExec,
@@ -77,6 +75,9 @@ use datafusion::physical_plan::metrics::MetricType;
 use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
+use datafusion::physical_plan::scalar_subquery::{
+    ScalarSubqueryExec, ScalarSubqueryLink,
+};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
 use datafusion::physical_plan::unnest::{ListUnnest, UnnestExec};
@@ -112,6 +113,7 @@ use datafusion_functions_aggregate::average::avg_udaf;
 use datafusion_functions_aggregate::min_max::max_udaf;
 use datafusion_functions_aggregate::nth_value::nth_value_udaf;
 use datafusion_functions_aggregate::string_agg::string_agg_udaf;
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_proto::bytes::{
     physical_plan_from_bytes_with_proto_converter,
     physical_plan_to_bytes_with_proto_converter,
@@ -3200,9 +3202,7 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
 /// same shared results container as ScalarSubqueryExec after a proto round-trip.
 #[test]
 fn roundtrip_scalar_subquery_exec() -> Result<()> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("a", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
 
     // Create a shared results container with one slot.
     let results = Arc::new(vec![OnceLock::new()]);
@@ -3216,12 +3216,16 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         Arc::clone(&results),
     ));
     let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
-    let filter = FilterExec::try_new(predicate, Arc::new(EmptyExec::new(schema.clone())))?;
+    let filter =
+        FilterExec::try_new(predicate, Arc::new(EmptyExec::new(schema.clone())))?;
 
     // Build a trivial subquery plan.
-    let subquery_plan = Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int64, true),
-    ]))));
+    let subquery_plan =
+        Arc::new(EmptyExec::new(Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Int64,
+            true,
+        )]))));
 
     let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
         Arc::new(filter),
@@ -3237,8 +3241,11 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     // results through expression deserialization.
     let codec = DefaultPhysicalExtensionCodec {};
     let converter = DeduplicatingProtoConverter {};
-    let bytes =
-        physical_plan_to_bytes_with_proto_converter(Arc::clone(&exec), &codec, &converter)?;
+    let bytes = physical_plan_to_bytes_with_proto_converter(
+        Arc::clone(&exec),
+        &codec,
+        &converter,
+    )?;
     let ctx = SessionContext::new();
     let deserialized = physical_plan_from_bytes_with_proto_converter(
         bytes.as_ref(),

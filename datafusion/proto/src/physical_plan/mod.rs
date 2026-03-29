@@ -2300,7 +2300,9 @@ impl protobuf::PhysicalPlanNode {
                 Ok(ScalarSubqueryLink { plan, index })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(ScalarSubqueryExec::new(input, subqueries, results)))
+        Ok(Arc::new(ScalarSubqueryExec::new(
+            input, subqueries, results,
+        )))
     }
 
     fn try_from_explain_exec(

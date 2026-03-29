@@ -39,9 +39,7 @@ fn query(ctx: &SessionContext, rt: &Runtime, sql: &str) {
 }
 
 fn create_context(num_rows: usize) -> Result<SessionContext> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("x", DataType::Int64, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
 
     let batch_size = 4096;
     let batches = (0..num_rows / batch_size)
@@ -54,16 +52,17 @@ fn create_context(num_rows: usize) -> Result<SessionContext> {
         .collect::<Vec<_>>();
 
     // Small lookup table for the subquery to read from.
-    let sq_schema = Arc::new(Schema::new(vec![
-        Field::new("v", DataType::Int64, false),
-    ]));
+    let sq_schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Int64, false)]));
     let sq_batch = RecordBatch::try_new(
         sq_schema.clone(),
         vec![Arc::new(Int64Array::from(vec![10, 20, 30]))],
     )?;
 
     let ctx = SessionContext::new();
-    ctx.register_table("main_t", Arc::new(MemTable::try_new(schema, vec![batches])?))?;
+    ctx.register_table(
+        "main_t",
+        Arc::new(MemTable::try_new(schema, vec![batches])?),
+    )?;
     ctx.register_table(
         "lookup",
         Arc::new(MemTable::try_new(sq_schema, vec![vec![sq_batch]])?),

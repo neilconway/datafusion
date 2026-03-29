@@ -35,6 +35,7 @@ use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_physical_expr::PhysicalExpr;
 
 use crate::execution_plan::{CardinalityEffect, ExecutionPlan, PlanProperties};
+use crate::joins::utils::{OnceAsync, OnceFut};
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
 
@@ -83,9 +84,8 @@ pub struct ScalarSubqueryExec {
     input: Arc<dyn ExecutionPlan>,
     /// Subquery plans and their result indexes.
     subqueries: Vec<ScalarSubqueryLink>,
-    /// Ensures subqueries are executed exactly once, even when multiple
-    /// partitions call `execute()` concurrently.
-    subquery_barrier: Arc<tokio::sync::OnceCell<()>>,
+    /// Shared one-time async computation of subquery results.
+    subquery_future: Arc<OnceAsync<()>>,
     /// Shared results container; same instance held by ScalarSubqueryExpr nodes.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).
@@ -102,7 +102,7 @@ impl ScalarSubqueryExec {
         Self {
             input,
             subqueries,
-            subquery_barrier: Arc::new(tokio::sync::OnceCell::new()),
+            subquery_future: Arc::default(),
             results,
             cache,
         }
@@ -196,24 +196,22 @@ impl ExecutionPlan for ScalarSubqueryExec {
     ) -> Result<SendableRecordBatchStream> {
         let subqueries = self.subqueries.clone();
         let results = Arc::clone(&self.results);
-        let barrier = Arc::clone(&self.subquery_barrier);
+        let subquery_ctx = Arc::clone(&context);
+        let mut subquery_future = self.subquery_future.try_once(move || {
+            Ok(async move { execute_subqueries(subqueries, results, subquery_ctx).await })
+        })?;
         let input = Arc::clone(&self.input);
         let schema = self.schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             schema,
             futures::stream::once(async move {
-                // Execute all subqueries exactly once
-                barrier
-                    .get_or_try_init(|| async {
-                        execute_subqueries(subqueries, results, context.clone())
-                            .await
-                            .map(|_| ())
-                    })
-                    .await?;
+                // Execute all subqueries exactly once, even when multiple
+                // partitions call execute() concurrently.
+                wait_for_subqueries(&mut subquery_future).await?;
 
-                // Now that the subqueries have been computed, we can safely
-                // start the main input
+                // Now that the subqueries have finished execution, we can
+                // safely execute the main input
                 input.execute(partition, context)
             })
             .try_flatten(),
@@ -246,19 +244,22 @@ impl ExecutionPlan for ScalarSubqueryExec {
 
 /// Execute all subquery plans, extract their scalar results, and populate
 /// the shared results container.
+async fn wait_for_subqueries(fut: &mut OnceFut<()>) -> Result<()> {
+    std::future::poll_fn(|cx| fut.get_shared(cx)).await?;
+    Ok(())
+}
+
 async fn execute_subqueries(
     subqueries: Vec<ScalarSubqueryLink>,
     results: ScalarSubqueryResults,
     context: Arc<TaskContext>,
-) -> Result<Vec<ScalarValue>> {
-    let mut values = Vec::with_capacity(subqueries.len());
+) -> Result<()> {
     for sq in &subqueries {
         let value =
             execute_scalar_subquery(Arc::clone(&sq.plan), Arc::clone(&context)).await?;
         let _ = results[sq.index].set(value.clone());
-        values.push(value);
     }
-    Ok(values)
+    Ok(())
 }
 
 /// Execute a single subquery plan and extract the scalar value.
@@ -304,10 +305,82 @@ mod tests {
     use crate::test::{self, TestMemoryExec};
 
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
+    use crate::test::exec::ErrorExec;
     use arrow::array::{Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+
+    #[derive(Debug)]
+    struct CountingExec {
+        inner: Arc<dyn ExecutionPlan>,
+        execute_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingExec {
+        fn new(inner: Arc<dyn ExecutionPlan>, execute_calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                inner,
+                execute_calls,
+            }
+        }
+    }
+
+    impl DisplayAs for CountingExec {
+        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            match t {
+                DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                    write!(f, "CountingExec")
+                }
+                DisplayFormatType::TreeRender => write!(f, ""),
+            }
+        }
+    }
+
+    impl ExecutionPlan for CountingExec {
+        fn name(&self) -> &'static str {
+            "CountingExec"
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            self.inner.properties()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![&self.inner]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            mut children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(Arc::new(Self::new(
+                children.remove(0),
+                Arc::clone(&self.execute_calls),
+            )))
+        }
+
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            Ok(TreeNodeRecursion::Continue)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            self.execute_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.execute(partition, context)
+        }
+    }
 
     fn make_subquery_plan(batches: Vec<RecordBatch>) -> Arc<dyn ExecutionPlan> {
         let schema = batches[0].schema();
@@ -404,6 +477,35 @@ mod tests {
             err_msg.contains("more than one row"),
             "Expected 'more than one row' error, got: {err_msg}"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failed_subquery_is_not_retried() -> Result<()> {
+        let execute_calls = Arc::new(AtomicUsize::new(0));
+        let subquery_plan = Arc::new(CountingExec::new(
+            Arc::new(ErrorExec::new()),
+            Arc::clone(&execute_calls),
+        ));
+        let results = make_results(1);
+        let sq = ScalarSubqueryLink {
+            plan: subquery_plan,
+            index: 0,
+        };
+
+        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            test::aggr_test_schema(),
+        ));
+        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results);
+
+        let ctx = Arc::new(TaskContext::default());
+        let stream = exec.execute(0, Arc::clone(&ctx))?;
+        assert!(crate::common::collect(stream).await.is_err());
+
+        let stream = exec.execute(0, ctx)?;
+        assert!(crate::common::collect(stream).await.is_err());
+
+        assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
         Ok(())
     }
 }

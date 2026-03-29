@@ -18,9 +18,7 @@
 //! Physical expression for uncorrelated scalar subqueries.
 //!
 //! [`ScalarSubqueryExpr`] reads a cached [`ScalarValue`] that is populated
-//! at execution time by [`ScalarSubqueryExec`].
-//!
-//! [`ScalarSubqueryExec`]: datafusion_physical_plan::scalar_subquery::ScalarSubqueryExec
+//! at execution time by `ScalarSubqueryExec`.
 
 use std::any::Any;
 use std::fmt;

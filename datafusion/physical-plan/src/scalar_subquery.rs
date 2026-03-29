@@ -35,11 +35,11 @@ use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_physical_expr::PhysicalExpr;
 
 use crate::execution_plan::{CardinalityEffect, ExecutionPlan, PlanProperties};
-use crate::joins::utils::OnceAsync;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
 
-use futures::stream::StreamExt;
+use futures::StreamExt;
+use futures::TryStreamExt;
 
 /// Links a scalar subquery's execution plan to its index in the shared results
 /// container. The [`ScalarSubqueryExec`] that owns these links populates
@@ -83,8 +83,9 @@ pub struct ScalarSubqueryExec {
     input: Arc<dyn ExecutionPlan>,
     /// Subquery plans and their result indexes.
     subqueries: Vec<ScalarSubqueryLink>,
-    /// Shared one-time async computation of subquery results.
-    subquery_future: Arc<OnceAsync<Vec<ScalarValue>>>,
+    /// Ensures subqueries are executed exactly once, even when multiple
+    /// partitions call `execute()` concurrently.
+    subquery_barrier: Arc<tokio::sync::OnceCell<()>>,
     /// Shared results container; same instance held by ScalarSubqueryExpr nodes.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).
@@ -101,7 +102,7 @@ impl ScalarSubqueryExec {
         Self {
             input,
             subqueries,
-            subquery_future: Arc::default(),
+            subquery_barrier: Arc::new(tokio::sync::OnceCell::new()),
             results,
             cache,
         }
@@ -195,35 +196,27 @@ impl ExecutionPlan for ScalarSubqueryExec {
     ) -> Result<SendableRecordBatchStream> {
         let subqueries = self.subqueries.clone();
         let results = Arc::clone(&self.results);
-        let ctx = Arc::clone(&context);
+        let barrier = Arc::clone(&self.subquery_barrier);
+        let input = Arc::clone(&self.input);
+        let schema = self.schema();
 
-        // Use OnceAsync to ensure all subqueries are executed exactly once,
-        // even when multiple partitions call execute() concurrently.
-        let mut once_fut = self.subquery_future.try_once(move || {
-            Ok(async move { execute_subqueries(subqueries, results, ctx).await })
-        })?;
-
-        let input = self.input.execute(partition, context)?;
-        let schema = input.schema();
-
-        // Create a stream that first waits for subquery results, then
-        // delegates to the inner input stream.
         Ok(Box::pin(RecordBatchStreamAdapter::new(
-            Arc::clone(&schema),
+            schema,
             futures::stream::once(async move {
-                // Wait for subquery execution to complete.
-                let result: Result<()> =
-                    std::future::poll_fn(|cx| once_fut.get(cx).map(|r| r.map(|_| ())))
-                        .await;
-                result
+                // Execute all subqueries exactly once
+                barrier
+                    .get_or_try_init(|| async {
+                        execute_subqueries(subqueries, results, context.clone())
+                            .await
+                            .map(|_| ())
+                    })
+                    .await?;
+
+                // Now that the subqueries have been computed, we can safely
+                // start the main input
+                input.execute(partition, context)
             })
-            .filter_map(|result| async move {
-                match result {
-                    Ok(()) => None,         // Subqueries done, proceed to input
-                    Err(e) => Some(Err(e)), // Propagate error
-                }
-            })
-            .chain(input),
+            .try_flatten(),
         )))
     }
 

@@ -36,8 +36,6 @@ use std::sync::Arc;
 
 use datafusion_physical_plan::ExecutionPlan;
 
-mod registry;
-
 /// Encodes something (such as [`Expr`]) to/from a stream of
 /// bytes.
 ///

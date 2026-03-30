@@ -746,6 +746,18 @@ logical_plan
 09)--------TableScan: t2
 10)--EmptyRelation: rows=1
 
+# Verify projection pushdown works inside uncorrelated scalar subqueries:
+# the TableScan inside the subquery should only read t2_id, not all columns.
+query TT
+explain select t1_id from t1 where t1_id > (select max(t2_id) from t2)
+----
+logical_plan
+01)Filter: t1.t1_id > (<subquery>)
+02)--Subquery:
+03)----Aggregate: groupBy=[[]], aggr=[[max(t2.t2_id)]]
+04)------TableScan: t2 projection=[t2_id]
+05)--TableScan: t1 projection=[t1_id]
+
 statement ok
 set datafusion.explain.logical_plan_only = false;
 

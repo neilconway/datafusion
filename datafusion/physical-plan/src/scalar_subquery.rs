@@ -59,14 +59,13 @@ pub struct ScalarSubqueryLink {
 /// Manages execution of uncorrelated scalar subqueries for a single plan
 /// level.
 ///
-/// This node has an asymmetric set of children: the first child is the
-/// **main input plan**, whose batches are passed through unchanged. The
-/// remaining children are **subquery plans**, each of which must produce
-/// exactly zero or one row. Before any batches from the main input are
-/// yielded, all subquery plans are executed and their scalar results are
-/// stored in a shared results container ([`ScalarSubqueryResults`]).
-/// [`ScalarSubqueryExpr`] nodes embedded in the main input's expressions
-/// read from this container by index.
+/// The first child node is the **main input plan**, whose batches are passed
+/// through unchanged. The remaining children are **subquery plans**, each of
+/// which must produce exactly zero or one row. Before any batches from the main
+/// input are yielded, all subquery plans are executed and their scalar results
+/// are stored in a shared results container ([`ScalarSubqueryResults`]).
+/// [`ScalarSubqueryExpr`] nodes embedded in the main input's expressions read
+/// from this container by index.
 ///
 /// All subqueries are evaluated eagerly when the first output partition is
 /// requested, before any rows from the main input are produced.

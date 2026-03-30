@@ -39,7 +39,7 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 /// shared results container at the appropriate index.
 ///
 /// If the same subquery appears multiple times in a query, there will be
-/// multiple `ScalarSubqueryExec` with the same result index.
+/// multiple `ScalarSubqueryExpr` with the same result index.
 #[derive(Debug)]
 pub struct ScalarSubqueryExpr {
     data_type: DataType,
@@ -85,8 +85,7 @@ impl fmt::Display for ScalarSubqueryExpr {
 }
 
 // Two ScalarSubqueryExprs are the "same" if they share the same results
-// container and have the same index. This follows the DynamicFilterPhysicalExpr
-// precedent of identity-based equality.
+// container and have the same index.
 impl Hash for ScalarSubqueryExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.results).hash(state);

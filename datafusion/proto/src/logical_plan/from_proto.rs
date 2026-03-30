@@ -25,7 +25,9 @@ use datafusion_common::{
 };
 use datafusion_execution::registry::FunctionRegistry;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::expr::{Alias, Exists, InSubquery, NullTreatment, Placeholder, Sort};
+use datafusion_expr::expr::{
+    Alias, Exists, InSubquery, NullTreatment, Placeholder, Sort,
+};
 use datafusion_expr::expr::{Unnest, WildcardOptions};
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
@@ -660,9 +662,9 @@ pub fn parse_expr(
         },
         ExprType::ScalarSubqueryExpr(sq) => {
             let subquery = parse_subquery(
-                sq.subquery.as_deref().ok_or_else(|| {
-                    Error::required("ScalarSubqueryExprNode.subquery")
-                })?,
+                sq.subquery
+                    .as_deref()
+                    .ok_or_else(|| Error::required("ScalarSubqueryExprNode.subquery"))?,
                 registry,
                 codec,
             )?;
@@ -676,9 +678,9 @@ pub fn parse_expr(
                 codec,
             )?;
             let subquery = parse_subquery(
-                sq.subquery.as_deref().ok_or_else(|| {
-                    Error::required("InSubqueryExprNode.subquery")
-                })?,
+                sq.subquery
+                    .as_deref()
+                    .ok_or_else(|| Error::required("InSubqueryExprNode.subquery"))?,
                 registry,
                 codec,
             )?;
@@ -690,9 +692,9 @@ pub fn parse_expr(
         }
         ExprType::ExistsExpr(sq) => {
             let subquery = parse_subquery(
-                sq.subquery.as_deref().ok_or_else(|| {
-                    Error::required("ExistsExprNode.subquery")
-                })?,
+                sq.subquery
+                    .as_deref()
+                    .ok_or_else(|| Error::required("ExistsExprNode.subquery"))?,
                 registry,
                 codec,
             )?;
@@ -715,8 +717,7 @@ fn parse_subquery(
     // structure itself.
     let ctx = datafusion_execution::TaskContext::default();
     let plan = plan_node.try_into_logical_plan(&ctx, codec)?;
-    let outer_ref_columns =
-        parse_exprs(&proto.outer_ref_columns, registry, codec)?;
+    let outer_ref_columns = parse_exprs(&proto.outer_ref_columns, registry, codec)?;
     Ok(Subquery {
         subquery: Arc::new(plan),
         outer_ref_columns,

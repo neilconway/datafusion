@@ -25,9 +25,8 @@ use datafusion_common::{NullEquality, TableReference, UnnestOptions};
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::expr::{
-    self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, Exists,
-    GroupingSet, InList, InSubquery, Like, NullTreatment, Placeholder, ScalarFunction,
-    Unnest,
+    self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, Exists, GroupingSet,
+    InList, InSubquery, Like, NullTreatment, Placeholder, ScalarFunction, Unnest,
 };
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
@@ -603,12 +602,10 @@ pub fn serialize_expr(
             ))),
         },
         Expr::Exists(Exists { subquery, negated }) => protobuf::LogicalExprNode {
-            expr_type: Some(ExprType::ExistsExpr(Box::new(
-                protobuf::ExistsExprNode {
-                    subquery: Some(Box::new(serialize_subquery(subquery, codec)?)),
-                    negated: *negated,
-                },
-            ))),
+            expr_type: Some(ExprType::ExistsExpr(Box::new(protobuf::ExistsExprNode {
+                subquery: Some(Box::new(serialize_subquery(subquery, codec)?)),
+                negated: *negated,
+            }))),
         },
         Expr::OuterReferenceColumn(_, _) | Expr::SetComparison(_) => {
             return Err(Error::General(format!(

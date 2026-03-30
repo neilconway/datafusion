@@ -416,12 +416,11 @@ impl DefaultPhysicalPlanner {
     /// [`create_physical_expr`] can convert `Expr::ScalarSubquery` into
     /// [`ScalarSubqueryExpr`] nodes that read from the slots.
     ///
-    /// The resulting physical plan is wrapped in a [`ScalarSubqueryExec`]
-    /// that owns and executes those subquery plans before any data flows
-    /// through the main plan. If a subquery itself contains nested
-    /// uncorrelated subqueries, the recursive call produces its own
-    /// [`ScalarSubqueryExec`] inside the subquery plan — each level
-    /// manages only its own subqueries.
+    /// The resulting physical plan is wrapped in a [`ScalarSubqueryExec`] node
+    /// that executes those subquery plans before any data flows through the
+    /// main plan. If a subquery itself contains nested uncorrelated subqueries,
+    /// the recursive call produces its own [`ScalarSubqueryExec`] inside the
+    /// subquery plan — each level manages only its own subqueries.
     ///
     /// Returns a [`BoxFuture`] rather than using `async fn` because of
     /// this recursion.
@@ -440,15 +439,14 @@ impl DefaultPhysicalPlanner {
                 .plan_scalar_subqueries(&all_sq_refs, session_state)
                 .await?;
 
-            // Create the shared results container and register it (along with
-            // the index map) in ExecutionProps so that `create_physical_expr`
-            // can resolve `Expr::ScalarSubquery` into `ScalarSubqueryExpr`
-            // nodes. We clone the SessionState so these are available
-            // throughout physical planning without mutating the caller's state.
+            // Create the shared results container and register it in
+            // ExecutionProps so that `create_physical_expr` can resolve
+            // `Expr::ScalarSubquery` into `ScalarSubqueryExpr` nodes. We clone
+            // the SessionState so these are available throughout physical
+            // planning without mutating the caller's state.
             //
             // Ideally, the subquery state would live in a dedicated planning
-            // context rather than on ExecutionProps (which is meant for
-            // session-level configuration). It's here because
+            // context rather than on ExecutionProps. It's here because
             // `create_physical_expr` only receives `&ExecutionProps`, and
             // changing that signature would be a breaking public API change.
             let results: Arc<Vec<OnceLock<ScalarValue>>> =

@@ -29,7 +29,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, ScalarValue, exec_err, internal_err};
+use datafusion_common::{Result, ScalarValue, Statistics, exec_err, internal_err};
 use datafusion_execution::TaskContext;
 use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_physical_expr::PhysicalExpr;
@@ -235,6 +235,10 @@ impl ExecutionPlan for ScalarSubqueryExec {
         // Only the main input; subquery children produce at most one
         // row, so repartitioning them adds overhead with no benefit.
         self.true_for_input_only()
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.input.partition_statistics(partition)
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {

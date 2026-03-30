@@ -25,8 +25,9 @@ use datafusion_common::{
 };
 use datafusion_execution::registry::FunctionRegistry;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::expr::{Alias, NullTreatment, Placeholder, Sort};
+use datafusion_expr::expr::{Alias, Exists, InSubquery, NullTreatment, Placeholder, Sort};
 use datafusion_expr::expr::{Unnest, WildcardOptions};
+use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet,
     GroupingSet::GroupingSets,
@@ -52,7 +53,7 @@ use crate::protobuf::{
     },
 };
 
-use super::LogicalExtensionCodec;
+use super::{AsLogicalPlan, LogicalExtensionCodec};
 
 impl From<&protobuf::UnnestOptions> for UnnestOptions {
     fn from(opts: &protobuf::UnnestOptions) -> Self {
@@ -657,7 +658,70 @@ pub fn parse_expr(
                 )))
             }
         },
+        ExprType::ScalarSubqueryExpr(sq) => {
+            let subquery = parse_subquery(
+                sq.subquery.as_deref().ok_or_else(|| {
+                    Error::required("ScalarSubqueryExprNode.subquery")
+                })?,
+                registry,
+                codec,
+            )?;
+            Ok(Expr::ScalarSubquery(subquery))
+        }
+        ExprType::InSubqueryExpr(sq) => {
+            let expr = parse_required_expr(
+                sq.expr.as_deref(),
+                registry,
+                "InSubqueryExprNode.expr",
+                codec,
+            )?;
+            let subquery = parse_subquery(
+                sq.subquery.as_deref().ok_or_else(|| {
+                    Error::required("InSubqueryExprNode.subquery")
+                })?,
+                registry,
+                codec,
+            )?;
+            Ok(Expr::InSubquery(InSubquery::new(
+                Box::new(expr),
+                subquery,
+                sq.negated,
+            )))
+        }
+        ExprType::ExistsExpr(sq) => {
+            let subquery = parse_subquery(
+                sq.subquery.as_deref().ok_or_else(|| {
+                    Error::required("ExistsExprNode.subquery")
+                })?,
+                registry,
+                codec,
+            )?;
+            Ok(Expr::Exists(Exists::new(subquery, sq.negated)))
+        }
     }
+}
+
+fn parse_subquery(
+    proto: &protobuf::SubqueryNode,
+    registry: &dyn FunctionRegistry,
+    codec: &dyn LogicalExtensionCodec,
+) -> Result<Subquery, Error> {
+    let plan_node = proto
+        .subquery
+        .as_ref()
+        .ok_or_else(|| Error::required("SubqueryNode.subquery"))?;
+    // TaskContext is needed for try_into_logical_plan but only used for
+    // table provider deserialization (cache manager), not for the plan
+    // structure itself.
+    let ctx = datafusion_execution::TaskContext::default();
+    let plan = plan_node.try_into_logical_plan(&ctx, codec)?;
+    let outer_ref_columns =
+        parse_exprs(&proto.outer_ref_columns, registry, codec)?;
+    Ok(Subquery {
+        subquery: Arc::new(plan),
+        outer_ref_columns,
+        spans: Default::default(),
+    })
 }
 
 /// Parse a vector of `protobuf::LogicalExprNode`s.

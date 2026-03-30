@@ -133,7 +133,8 @@ fn roundtrip_expr_test_with_codec(
 ) {
     let proto: protobuf::LogicalExprNode = serialize_expr(&initial_struct, codec)
         .unwrap_or_else(|e| panic!("Error serializing expression: {e:?}"));
-    let round_trip: Expr = from_proto::parse_expr(&proto, &ctx, codec).unwrap();
+    let round_trip: Expr =
+        from_proto::parse_expr(&proto, ctx.task_ctx().as_ref(), codec).unwrap();
 
     assert_eq!(format!("{:?}", &initial_struct), format!("{round_trip:?}"));
 
@@ -2562,7 +2563,8 @@ fn roundtrip_scalar_udf_extension_codec() {
     let ctx = SessionContext::new();
     let proto = serialize_expr(&test_expr, &UDFExtensionCodec).expect("serialize expr");
     let round_trip =
-        from_proto::parse_expr(&proto, &ctx, &UDFExtensionCodec).expect("parse expr");
+        from_proto::parse_expr(&proto, ctx.task_ctx().as_ref(), &UDFExtensionCodec)
+            .expect("parse expr");
 
     assert_eq!(format!("{:?}", &test_expr), format!("{round_trip:?}"));
     roundtrip_json_test(&proto);
@@ -2575,7 +2577,8 @@ fn roundtrip_aggregate_udf_extension_codec() {
     let ctx = SessionContext::new();
     let proto = serialize_expr(&test_expr, &UDFExtensionCodec).expect("serialize expr");
     let round_trip =
-        from_proto::parse_expr(&proto, &ctx, &UDFExtensionCodec).expect("parse expr");
+        from_proto::parse_expr(&proto, ctx.task_ctx().as_ref(), &UDFExtensionCodec)
+            .expect("parse expr");
 
     assert_eq!(format!("{:?}", &test_expr), format!("{round_trip:?}"));
     roundtrip_json_test(&proto);

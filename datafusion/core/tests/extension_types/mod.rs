@@ -15,15 +15,4 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Sort Merge Join Execution Plan Operator
-
-pub use exec::SortMergeJoinExec;
-
-pub(crate) mod bitwise_stream;
-mod exec;
-mod filter;
-pub(crate) mod materializing_stream;
-mod metrics;
-
-#[cfg(test)]
-mod tests;
+mod pretty_printing;

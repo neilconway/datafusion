@@ -73,9 +73,6 @@ pub struct ScalarSubqueryLink {
 /// TODO: Consider overlapping computation of the subqueries with evaluating the
 /// main query.
 ///
-/// TODO: Subqueries are evaluated sequentially. Consider parallel evaluation in
-/// the future.
-///
 /// [`ScalarSubqueryExpr`]: datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr
 #[derive(Debug)]
 pub struct ScalarSubqueryExec {
@@ -257,11 +254,20 @@ async fn execute_subqueries(
     results: ScalarSubqueryResults,
     context: Arc<TaskContext>,
 ) -> Result<()> {
-    for sq in &subqueries {
-        let value =
-            execute_scalar_subquery(Arc::clone(&sq.plan), Arc::clone(&context)).await?;
-        let _ = results[sq.index].set(value.clone());
-    }
+    // Evaluate subqueries in parallel; wait for them all to finish evaluation
+    // before returning.
+    let futures = subqueries.iter().map(|sq| {
+        let plan = Arc::clone(&sq.plan);
+        let ctx = Arc::clone(&context);
+        let results = Arc::clone(&results);
+        let index = sq.index;
+        async move {
+            let value = execute_scalar_subquery(plan, ctx).await?;
+            let _ = results[index].set(value);
+            Ok(()) as Result<()>
+        }
+    });
+    futures::future::try_join_all(futures).await?;
     Ok(())
 }
 

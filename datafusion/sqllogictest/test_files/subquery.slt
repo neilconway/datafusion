@@ -727,7 +727,7 @@ logical_plan
 02)--Subquery:
 03)----Projection: count(Int64(1)) AS count(*)
 04)------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
-05)--------TableScan: t1
+05)--------TableScan: t1 projection=[]
 06)--EmptyRelation: rows=1
 
 #simple_uncorrelated_scalar_subquery2
@@ -739,15 +739,19 @@ logical_plan
 02)--Subquery:
 03)----Projection: count(Int64(1)) AS count(*)
 04)------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
-05)--------TableScan: t1
+05)--------TableScan: t1 projection=[]
 06)--Subquery:
-07)----Projection: count(Int64(1))
-08)------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
-09)--------TableScan: t2
-10)--EmptyRelation: rows=1
+07)----Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
+08)------TableScan: t2 projection=[]
+09)--EmptyRelation: rows=1
 
-# Verify projection pushdown works inside uncorrelated scalar subqueries:
-# the TableScan inside the subquery should only read t2_id, not all columns.
+# Verify projection pushdown works inside uncorrelated scalar subqueries.
+# Each test targets a different early-return path in OptimizeProjections
+# to ensure subquery plans are optimized regardless of where the subquery
+# expression appears.
+
+# Subquery in a Filter predicate: the TableScan inside the subquery should
+# only read t2_id, not all columns.
 query TT
 explain select t1_id from t1 where t1_id > (select max(t2_id) from t2)
 ----
@@ -757,6 +761,41 @@ logical_plan
 03)----Aggregate: groupBy=[[]], aggr=[[max(t2.t2_id)]]
 04)------TableScan: t2 projection=[t2_id]
 05)--TableScan: t1 projection=[t1_id]
+
+# Subquery in a Projection expression
+query TT
+explain select t1_id, (select max(t2_id) from t2) as max_t2 from t1
+----
+logical_plan
+01)Projection: t1.t1_id, (<subquery>) AS max_t2
+02)--Subquery:
+03)----Aggregate: groupBy=[[]], aggr=[[max(t2.t2_id)]]
+04)------TableScan: t2 projection=[t2_id]
+05)--TableScan: t1 projection=[t1_id]
+
+# Subquery in an Aggregate expression
+query TT
+explain select sum(t1_int + (select min(t2_int) from t2)) as s from t1
+----
+logical_plan
+01)Projection: sum(t1.t1_int + min(t2.t2_int)) AS s
+02)--Aggregate: groupBy=[[]], aggr=[[sum(CAST(t1.t1_int + (<subquery>) AS Int64))]]
+03)----Subquery:
+04)------Aggregate: groupBy=[[]], aggr=[[min(t2.t2_int)]]
+05)--------TableScan: t2 projection=[t2_int]
+06)----TableScan: t1 projection=[t1_int]
+
+# Subquery in a Window expression
+query TT
+explain select t1_id, sum(t1_int + (select min(t2_int) from t2)) over () as win from t1
+----
+logical_plan
+01)Projection: t1.t1_id, sum(t1.t1_int + min(t2.t2_int)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING AS win
+02)--WindowAggr: windowExpr=[[sum(CAST(t1.t1_int + (<subquery>) AS Int64)) ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING]]
+03)----Subquery:
+04)------Aggregate: groupBy=[[]], aggr=[[min(t2.t2_int)]]
+05)--------TableScan: t2 projection=[t2_int]
+06)----TableScan: t1 projection=[t1_id, t1_int]
 
 statement ok
 set datafusion.explain.logical_plan_only = false;
@@ -769,12 +808,11 @@ logical_plan
 02)--Subquery:
 03)----Projection: count(Int64(1)) AS count(*)
 04)------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
-05)--------TableScan: t1
+05)--------TableScan: t1 projection=[]
 06)--Subquery:
-07)----Projection: count(Int64(1))
-08)------Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
-09)--------TableScan: t2
-10)--EmptyRelation: rows=1
+07)----Aggregate: groupBy=[[]], aggr=[[count(Int64(1))]]
+08)------TableScan: t2 projection=[]
+09)--EmptyRelation: rows=1
 physical_plan
 01)ScalarSubqueryExec: subqueries=2
 02)--ProjectionExec: expr=[scalar_subquery(<pending>) as b, scalar_subquery(<pending>) as count(Int64(1))]
@@ -1816,12 +1854,11 @@ logical_plan
 02)--Subquery:
 03)----Projection: max(sq_values.v) + (<subquery>)
 04)------Subquery:
-05)--------Projection: min(sq_values.v)
-06)----------Aggregate: groupBy=[[]], aggr=[[min(sq_values.v)]]
-07)------------TableScan: sq_values
-08)------Aggregate: groupBy=[[]], aggr=[[max(sq_values.v)]]
-09)--------TableScan: sq_values
-10)--EmptyRelation: rows=1
+05)--------Aggregate: groupBy=[[]], aggr=[[min(sq_values.v)]]
+06)----------TableScan: sq_values projection=[v]
+07)------Aggregate: groupBy=[[]], aggr=[[max(sq_values.v)]]
+08)--------TableScan: sq_values projection=[v]
+09)--EmptyRelation: rows=1
 physical_plan
 01)ScalarSubqueryExec: subqueries=1
 02)--ProjectionExec: expr=[scalar_subquery(<pending>) as max(sq_values.v) + min(sq_values.v)]
@@ -1857,10 +1894,9 @@ logical_plan
 01)Projection: __common_expr_1 + __common_expr_1 AS doubled
 02)--Projection: (<subquery>) AS __common_expr_1
 03)----Subquery:
-04)------Projection: max(sq_values.v)
-05)--------Aggregate: groupBy=[[]], aggr=[[max(sq_values.v)]]
-06)----------TableScan: sq_values
-07)----EmptyRelation: rows=1
+04)------Aggregate: groupBy=[[]], aggr=[[max(sq_values.v)]]
+05)--------TableScan: sq_values projection=[v]
+06)----EmptyRelation: rows=1
 physical_plan
 01)ScalarSubqueryExec: subqueries=1
 02)--ProjectionExec: expr=[__common_expr_1@0 + __common_expr_1@0 as doubled]

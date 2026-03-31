@@ -136,9 +136,11 @@ fn optimize_projections(
     // their parents' required indices.
     match plan {
         LogicalPlan::Projection(proj) => {
-            return merge_consecutive_projections(proj)?.transform_data(|proj| {
-                rewrite_projection_given_requirements(proj, config, &indices)
-            });
+            return merge_consecutive_projections(proj)?
+                .transform_data(|proj| {
+                    rewrite_projection_given_requirements(proj, config, &indices)
+                })?
+                .transform_data(|plan| optimize_subqueries(plan, config));
         }
         LogicalPlan::Aggregate(aggregate) => {
             // Split parent requirements to GROUP BY and aggregate sections:
@@ -210,7 +212,8 @@ fn optimize_projections(
                     new_aggr_expr,
                 )
                 .map(LogicalPlan::Aggregate)
-            });
+            })?
+            .transform_data(|plan| optimize_subqueries(plan, config));
         }
         LogicalPlan::Window(window) => {
             let input_schema = Arc::clone(window.input.schema());
@@ -250,7 +253,8 @@ fn optimize_projections(
                         .map(LogicalPlan::Window)
                         .map(Transformed::yes)
                 }
-            });
+            })?
+            .transform_data(|plan| optimize_subqueries(plan, config));
         }
         LogicalPlan::TableScan(table_scan) => {
             let TableScan {
@@ -271,7 +275,8 @@ fn optimize_projections(
             let new_scan =
                 TableScan::try_new(table_name, source, Some(projection), filters, fetch)?;
 
-            return Ok(Transformed::yes(LogicalPlan::TableScan(new_scan)));
+            return Transformed::yes(LogicalPlan::TableScan(new_scan))
+                .transform_data(|plan| optimize_subqueries(plan, config));
         }
         // Other node types are handled below
         _ => {}
@@ -458,20 +463,8 @@ fn optimize_projections(
         )
     })?;
 
-    // Also optimize uncorrelated subquery plans embedded in expressions
-    // (e.g., Expr::ScalarSubquery). map_children only visits direct plan
-    // inputs, so subqueries must be handled separately. We skip correlated
-    // subqueries because modifying their plan structure can interfere with
-    // decorrelation in subsequent optimizer passes.
-    let transformed_plan = transformed_plan.transform_data(|plan| {
-        plan.map_subqueries(|subquery_plan| match &subquery_plan {
-            LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty() => {
-                let indices = RequiredIndices::new_for_all_exprs(&subquery_plan);
-                optimize_projections(subquery_plan, config, indices)
-            }
-            _ => Ok(Transformed::no(subquery_plan)),
-        })
-    })?;
+    let transformed_plan =
+        transformed_plan.transform_data(|plan| optimize_subqueries(plan, config))?;
 
     // If any of the children are transformed, we need to potentially update the plan's schema
     if transformed_plan.transformed {
@@ -483,6 +476,24 @@ fn optimize_projections(
 
 /// Merges consecutive projections.
 ///
+/// Optimizes uncorrelated subquery plans embedded in expressions of the given
+/// plan node (e.g., `Expr::ScalarSubquery`). `map_children` only visits direct
+/// plan inputs, so subqueries must be handled separately. Correlated subqueries
+/// are skipped to avoid interfering with decorrelation in subsequent optimizer
+/// passes.
+fn optimize_subqueries(
+    plan: LogicalPlan,
+    config: &dyn OptimizerConfig,
+) -> Result<Transformed<LogicalPlan>> {
+    plan.map_subqueries(|subquery_plan| match &subquery_plan {
+        LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty() => {
+            let indices = RequiredIndices::new_for_all_exprs(&subquery_plan);
+            optimize_projections(subquery_plan, config, indices)
+        }
+        _ => Ok(Transformed::no(subquery_plan)),
+    })
+}
+
 /// Given a projection `proj`, this function attempts to merge it with a previous
 /// projection if it exists and if merging is beneficial. Merging is considered
 /// beneficial when expressions in the current projection are non-trivial and

@@ -29,10 +29,13 @@ use std::fmt;
 use std::sync::Arc;
 
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, ScalarValue, Statistics, exec_err, internal_err};
+use datafusion_common::{
+    DataFusionError, Result, ScalarValue, Statistics, exec_err, internal_err,
+};
 use datafusion_execution::TaskContext;
 use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_physical_expr::PhysicalExpr;
+use parking_lot::Mutex;
 
 use crate::execution_plan::{CardinalityEffect, ExecutionPlan, PlanProperties};
 use crate::joins::utils::{OnceAsync, OnceFut};
@@ -54,6 +57,156 @@ pub struct ScalarSubqueryLink {
     pub plan: Arc<dyn ExecutionPlan>,
     /// Index into the shared results container.
     pub index: usize,
+}
+
+/// Published wait handle for the current [`ScalarSubqueryExec`] invocation.
+///
+/// [`ScalarSubqueryExec`] creates the shared [`OnceFut`] exactly once, publishes
+/// a clone here before calling `input.execute()`, and then
+/// [`AwaitScalarSubqueryExec`] nodes clone and wait on the same future before
+/// polling the wrapped operator.
+#[derive(Default)]
+pub struct ScalarSubqueryWaiter {
+    future: Mutex<Option<OnceFut<()>>>,
+}
+
+impl fmt::Debug for ScalarSubqueryWaiter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ScalarSubqueryWaiter")
+    }
+}
+
+impl ScalarSubqueryWaiter {
+    /// Publish the shared wait future, ignoring duplicate publishes that refer
+    /// to the same underlying computation.
+    pub(crate) fn publish(&self, future: OnceFut<()>) {
+        let mut guard = self.future.lock();
+        if guard.is_none() {
+            *guard = Some(future);
+        }
+    }
+
+    /// Returns a clone of the published wait future.
+    pub(crate) fn wait_future(&self) -> Result<OnceFut<()>> {
+        self.future.lock().clone().ok_or_else(|| {
+            DataFusionError::Internal(
+                "AwaitScalarSubqueryExec executed before ScalarSubqueryExec initialized the wait future"
+                    .to_string(),
+            )
+        })
+    }
+}
+
+/// Waits for the current scalar-subquery plan level to finish evaluating
+/// before polling the wrapped input.
+///
+/// This keeps long waits in async stream code rather than in synchronous
+/// physical expression evaluation.
+#[derive(Debug)]
+pub struct AwaitScalarSubqueryExec {
+    input: Arc<dyn ExecutionPlan>,
+    waiter: Arc<ScalarSubqueryWaiter>,
+    cache: Arc<PlanProperties>,
+}
+
+impl AwaitScalarSubqueryExec {
+    pub fn new(input: Arc<dyn ExecutionPlan>, waiter: Arc<ScalarSubqueryWaiter>) -> Self {
+        let cache = Arc::clone(input.properties());
+        Self {
+            input,
+            waiter,
+            cache,
+        }
+    }
+
+    pub fn input(&self) -> &Arc<dyn ExecutionPlan> {
+        &self.input
+    }
+
+    pub fn waiter(&self) -> &Arc<ScalarSubqueryWaiter> {
+        &self.waiter
+    }
+}
+
+impl DisplayAs for AwaitScalarSubqueryExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "AwaitScalarSubqueryExec")
+            }
+            DisplayFormatType::TreeRender => write!(f, ""),
+        }
+    }
+}
+
+impl ExecutionPlan for AwaitScalarSubqueryExec {
+    fn name(&self) -> &'static str {
+        "AwaitScalarSubqueryExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.cache
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Self::new(
+            children.remove(0),
+            Arc::clone(&self.waiter),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        let input_stream = self.input.execute(partition, context)?;
+        let mut subquery_future = self.waiter.wait_future()?;
+        let schema = self.schema();
+
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            futures::stream::once(async move {
+                wait_for_subqueries(&mut subquery_future).await?;
+                Ok::<SendableRecordBatchStream, DataFusionError>(input_stream)
+            })
+            .try_flatten(),
+        )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        vec![true]
+    }
+
+    fn benefits_from_input_partitioning(&self) -> Vec<bool> {
+        self.input.benefits_from_input_partitioning()
+    }
+
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        self.input.partition_statistics(partition)
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
+    }
 }
 
 /// Manages execution of uncorrelated scalar subqueries for a single plan
@@ -82,6 +235,9 @@ pub struct ScalarSubqueryExec {
     subqueries: Vec<ScalarSubqueryLink>,
     /// Shared one-time async computation of subquery results.
     subquery_future: Arc<OnceAsync<()>>,
+    /// Shared published waiter for [`AwaitScalarSubqueryExec`] nodes in the
+    /// main input subtree.
+    waiter: Arc<ScalarSubqueryWaiter>,
     /// Shared results container; same instance held by ScalarSubqueryExpr nodes.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).
@@ -94,11 +250,26 @@ impl ScalarSubqueryExec {
         subqueries: Vec<ScalarSubqueryLink>,
         results: ScalarSubqueryResults,
     ) -> Self {
+        Self::new_with_waiter(
+            input,
+            subqueries,
+            results,
+            Arc::new(ScalarSubqueryWaiter::default()),
+        )
+    }
+
+    pub fn new_with_waiter(
+        input: Arc<dyn ExecutionPlan>,
+        subqueries: Vec<ScalarSubqueryLink>,
+        results: ScalarSubqueryResults,
+        waiter: Arc<ScalarSubqueryWaiter>,
+    ) -> Self {
         let cache = Arc::clone(input.properties());
         Self {
             input,
             subqueries,
             subquery_future: Arc::default(),
+            waiter,
             results,
             cache,
         }
@@ -114,6 +285,10 @@ impl ScalarSubqueryExec {
 
     pub fn results(&self) -> &ScalarSubqueryResults {
         &self.results
+    }
+
+    pub fn waiter(&self) -> &Arc<ScalarSubqueryWaiter> {
+        &self.waiter
     }
 
     /// Returns a per-child bool vec that is `true` for the main input
@@ -178,10 +353,11 @@ impl ExecutionPlan for ScalarSubqueryExec {
                 index: sq.index,
             })
             .collect();
-        Ok(Arc::new(ScalarSubqueryExec::new(
+        Ok(Arc::new(ScalarSubqueryExec::new_with_waiter(
             input,
             subqueries,
             Arc::clone(&self.results),
+            Arc::clone(&self.waiter),
         )))
     }
 
@@ -196,7 +372,8 @@ impl ExecutionPlan for ScalarSubqueryExec {
         let mut subquery_future = self.subquery_future.try_once(move || {
             Ok(async move { execute_subqueries(subqueries, results, subquery_ctx).await })
         })?;
-        let input = Arc::clone(&self.input);
+        self.waiter.publish(subquery_future.clone());
+        let input_stream = self.input.execute(partition, context)?;
         let schema = self.schema();
 
         Ok(Box::pin(RecordBatchStreamAdapter::new(
@@ -206,9 +383,9 @@ impl ExecutionPlan for ScalarSubqueryExec {
                 // partitions call execute() concurrently.
                 wait_for_subqueries(&mut subquery_future).await?;
 
-                // Now that the subqueries have finished execution, we can
-                // safely execute the main input
-                input.execute(partition, context)
+                // The main input is already executing; only forwarding is
+                // delayed until the subqueries have finished.
+                Ok::<SendableRecordBatchStream, DataFusionError>(input_stream)
             })
             .try_flatten(),
         )))
@@ -311,15 +488,18 @@ async fn execute_scalar_subquery(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::BufferExec;
+    use crate::filter::FilterExec;
     use crate::test::{self, TestMemoryExec};
 
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::test::exec::ErrorExec;
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::{BooleanArray, Int32Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use tokio::sync::oneshot;
 
     #[derive(Debug)]
     struct CountingExec {
@@ -515,6 +695,83 @@ mod tests {
         assert!(crate::common::collect(stream).await.is_err());
 
         assert_eq!(execute_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_main_input_execute_starts_before_subqueries_finish() -> Result<()> {
+        let main_execute_calls = Arc::new(AtomicUsize::new(0));
+        let main_input = Arc::new(CountingExec::new(
+            Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+                test::aggr_test_schema(),
+            )),
+            Arc::clone(&main_execute_calls),
+        ));
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![42]))],
+        )?;
+        let subquery_plan = make_subquery_plan(vec![batch]);
+        let results = make_results(1);
+        let exec = ScalarSubqueryExec::new(
+            main_input,
+            vec![ScalarSubqueryLink {
+                plan: subquery_plan,
+                index: 0,
+            }],
+            results,
+        );
+
+        let _stream = exec.execute(0, Arc::new(TaskContext::default()))?;
+        assert_eq!(main_execute_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_await_exec_blocks_eager_parent_until_result_ready() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(BooleanArray::from(vec![true]))],
+        )?;
+        let input: Arc<dyn ExecutionPlan> =
+            TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+
+        let results = make_results(1);
+        let waiter = Arc::new(ScalarSubqueryWaiter::default());
+        let sq_expr = Arc::new(
+            datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr::new(
+                DataType::Boolean,
+                false,
+                0,
+                Arc::clone(&results),
+            ),
+        );
+        let filter = Arc::new(FilterExec::try_new(sq_expr, input)?);
+        let await_filter =
+            Arc::new(AwaitScalarSubqueryExec::new(filter, Arc::clone(&waiter)));
+        let buffered = Arc::new(BufferExec::new(await_filter, 1));
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let results_for_future = Arc::clone(&results);
+        waiter.publish(OnceFut::new(async move {
+            rx.await.map_err(|_| {
+                DataFusionError::Internal("test sender dropped".to_string())
+            })?;
+            let _ = results_for_future[0].set(ScalarValue::Boolean(Some(true)));
+            Ok(())
+        }));
+
+        let stream = buffered.execute(0, Arc::new(TaskContext::default()))?;
+        tokio::task::yield_now().await;
+        tx.send(()).expect("receiver should still be waiting");
+        let batches = crate::common::collect(stream).await?;
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
         Ok(())
     }
 }

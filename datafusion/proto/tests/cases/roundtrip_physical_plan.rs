@@ -76,7 +76,7 @@ use datafusion::physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion::physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::scalar_subquery::{
-    ScalarSubqueryExec, ScalarSubqueryLink,
+    AwaitScalarSubqueryExec, ScalarSubqueryExec, ScalarSubqueryLink, ScalarSubqueryWaiter,
 };
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::union::{InterleaveExec, UnionExec};
@@ -3219,6 +3219,11 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
     let filter =
         FilterExec::try_new(predicate, Arc::new(EmptyExec::new(schema.clone())))?;
+    let waiter = Arc::new(ScalarSubqueryWaiter::default());
+    let await_filter = Arc::new(AwaitScalarSubqueryExec::new(
+        Arc::new(filter),
+        Arc::clone(&waiter),
+    ));
 
     // Build a trivial subquery plan.
     let subquery_plan =
@@ -3228,13 +3233,14 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
             true,
         )]))));
 
-    let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
-        Arc::new(filter),
+    let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new_with_waiter(
+        await_filter,
         vec![ScalarSubqueryLink {
             plan: subquery_plan,
             index: 0,
         }],
         results,
+        waiter,
     ));
 
     // Perform the round-trip using DeduplicatingProtoConverter, which
@@ -3263,9 +3269,19 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         .expect("expected ScalarSubqueryExec");
     let exec_results = sq_exec.results();
 
-    // Walk the input plan to find the ScalarSubqueryExpr and verify it
+    let await_exec = sq_exec
+        .input()
+        .as_any()
+        .downcast_ref::<AwaitScalarSubqueryExec>()
+        .expect("expected AwaitScalarSubqueryExec");
+    assert!(
+        Arc::ptr_eq(sq_exec.waiter(), await_exec.waiter()),
+        "AwaitScalarSubqueryExec should share the same wait handle as ScalarSubqueryExec"
+    );
+
+    // Walk the wrapped input plan to find the ScalarSubqueryExpr and verify it
     // points to the same results container.
-    let filter_exec = sq_exec
+    let filter_exec = await_exec
         .input()
         .as_any()
         .downcast_ref::<FilterExec>()

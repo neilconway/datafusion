@@ -67,7 +67,7 @@ use datafusion_common::HashMap as DFHashMap;
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::format::ExplainAnalyzeCategories;
 use datafusion_common::tree_node::{
-    Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeVisitor,
 };
 use datafusion_common::{
     DFSchema, DFSchemaRef, ScalarValue, exec_err, internal_datafusion_err, internal_err,
@@ -94,6 +94,7 @@ use datafusion_expr::{
 };
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Literal;
+use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 use datafusion_physical_expr::{
     LexOrdering, PhysicalSortExpr, create_physical_sort_exprs,
 };
@@ -103,7 +104,9 @@ use datafusion_physical_plan::execution_plan::InvariantLevel;
 use datafusion_physical_plan::joins::PiecewiseMergeJoinExec;
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::recursive_query::RecursiveQueryExec;
-use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
+use datafusion_physical_plan::scalar_subquery::{
+    AwaitScalarSubqueryExec, ScalarSubqueryExec, ScalarSubqueryLink, ScalarSubqueryWaiter,
+};
 use datafusion_physical_plan::unnest::ListUnnest;
 
 use async_trait::async_trait;
@@ -463,9 +466,7 @@ impl DefaultPhysicalPlanner {
             let plan = self
                 .create_initial_plan_inner(logical_plan, &session_state)
                 .await?;
-            Ok(Self::wrap_scalar_subquery_exec_if_needed(
-                plan, links, results,
-            ))
+            Self::wrap_scalar_subquery_exec_if_needed(plan, links, results)
         })
     }
 
@@ -2961,12 +2962,59 @@ impl DefaultPhysicalPlanner {
         input: Arc<dyn ExecutionPlan>,
         subqueries: Vec<ScalarSubqueryLink>,
         results: Arc<Vec<OnceLock<ScalarValue>>>,
-    ) -> Arc<dyn ExecutionPlan> {
+    ) -> Result<Arc<dyn ExecutionPlan>> {
         if subqueries.is_empty() {
-            input
+            Ok(input)
         } else {
-            Arc::new(ScalarSubqueryExec::new(input, subqueries, results))
+            let waiter = Arc::new(ScalarSubqueryWaiter::default());
+            let input = Self::wrap_scalar_subquery_consumers(input, Arc::clone(&waiter))?;
+            Ok(Arc::new(ScalarSubqueryExec::new_with_waiter(
+                input, subqueries, results, waiter,
+            )))
         }
+    }
+
+    fn wrap_scalar_subquery_consumers(
+        input: Arc<dyn ExecutionPlan>,
+        waiter: Arc<ScalarSubqueryWaiter>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        input
+            .transform_up(|plan| {
+                if plan.as_any().is::<AwaitScalarSubqueryExec>() {
+                    return Ok(Transformed::no(plan));
+                }
+
+                if Self::plan_contains_scalar_subquery_expr(plan.as_ref())? {
+                    Ok(Transformed::yes(Arc::new(AwaitScalarSubqueryExec::new(
+                        plan,
+                        Arc::clone(&waiter),
+                    ))))
+                } else {
+                    Ok(Transformed::no(plan))
+                }
+            })
+            .data()
+    }
+
+    fn plan_contains_scalar_subquery_expr(plan: &dyn ExecutionPlan) -> Result<bool> {
+        let mut found = false;
+        plan.apply_expressions(&mut |expr| {
+            if Self::physical_expr_contains_scalar_subquery(expr) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })?;
+        Ok(found)
+    }
+
+    fn physical_expr_contains_scalar_subquery(expr: &dyn PhysicalExpr) -> bool {
+        expr.as_any().is::<ScalarSubqueryExpr>()
+            || expr
+                .children()
+                .into_iter()
+                .any(|child| Self::physical_expr_contains_scalar_subquery(child.as_ref()))
     }
 
     fn create_project_physical_exec_with_props(
@@ -3331,7 +3379,9 @@ mod tests {
         )
         .await?;
 
-        assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
+        let formatted = format!("{plan:?}");
+        assert_contains!(&formatted, "ScalarSubqueryExec");
+        assert_contains!(&formatted, "AwaitScalarSubqueryExec");
         Ok(())
     }
 
@@ -3361,7 +3411,9 @@ mod tests {
         )
         .await?;
 
-        assert_contains!(format!("{plan:?}"), "ScalarSubqueryExec");
+        let formatted = format!("{plan:?}");
+        assert_contains!(&formatted, "ScalarSubqueryExec");
+        assert_contains!(&formatted, "AwaitScalarSubqueryExec");
         Ok(())
     }
 
@@ -3392,6 +3444,7 @@ mod tests {
 
         let formatted = format!("{plan:?}");
         assert_contains!(&formatted, "ScalarSubqueryExec");
+        assert_contains!(&formatted, "AwaitScalarSubqueryExec");
         assert!(
             formatted.contains("HashJoinExec")
                 || formatted.contains("SortMergeJoinExec")
@@ -3409,9 +3462,10 @@ mod tests {
         )
         .await?;
 
-        let formatted = format!("{plan:?}");
+        let formatted = displayable(plan.as_ref()).indent(true).to_string();
         // All uncorrelated scalar subqueries are hoisted to a single root node.
-        assert_eq!(formatted.matches("ScalarSubqueryExec").count(), 1);
+        assert_eq!(formatted.matches("ScalarSubqueryExec:").count(), 1);
+        assert_eq!(formatted.matches("AwaitScalarSubqueryExec").count(), 2);
         Ok(())
     }
 

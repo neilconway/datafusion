@@ -84,7 +84,9 @@ use datafusion_physical_plan::metrics::{MetricCategory, MetricType};
 use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
-use datafusion_physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
+use datafusion_physical_plan::scalar_subquery::{
+    AwaitScalarSubqueryExec, ScalarSubqueryExec, ScalarSubqueryLink, ScalarSubqueryWaiter,
+};
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion_physical_plan::union::{InterleaveExec, UnionExec};
@@ -323,6 +325,13 @@ impl protobuf::PhysicalPlanNode {
             PhysicalPlanType::Buffer(buffer) => {
                 self.try_into_buffer_physical_plan(buffer, ctx, codec, proto_converter)
             }
+            PhysicalPlanType::AwaitScalarSubquery(await_sq) => self
+                .try_into_await_scalar_subquery_physical_plan(
+                    await_sq,
+                    ctx,
+                    codec,
+                    proto_converter,
+                ),
             PhysicalPlanType::ScalarSubquery(sq) => self
                 .try_into_scalar_subquery_physical_plan(sq, ctx, codec, proto_converter),
         }
@@ -567,6 +576,14 @@ impl protobuf::PhysicalPlanNode {
 
         if let Some(exec) = plan.downcast_ref::<BufferExec>() {
             return protobuf::PhysicalPlanNode::try_from_buffer_exec(
+                exec,
+                codec,
+                proto_converter,
+            );
+        }
+
+        if let Some(exec) = plan.downcast_ref::<AwaitScalarSubqueryExec>() {
+            return protobuf::PhysicalPlanNode::try_from_await_scalar_subquery_exec(
                 exec,
                 codec,
                 proto_converter,
@@ -2263,6 +2280,26 @@ impl protobuf::PhysicalPlanNode {
         Ok(Arc::new(BufferExec::new(input, buffer.capacity as usize)))
     }
 
+    fn try_into_await_scalar_subquery_physical_plan(
+        &self,
+        await_sq: &protobuf::AwaitScalarSubqueryExecNode,
+        ctx: &TaskContext,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let waiter = proto_converter
+            .scalar_subquery_waiter()
+            .ok_or_else(|| {
+                proto_error(
+                    "AwaitScalarSubqueryExecNode must be deserialized within ScalarSubqueryExec input",
+                )
+            })?;
+        let input: Arc<dyn ExecutionPlan> =
+            into_physical_plan(&await_sq.input, ctx, codec, proto_converter)?;
+
+        Ok(Arc::new(AwaitScalarSubqueryExec::new(input, waiter)))
+    }
+
     fn try_into_scalar_subquery_physical_plan(
         &self,
         sq: &protobuf::ScalarSubqueryExecNode,
@@ -2279,11 +2316,15 @@ impl protobuf::PhysicalPlanNode {
                 .map(|_| std::sync::OnceLock::new())
                 .collect::<Vec<_>>(),
         );
+        let waiter = Arc::new(ScalarSubqueryWaiter::default());
         let prev =
             proto_converter.set_scalar_subquery_results(Some(Arc::clone(&results)));
+        let prev_waiter =
+            proto_converter.set_scalar_subquery_waiter(Some(Arc::clone(&waiter)));
         let input = into_physical_plan(&sq.input, ctx, codec, proto_converter);
         // Restore previous state before propagating errors, so nested
         // ScalarSubqueryExec deserialization doesn't see stale state.
+        proto_converter.set_scalar_subquery_waiter(prev_waiter);
         proto_converter.set_scalar_subquery_results(prev);
         let input: Arc<dyn ExecutionPlan> = input?;
 
@@ -2300,8 +2341,8 @@ impl protobuf::PhysicalPlanNode {
                 Ok(ScalarSubqueryLink { plan, index })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Arc::new(ScalarSubqueryExec::new(
-            input, subqueries, results,
+        Ok(Arc::new(ScalarSubqueryExec::new_with_waiter(
+            input, subqueries, results, waiter,
         )))
     }
 
@@ -3700,6 +3741,26 @@ impl protobuf::PhysicalPlanNode {
         })
     }
 
+    fn try_from_await_scalar_subquery_exec(
+        exec: &AwaitScalarSubqueryExec,
+        codec: &dyn PhysicalExtensionCodec,
+        proto_converter: &dyn PhysicalProtoConverterExtension,
+    ) -> Result<Self> {
+        let input = protobuf::PhysicalPlanNode::try_from_physical_plan_with_converter(
+            Arc::clone(exec.input()),
+            codec,
+            proto_converter,
+        )?;
+
+        Ok(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(PhysicalPlanType::AwaitScalarSubquery(Box::new(
+                protobuf::AwaitScalarSubqueryExecNode {
+                    input: Some(Box::new(input)),
+                },
+            ))),
+        })
+    }
+
     fn try_from_scalar_subquery_exec(
         exec: &ScalarSubqueryExec,
         codec: &dyn PhysicalExtensionCodec,
@@ -3881,6 +3942,20 @@ pub trait PhysicalProtoConverterExtension {
     fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
         None
     }
+
+    /// Sets the scalar subquery waiter for plan deserialization.
+    /// Returns the previous value (for save/restore around nested subqueries).
+    fn set_scalar_subquery_waiter(
+        &self,
+        _waiter: Option<Arc<ScalarSubqueryWaiter>>,
+    ) -> Option<Arc<ScalarSubqueryWaiter>> {
+        None
+    }
+
+    /// Returns the current scalar subquery waiter, if any.
+    fn scalar_subquery_waiter(&self) -> Option<Arc<ScalarSubqueryWaiter>> {
+        None
+    }
 }
 
 /// DataEncoderTuple captures the position of the encoder
@@ -3899,6 +3974,7 @@ struct DataEncoderTuple {
 #[derive(Default)]
 pub struct DefaultPhysicalProtoConverter {
     scalar_subquery_results: RefCell<Option<ScalarSubqueryResults>>,
+    scalar_subquery_waiter: RefCell<Option<Arc<ScalarSubqueryWaiter>>>,
 }
 
 impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
@@ -3957,6 +4033,17 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
 
     fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
         self.scalar_subquery_results.borrow().clone()
+    }
+
+    fn set_scalar_subquery_waiter(
+        &self,
+        waiter: Option<Arc<ScalarSubqueryWaiter>>,
+    ) -> Option<Arc<ScalarSubqueryWaiter>> {
+        self.scalar_subquery_waiter.replace(waiter)
+    }
+
+    fn scalar_subquery_waiter(&self) -> Option<Arc<ScalarSubqueryWaiter>> {
+        self.scalar_subquery_waiter.borrow().clone()
     }
 }
 
@@ -4044,6 +4131,11 @@ struct DeduplicatingDeserializer {
     /// Set by `ScalarSubqueryExec` deserialization so that `ScalarSubqueryExpr`
     /// nodes in the input plan can pick up the shared results container.
     scalar_subquery_results: RefCell<Option<ScalarSubqueryResults>>,
+    /// Scalar subquery waiter for the current deserialization scope.
+    /// Set by `ScalarSubqueryExec` deserialization so that
+    /// `AwaitScalarSubqueryExec` nodes in the input plan can pick up the
+    /// shared wait handle.
+    scalar_subquery_waiter: RefCell<Option<Arc<ScalarSubqueryWaiter>>>,
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
@@ -4114,6 +4206,17 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
 
     fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
         self.scalar_subquery_results.borrow().clone()
+    }
+
+    fn set_scalar_subquery_waiter(
+        &self,
+        waiter: Option<Arc<ScalarSubqueryWaiter>>,
+    ) -> Option<Arc<ScalarSubqueryWaiter>> {
+        self.scalar_subquery_waiter.replace(waiter)
+    }
+
+    fn scalar_subquery_waiter(&self) -> Option<Arc<ScalarSubqueryWaiter>> {
+        self.scalar_subquery_waiter.borrow().clone()
     }
 }
 

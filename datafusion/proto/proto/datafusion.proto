@@ -800,6 +800,7 @@ message PhysicalPlanNode {
     BufferExecNode buffer = 37;
     ArrowScanExecNode arrow_scan = 38;
     ScalarSubqueryExecNode scalar_subquery = 39;
+    AwaitScalarSubqueryExecNode await_scalar_subquery = 40;
   }
 }
 
@@ -1506,6 +1507,10 @@ message BufferExecNode {
 message ScalarSubqueryExecNode {
   PhysicalPlanNode input = 1;
   repeated PhysicalPlanNode subqueries = 2;
+}
+
+message AwaitScalarSubqueryExecNode {
+  PhysicalPlanNode input = 1;
 }
 
 message PhysicalScalarSubqueryExprNode {

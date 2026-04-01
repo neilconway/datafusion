@@ -108,7 +108,7 @@ impl PhysicalExpr for ScalarSubqueryExpr {
 
     fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
         Ok(Arc::new(Field::new(
-            format!("{self}"),
+            "scalar_subquery",
             self.data_type.clone(),
             self.nullable,
         )))

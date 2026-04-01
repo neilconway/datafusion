@@ -385,13 +385,19 @@ impl DefaultPhysicalPlanner {
         Ok(())
     }
 
-    /// Collect uncorrelated scalar subqueries. We don't descend into nested
-    /// subqueries here: each call to `create_initial_plan` handles subqueries
-    /// at its level and then recurses in order to handle nested subqueries.
+    /// Collect uncorrelated scalar subqueries from this plan level's
+    /// expressions. We don't descend into nested subquery plan bodies:
+    /// each call to `create_initial_plan` handles subqueries at its
+    /// level and then recurses to handle nested subqueries.
     fn collect_scalar_subqueries(plan: &LogicalPlan) -> Vec<Subquery> {
         let mut subqueries = Vec::new();
         let mut seen = HashSet::new();
         plan.apply(|node| {
+            // Don't descend into subquery plan bodies — those are
+            // handled by the recursive `create_initial_plan` call.
+            if matches!(node, LogicalPlan::Subquery(_)) {
+                return Ok(TreeNodeRecursion::Jump);
+            }
             for expr in node.expressions() {
                 expr.apply(|e| {
                     if let Expr::ScalarSubquery(sq) = e
@@ -2938,6 +2944,8 @@ impl DefaultPhysicalPlanner {
         subqueries: &[&Subquery],
         session_state: &SessionState,
     ) -> Result<(Vec<ScalarSubqueryLink>, DFHashMap<Subquery, usize>)> {
+        // TODO: plan independent subqueries concurrently with join_all
+        // rather than awaiting each one sequentially.
         let mut links = Vec::with_capacity(subqueries.len());
         let mut index_map = DFHashMap::with_capacity(subqueries.len());
         for &sq in subqueries {

@@ -440,7 +440,11 @@ async fn execute_subqueries(
         let index = sq.index;
         async move {
             let value = execute_scalar_subquery(plan, ctx).await?;
-            let _ = results[index].set(value);
+            if results[index].set(value).is_err() {
+                return internal_err!(
+                    "scalar subquery result at index {index} was already populated"
+                );
+            }
             Ok(()) as Result<()>
         }
     });

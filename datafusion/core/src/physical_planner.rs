@@ -2967,7 +2967,7 @@ impl DefaultPhysicalPlanner {
             Ok(input)
         } else {
             let waiter = Arc::new(ScalarSubqueryWaiter::default());
-            let input = Self::wrap_scalar_subquery_consumers(input, Arc::clone(&waiter))?;
+            let input = Self::wrap_scalar_subquery_consumers(input, &waiter)?;
             Ok(Arc::new(ScalarSubqueryExec::new_with_waiter(
                 input, subqueries, results, waiter,
             )))
@@ -2976,7 +2976,7 @@ impl DefaultPhysicalPlanner {
 
     fn wrap_scalar_subquery_consumers(
         input: Arc<dyn ExecutionPlan>,
-        waiter: Arc<ScalarSubqueryWaiter>,
+        waiter: &Arc<ScalarSubqueryWaiter>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         input
             .transform_up(|plan| {
@@ -2987,7 +2987,7 @@ impl DefaultPhysicalPlanner {
                 if Self::plan_contains_scalar_subquery_expr(plan.as_ref())? {
                     Ok(Transformed::yes(Arc::new(AwaitScalarSubqueryExec::new(
                         plan,
-                        Arc::clone(&waiter),
+                        Arc::clone(waiter),
                     ))))
                 } else {
                     Ok(Transformed::no(plan))

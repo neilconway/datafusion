@@ -1984,3 +1984,38 @@ DROP TABLE sq_name_t1;
 
 statement ok
 DROP TABLE sq_name_t2;
+
+# Test: scalar subquery in filter on a partition column of a partitioned table.
+# This exercises the code path where filters are pushed down to the table
+# provider for partition pruning. Scalar subqueries must not be pushed to the
+# provider because the subquery result is not available at partition listing
+# time.
+
+query I
+COPY (VALUES(1, 'a'), (2, 'b'), (3, 'c'))
+TO 'test_files/scratch/subquery/partition_pruning/part=1/file1.parquet';
+----
+3
+
+query I
+COPY (VALUES(4, 'd'), (5, 'e'))
+TO 'test_files/scratch/subquery/partition_pruning/part=2/file1.parquet';
+----
+2
+
+statement ok
+CREATE EXTERNAL TABLE subquery_partitioned
+STORED AS PARQUET
+LOCATION 'test_files/scratch/subquery/partition_pruning/';
+
+query IT
+SELECT column1, column2 FROM subquery_partitioned
+WHERE part = (SELECT 1)
+ORDER BY column1;
+----
+1 a
+2 b
+3 c
+
+statement ok
+DROP TABLE subquery_partitioned;

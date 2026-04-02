@@ -499,14 +499,12 @@ pub fn parse_physical_expr_with_converter(
                     proto_error("Missing data_type in PhysicalScalarSubqueryExprNode")
                 })?
                 .try_into()?;
-            let results = proto_converter
-                .scalar_subquery_results()
-                .ok_or_else(|| {
-                    proto_error(
-                        "ScalarSubqueryExpr can only be deserialized as part \
+            let results = proto_converter.scalar_subquery_results().ok_or_else(|| {
+                proto_error(
+                    "ScalarSubqueryExpr can only be deserialized as part \
                          of a surrounding ScalarSubqueryExec",
-                    )
-                })?;
+                )
+            })?;
             Arc::new(ScalarSubqueryExpr::new(
                 data_type,
                 sq.nullable,

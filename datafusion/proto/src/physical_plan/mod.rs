@@ -51,7 +51,9 @@ use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
-use datafusion_expr::execution_props::ScalarSubqueryResults;
+use datafusion_expr::execution_props::{
+    ScalarSubqueryResults, new_scalar_subquery_results,
+};
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
@@ -2274,11 +2276,7 @@ impl protobuf::PhysicalPlanNode {
         // proto. Making it available on the converter before deserializing
         // the input plan allows ScalarSubqueryExpr nodes to pick up the
         // shared container at construction time.
-        let results = Arc::new(
-            (0..sq.subqueries.len())
-                .map(|_| std::sync::OnceLock::new())
-                .collect::<Vec<_>>(),
-        );
+        let results = new_scalar_subquery_results(sq.subqueries.len());
         let prev =
             proto_converter.set_scalar_subquery_results(Some(Arc::clone(&results)));
         let input = into_physical_plan(&sq.input, ctx, codec, proto_converter);
@@ -2300,6 +2298,7 @@ impl protobuf::PhysicalPlanNode {
                 Ok(ScalarSubqueryLink { plan, index })
             })
             .collect::<Result<Vec<_>>>()?;
+
         Ok(Arc::new(ScalarSubqueryExec::new(
             input, subqueries, results,
         )))
@@ -3870,6 +3869,16 @@ pub trait PhysicalProtoConverterExtension {
     /// During `ScalarSubqueryExec` deserialization, this is called before
     /// deserializing the input plan so that `ScalarSubqueryExpr` nodes can
     /// pick up the shared results container at construction time.
+    ///
+    /// The default implementation discards the value and always returns `None`.
+    /// This means `ScalarSubqueryExpr` deserialization will fail with an error,
+    /// Implementations that need scalar subquery support should override both
+    /// this method and `scalar_subquery_results`.
+    ///
+    /// NOTE: These methods use interior mutability (`RefCell`) to thread state
+    /// through `&self`, because the deserialization call stack does not have an
+    /// explicit context parameter. A dedicated deserialization context struct
+    /// would be a cleaner long-term solution.
     fn set_scalar_subquery_results(
         &self,
         _results: Option<ScalarSubqueryResults>,
@@ -3878,6 +3887,9 @@ pub trait PhysicalProtoConverterExtension {
     }
 
     /// Returns the current scalar subquery results container, if any.
+    ///
+    /// See [`set_scalar_subquery_results`](Self::set_scalar_subquery_results)
+    /// for details on the default behavior and design trade-offs.
     fn scalar_subquery_results(&self) -> Option<ScalarSubqueryResults> {
         None
     }

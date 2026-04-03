@@ -510,8 +510,8 @@ pub fn serialize_physical_expr_with_converter(
             expr_id: None,
             expr_type: Some(protobuf::physical_expr_node::ExprType::ScalarSubquery(
                 protobuf::PhysicalScalarSubqueryExprNode {
-                    data_type: Some((&expr.data_type(&Schema::empty())?).try_into()?),
-                    nullable: expr.nullable(&Schema::empty())?,
+                    data_type: Some(expr.data_type().try_into()?),
+                    nullable: expr.nullable(),
                     index: expr.index() as u32,
                 },
             )),

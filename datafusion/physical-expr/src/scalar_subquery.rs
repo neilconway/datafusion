@@ -65,6 +65,14 @@ impl ScalarSubqueryExpr {
         }
     }
 
+    pub fn data_type(&self) -> &DataType {
+        &self.data_type
+    }
+
+    pub fn nullable(&self) -> bool {
+        self.nullable
+    }
+
     /// Returns the index of this subquery in the shared results container.
     pub fn index(&self) -> usize {
         self.index

@@ -19,7 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use crate::datasource::file_format::file_type_to_format;
 use crate::datasource::listing::ListingTableUrl;
@@ -79,6 +79,9 @@ use datafusion_common::{
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::dml::{CopyTo, InsertOp};
+use datafusion_expr::execution_props::{
+    ScalarSubqueryResults, new_scalar_subquery_results,
+};
 use datafusion_expr::expr::{
     AggregateFunction, AggregateFunctionParams, Alias, GroupingSet, NullTreatment,
     WindowFunction, WindowFunctionParams, physical_name,
@@ -449,8 +452,7 @@ impl DefaultPhysicalPlanner {
             // context rather than on ExecutionProps. It's here because
             // `create_physical_expr` only receives `&ExecutionProps`, and
             // changing that signature would be a breaking public API change.
-            let results: Arc<Vec<OnceLock<ScalarValue>>> =
-                Arc::new((0..links.len()).map(|_| OnceLock::new()).collect());
+            let results = new_scalar_subquery_results(links.len());
             let session_state = if links.is_empty() {
                 Cow::Borrowed(session_state)
             } else {
@@ -2960,7 +2962,7 @@ impl DefaultPhysicalPlanner {
     fn wrap_scalar_subquery_exec_if_needed(
         input: Arc<dyn ExecutionPlan>,
         subqueries: Vec<ScalarSubqueryLink>,
-        results: Arc<Vec<OnceLock<ScalarValue>>>,
+        results: ScalarSubqueryResults,
     ) -> Arc<dyn ExecutionPlan> {
         if subqueries.is_empty() {
             input

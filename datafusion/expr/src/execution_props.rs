@@ -30,6 +30,11 @@ use std::sync::{Arc, OnceLock};
 /// read by `ScalarSubqueryExpr` instances that share this container.
 pub type ScalarSubqueryResults = Arc<Vec<OnceLock<ScalarValue>>>;
 
+/// Creates a [`ScalarSubqueryResults`] container with `n` empty slots.
+pub fn new_scalar_subquery_results(n: usize) -> ScalarSubqueryResults {
+    Arc::new((0..n).map(|_| OnceLock::new()).collect())
+}
+
 /// Holds per-query execution properties and data (such as statement
 /// starting timestamps).
 ///

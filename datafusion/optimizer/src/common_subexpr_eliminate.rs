@@ -589,9 +589,9 @@ impl OptimizerRule for CommonSubexprEliminate {
                 // manner. Process uncorrelated subqueries in expressions
                 // (e.g., Expr::ScalarSubquery), then direct children.
                 plan.map_uncorrelated_subqueries(|c| self.rewrite(c, config))?
-                .transform_sibling(|plan| {
-                    plan.map_children(|c| self.rewrite(c, config))
-                })?
+                    .transform_sibling(|plan| {
+                        plan.map_children(|c| self.rewrite(c, config))
+                    })?
             }
         };
 

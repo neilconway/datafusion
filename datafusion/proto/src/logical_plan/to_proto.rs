@@ -25,8 +25,8 @@ use datafusion_common::{NullEquality, TableReference, UnnestOptions};
 use datafusion_expr::WriteOp;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::expr::{
-    self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, GroupingSet,
-    InList, Like, NullTreatment, Placeholder, ScalarFunction, Unnest,
+    self, AggregateFunctionParams, Alias, Between, BinaryExpr, Cast, GroupingSet, InList,
+    Like, NullTreatment, Placeholder, ScalarFunction, Unnest,
 };
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{

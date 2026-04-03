@@ -144,7 +144,11 @@ impl OptimizerRule for ScalarSubqueryToJoin {
             LogicalPlan::Projection(projection) => {
                 // Optimization: skip the rest of the rule and its copies if there
                 // are no correlated scalar subqueries
-                if !projection.expr.iter().any(contains_correlated_scalar_subquery) {
+                if !projection
+                    .expr
+                    .iter()
+                    .any(contains_correlated_scalar_subquery)
+                {
                     return Ok(Transformed::no(LogicalPlan::Projection(projection)));
                 }
 

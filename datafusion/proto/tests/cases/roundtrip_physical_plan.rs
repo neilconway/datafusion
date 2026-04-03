@@ -3250,7 +3250,6 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     // Verify the deserialized ScalarSubqueryExec's results container is
     // shared with the ScalarSubqueryExpr in the input plan.
     let sq_exec = deserialized
-        .as_any()
         .downcast_ref::<ScalarSubqueryExec>()
         .expect("expected ScalarSubqueryExec");
     let exec_results = sq_exec.results();
@@ -3259,7 +3258,6 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     // points to the same results container.
     let filter_exec = sq_exec
         .input()
-        .as_any()
         .downcast_ref::<FilterExec>()
         .expect("expected FilterExec");
     let binary_expr = filter_exec

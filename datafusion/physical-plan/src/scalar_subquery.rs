@@ -24,7 +24,6 @@
 //!
 //! [`ScalarSubqueryExpr`]: datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -145,10 +144,6 @@ impl DisplayAs for ScalarSubqueryExec {
 impl ExecutionPlan for ScalarSubqueryExec {
     fn name(&self) -> &'static str {
         "ScalarSubqueryExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -353,10 +348,6 @@ mod tests {
     impl ExecutionPlan for CountingExec {
         fn name(&self) -> &'static str {
             "CountingExec"
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
 
         fn properties(&self) -> &Arc<PlanProperties> {

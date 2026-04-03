@@ -2272,19 +2272,16 @@ impl protobuf::PhysicalPlanNode {
         codec: &dyn PhysicalExtensionCodec,
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Create the results container upfront — we know the count from the
-        // proto. Making it available on the converter before deserializing
-        // the input plan allows ScalarSubqueryExpr nodes to pick up the
-        // shared container at construction time.
-        let results = new_scalar_subquery_results(sq.subqueries.len());
-        let prev =
-            proto_converter.set_scalar_subquery_results(Some(Arc::clone(&results)));
+        // First, deserialize the main input plan. We set up the subquery results
+        // container first, so that ScalarSubqueryExpr nodes can reference it.
+        let subquery_results = new_scalar_subquery_results(sq.subqueries.len());
+        let prev = proto_converter
+            .set_scalar_subquery_results(Some(Arc::clone(&subquery_results)));
         let input = into_physical_plan(&sq.input, ctx, codec, proto_converter);
-        // Restore previous state before propagating errors, so nested
-        // ScalarSubqueryExec deserialization doesn't see stale state.
         proto_converter.set_scalar_subquery_results(prev);
-        let input: Arc<dyn ExecutionPlan> = input?;
+        let input = input?;
 
+        // Now deserialize the subquery children.
         let subqueries: Vec<ScalarSubqueryLink> = sq
             .subqueries
             .iter()
@@ -2300,7 +2297,9 @@ impl protobuf::PhysicalPlanNode {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(Arc::new(ScalarSubqueryExec::new(
-            input, subqueries, results,
+            input,
+            subqueries,
+            subquery_results,
         )))
     }
 

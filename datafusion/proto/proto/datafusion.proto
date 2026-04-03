@@ -428,8 +428,6 @@ message LogicalExprNode {
 
     // Subquery expressions
     ScalarSubqueryExprNode scalar_subquery_expr = 36;
-    InSubqueryExprNode in_subquery_expr = 37;
-    ExistsExprNode exists_expr = 38;
   }
 }
 
@@ -444,17 +442,6 @@ message SubqueryNode {
 
 message ScalarSubqueryExprNode {
   SubqueryNode subquery = 1;
-}
-
-message InSubqueryExprNode {
-  LogicalExprNode expr = 1;
-  SubqueryNode subquery = 2;
-  bool negated = 3;
-}
-
-message ExistsExprNode {
-  SubqueryNode subquery = 1;
-  bool negated = 2;
 }
 
 message PlaceholderNode {

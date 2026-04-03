@@ -26,9 +26,7 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_execution::registry::FunctionRegistry;
 use datafusion_expr::dml::InsertOp;
-use datafusion_expr::expr::{
-    Alias, Exists, InSubquery, NullTreatment, Placeholder, Sort,
-};
+use datafusion_expr::expr::{Alias, NullTreatment, Placeholder, Sort};
 use datafusion_expr::expr::{Unnest, WildcardOptions};
 use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::{
@@ -668,36 +666,6 @@ pub fn parse_expr(
                 codec,
             )?;
             Ok(Expr::ScalarSubquery(subquery))
-        }
-        ExprType::InSubqueryExpr(sq) => {
-            let expr = parse_required_expr(
-                sq.expr.as_deref(),
-                ctx,
-                "InSubqueryExprNode.expr",
-                codec,
-            )?;
-            let subquery = parse_subquery(
-                sq.subquery
-                    .as_deref()
-                    .ok_or_else(|| Error::required("InSubqueryExprNode.subquery"))?,
-                ctx,
-                codec,
-            )?;
-            Ok(Expr::InSubquery(InSubquery::new(
-                Box::new(expr),
-                subquery,
-                sq.negated,
-            )))
-        }
-        ExprType::ExistsExpr(sq) => {
-            let subquery = parse_subquery(
-                sq.subquery
-                    .as_deref()
-                    .ok_or_else(|| Error::required("ExistsExprNode.subquery"))?,
-                ctx,
-                codec,
-            )?;
-            Ok(Expr::Exists(Exists::new(subquery, sq.negated)))
         }
     }
 }

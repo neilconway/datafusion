@@ -1146,7 +1146,7 @@ impl OptimizerRule for PushDownFilter {
 
                 // Filters containing scalar subqueries cannot be pushed to
                 // providers because the subquery result is not available
-                // until execution time (via ScalarSubqueryExec).
+                // until execution time.
                 let (subquery_filters, pushdown_candidates): (Vec<&Expr>, Vec<&Expr>) =
                     filter_predicates
                         .into_iter()

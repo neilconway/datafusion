@@ -578,7 +578,7 @@ pub struct SubqueryAliasNode {
 pub struct LogicalExprNode {
     #[prost(
         oneof = "logical_expr_node::ExprType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 13, 14, 15, 17, 18, 19, 20, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36"
     )]
     pub expr_type: ::core::option::Option<logical_expr_node::ExprType>,
 }
@@ -659,10 +659,6 @@ pub mod logical_expr_node {
         /// Subquery expressions
         #[prost(message, tag = "36")]
         ScalarSubqueryExpr(::prost::alloc::boxed::Box<super::ScalarSubqueryExprNode>),
-        #[prost(message, tag = "37")]
-        InSubqueryExpr(::prost::alloc::boxed::Box<super::InSubqueryExprNode>),
-        #[prost(message, tag = "38")]
-        ExistsExpr(::prost::alloc::boxed::Box<super::ExistsExprNode>),
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -681,22 +677,6 @@ pub struct SubqueryNode {
 pub struct ScalarSubqueryExprNode {
     #[prost(message, optional, boxed, tag = "1")]
     pub subquery: ::core::option::Option<::prost::alloc::boxed::Box<SubqueryNode>>,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct InSubqueryExprNode {
-    #[prost(message, optional, boxed, tag = "1")]
-    pub expr: ::core::option::Option<::prost::alloc::boxed::Box<LogicalExprNode>>,
-    #[prost(message, optional, boxed, tag = "2")]
-    pub subquery: ::core::option::Option<::prost::alloc::boxed::Box<SubqueryNode>>,
-    #[prost(bool, tag = "3")]
-    pub negated: bool,
-}
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct ExistsExprNode {
-    #[prost(message, optional, boxed, tag = "1")]
-    pub subquery: ::core::option::Option<::prost::alloc::boxed::Box<SubqueryNode>>,
-    #[prost(bool, tag = "2")]
-    pub negated: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PlaceholderNode {

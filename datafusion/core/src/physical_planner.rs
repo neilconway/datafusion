@@ -414,7 +414,7 @@ impl DefaultPhysicalPlanner {
     ///
     /// Uncorrelated scalar subqueries in the plan's own expressions are
     /// collected, planned as separate physical plans, and each assigned a
-    /// shared [`OnceLock`] slot that will hold its result at execution time.
+    /// shared `OnceLock` slot that will hold its result at execution time.
     /// These slots are registered in [`ExecutionProps`] so that
     /// [`create_physical_expr`] can convert `Expr::ScalarSubquery` into
     /// [`ScalarSubqueryExpr`] nodes that read from the slots.

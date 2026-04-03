@@ -284,6 +284,7 @@ async fn execute_scalar_subquery(
 ) -> Result<ScalarValue> {
     let schema = plan.schema();
     if schema.fields().len() != 1 {
+        // Should be enforced by the physical planner.
         return internal_err!(
             "Scalar subquery must return exactly one column, got {}",
             schema.fields().len()
@@ -291,25 +292,23 @@ async fn execute_scalar_subquery(
     }
 
     let mut stream = crate::execute_stream(plan, context)?;
+    let mut result: Option<ScalarValue> = None;
 
-    let mut total_rows = 0usize;
-    let mut result_value: Option<ScalarValue> = None;
     while let Some(batch) = stream.next().await.transpose()? {
-        total_rows += batch.num_rows();
-        if total_rows > 1 {
-            return exec_err!(
-                "Scalar subquery returned more than one row (got at least {total_rows})"
-            );
+        if batch.num_rows() == 0 {
+            continue;
         }
-        if batch.num_rows() == 1 {
-            result_value = Some(ScalarValue::try_from_array(batch.column(0), 0)?);
+        if result.is_some() || batch.num_rows() > 1 {
+            return exec_err!("Scalar subquery returned more than one row");
         }
+        result = Some(ScalarValue::try_from_array(batch.column(0), 0)?);
     }
 
-    // 0 rows → NULL of the appropriate type
-    Ok(result_value.unwrap_or_else(|| {
-        ScalarValue::try_from(schema.field(0).data_type()).unwrap_or(ScalarValue::Null)
-    }))
+    // 0 rows → typed NULL per SQL semantics
+    match result {
+        Some(v) => Ok(v),
+        None => ScalarValue::try_from(schema.field(0).data_type()),
+    }
 }
 
 #[cfg(test)]

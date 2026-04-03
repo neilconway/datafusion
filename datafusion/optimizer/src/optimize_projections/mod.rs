@@ -478,19 +478,14 @@ fn optimize_projections(
 ///
 /// Optimizes uncorrelated subquery plans embedded in expressions of the given
 /// plan node (e.g., `Expr::ScalarSubquery`). `map_children` only visits direct
-/// plan inputs, so subqueries must be handled separately. Correlated subqueries
-/// are skipped to avoid interfering with decorrelation in subsequent optimizer
-/// passes.
+/// plan inputs, so subqueries must be handled separately.
 fn optimize_subqueries(
     plan: LogicalPlan,
     config: &dyn OptimizerConfig,
 ) -> Result<Transformed<LogicalPlan>> {
-    plan.map_subqueries(|subquery_plan| match &subquery_plan {
-        LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty() => {
-            let indices = RequiredIndices::new_for_all_exprs(&subquery_plan);
-            optimize_projections(subquery_plan, config, indices)
-        }
-        _ => Ok(Transformed::no(subquery_plan)),
+    plan.map_uncorrelated_subqueries(|subquery_plan| {
+        let indices = RequiredIndices::new_for_all_exprs(&subquery_plan);
+        optimize_projections(subquery_plan, config, indices)
     })
 }
 

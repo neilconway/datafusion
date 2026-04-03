@@ -588,14 +588,7 @@ impl OptimizerRule for CommonSubexprEliminate {
                 // This rule handles recursion itself in a `ApplyOrder::TopDown` like
                 // manner. Process uncorrelated subqueries in expressions
                 // (e.g., Expr::ScalarSubquery), then direct children.
-                // Correlated subqueries are skipped to avoid interfering
-                // with decorrelation in subsequent optimizer passes.
-                plan.map_subqueries(|c| match &c {
-                    LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty() => {
-                        self.rewrite(c, config)
-                    }
-                    _ => Ok(Transformed::no(c)),
-                })?
+                plan.map_uncorrelated_subqueries(|c| self.rewrite(c, config))?
                 .transform_sibling(|plan| {
                     plan.map_children(|c| self.rewrite(c, config))
                 })?

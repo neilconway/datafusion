@@ -90,7 +90,7 @@ impl OptimizerRule for ScalarSubqueryToJoin {
             LogicalPlan::Filter(filter) => {
                 // Optimization: skip the rest of the rule and its copies if
                 // there are no scalar subqueries
-                if !contains_scalar_subquery(&filter.predicate) {
+                if !contains_correlated_scalar_subquery(&filter.predicate) {
                     return Ok(Transformed::no(LogicalPlan::Filter(filter)));
                 }
 
@@ -144,7 +144,7 @@ impl OptimizerRule for ScalarSubqueryToJoin {
             LogicalPlan::Projection(projection) => {
                 // Optimization: skip the rest of the rule and its copies if there
                 // are no correlated scalar subqueries
-                if !projection.expr.iter().any(contains_scalar_subquery) {
+                if !projection.expr.iter().any(contains_correlated_scalar_subquery) {
                     return Ok(Transformed::no(LogicalPlan::Projection(projection)));
                 }
 
@@ -230,7 +230,7 @@ impl OptimizerRule for ScalarSubqueryToJoin {
 /// Returns true if the expression contains a correlated scalar subquery, false
 /// otherwise.  Uncorrelated scalar subqueries are handled by the physical
 /// planner via `ScalarSubqueryExec` and do not need to be converted to joins.
-fn contains_scalar_subquery(expr: &Expr) -> bool {
+fn contains_correlated_scalar_subquery(expr: &Expr) -> bool {
     expr.exists(|expr| {
         Ok(matches!(expr, Expr::ScalarSubquery(sq) if !sq.outer_ref_columns.is_empty()))
     })

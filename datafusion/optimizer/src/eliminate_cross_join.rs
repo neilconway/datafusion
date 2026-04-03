@@ -212,16 +212,9 @@ fn rewrite_children(
     plan: LogicalPlan,
     config: &dyn OptimizerConfig,
 ) -> Result<Transformed<LogicalPlan>> {
-    // Process uncorrelated subqueries in expressions, then direct
-    // children. Correlated subqueries are skipped to avoid interfering
-    // with decorrelation in subsequent optimizer passes.
+    // Process uncorrelated subqueries in expressions, then direct children.
     let transformed_plan = plan
-        .map_subqueries(|input| match &input {
-            LogicalPlan::Subquery(sq) if sq.outer_ref_columns.is_empty() => {
-                optimizer.rewrite(input, config)
-            }
-            _ => Ok(Transformed::no(input)),
-        })?
+        .map_uncorrelated_subqueries(|input| optimizer.rewrite(input, config))?
         .transform_sibling(|plan| {
             plan.map_children(|input| optimizer.rewrite(input, config))
         })?;

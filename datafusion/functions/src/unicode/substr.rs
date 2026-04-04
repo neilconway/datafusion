@@ -120,14 +120,12 @@ impl ScalarUDFImpl for SubstrFunc {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
 
-        // When start (and count, if present) are scalar, use a specialized
-        // path that avoids expanding them into full-length arrays and applies
-        // the short-prefix ASCII heuristic using the known constant values.
+        // Fast-path for scalar start (and count, if provided)
         if let Some((start, count)) = extract_scalar_start_count(&args) {
             return invoke_substr_scalar(&args, start, count);
         }
 
-        // Fallback for array start/count args
+        // Fallback for array start/count
         make_scalar_function(substr, vec![])(&args)
     }
 
@@ -151,19 +149,18 @@ fn extract_scalar_start_count(args: &[ColumnarValue]) -> Option<(i64, Option<i64
     Some((start, count))
 }
 
-/// Handles the scalar start/count fast path, converting only the string
-/// argument to an array and returning the appropriate `ColumnarValue`.
+/// Fast-path for scalar start/count fast path.
 fn invoke_substr_scalar(
     args: &[ColumnarValue],
     start: i64,
     count: Option<i64>,
 ) -> Result<ColumnarValue> {
-    let len = args.iter().find_map(|arg| match arg {
-        ColumnarValue::Array(a) => Some(a.len()),
-        _ => None,
-    });
-    let is_scalar = len.is_none();
-    let batch_len = len.unwrap_or(1);
+    // Start and count are known to be scalar, so only the string arg
+    // can be an array.
+    let (is_scalar, batch_len) = match &args[0] {
+        ColumnarValue::Array(a) => (false, a.len()),
+        ColumnarValue::Scalar(_) => (true, 1),
+    };
 
     let string_array = args[0].to_array(batch_len)?;
 
@@ -303,11 +300,7 @@ fn enable_ascii_fast_path_scalar<'a, V: StringArrayType<'a>>(
         None => false,
     };
 
-    if is_short_prefix {
-        false
-    } else {
-        string_array.is_ascii()
-    }
+    !is_short_prefix && string_array.is_ascii()
 }
 
 /// When start/count are arrays (not constant), always check `is_ascii()`
@@ -324,10 +317,7 @@ pub fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
 // Scalar start/count implementations
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn can_reuse_generic_string_values<T: OffsetSizeTrait>(
-    string_array: &GenericStringArray<T>,
-) -> bool {
+fn values_fit_in_u32<T: OffsetSizeTrait>(string_array: &GenericStringArray<T>) -> bool {
     string_array
         .offsets()
         .last()
@@ -409,7 +399,10 @@ fn generic_string_substr_scalar_args<T: OffsetSizeTrait>(
     start: i64,
     count: Option<i64>,
 ) -> Result<ArrayRef> {
-    if !can_reuse_generic_string_values(string_array) {
+    // We return a StringViewArray that points into the input string array's
+    // values buffer, avoiding copies. This is only possible when the values
+    // buffer is <= 4GB, since StringView offsets are u32.
+    if !values_fit_in_u32(string_array) {
         return generic_string_substr_scalar_args_copy(string_array, start, count);
     }
 
@@ -539,7 +532,7 @@ fn generic_string_substr<T: OffsetSizeTrait>(
     string_array: &GenericStringArray<T>,
     args: &[ArrayRef],
 ) -> Result<ArrayRef> {
-    if !can_reuse_generic_string_values(string_array) {
+    if !values_fit_in_u32(string_array) {
         return generic_string_substr_copy(string_array, args);
     }
 

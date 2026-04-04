@@ -305,14 +305,14 @@ fn values_fit_in_u32<T: OffsetSizeTrait>(string_array: &GenericStringArray<T>) -
 }
 
 #[inline]
-fn make_and_append_view_from_string_values(
+fn append_new_view(
     views_buf: &mut Vec<u128>,
     null_builder: &mut NullBufferBuilder,
     substr: &str,
     byte_offset: usize,
 ) -> bool {
-    let uses_source_buffer = substr.len() > 12;
-    let view = if uses_source_buffer {
+    let is_out_of_line = substr.len() > 12;
+    let view = if is_out_of_line {
         let byte_offset = u32::try_from(byte_offset)
             .expect("validated string buffer offset fits in u32");
         make_view(substr.as_bytes(), 0, byte_offset)
@@ -322,7 +322,7 @@ fn make_and_append_view_from_string_values(
 
     views_buf.push(view);
     null_builder.append_non_null();
-    uses_source_buffer
+    is_out_of_line
 }
 
 fn generic_string_substr_scalar<T: OffsetSizeTrait>(
@@ -341,7 +341,7 @@ fn generic_string_substr_scalar<T: OffsetSizeTrait>(
     let offsets = string_array.value_offsets();
     let mut views_buf = Vec::with_capacity(string_array.len());
     let mut null_builder = NullBufferBuilder::new(string_array.len());
-    let mut uses_source_buffer = false;
+    let mut has_out_of_line = false;
 
     for i in 0..string_array.len() {
         if string_array.is_null(i) {
@@ -354,7 +354,7 @@ fn generic_string_substr_scalar<T: OffsetSizeTrait>(
         let source_offset = offsets[i].as_usize();
 
         let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
-        uses_source_buffer |= make_and_append_view_from_string_values(
+        has_out_of_line |= append_new_view(
             &mut views_buf,
             &mut null_builder,
             &string[byte_start..byte_end],
@@ -364,7 +364,10 @@ fn generic_string_substr_scalar<T: OffsetSizeTrait>(
 
     let views_buf = ScalarBuffer::from(views_buf);
     let nulls_buf = null_builder.finish();
-    let data_buffers = if uses_source_buffer {
+
+    // If all result strings are stored inline, we don't need to retain the
+    // input string array.
+    let data_buffers = if has_out_of_line {
         vec![string_array.values().clone()]
     } else {
         vec![]
@@ -458,7 +461,6 @@ fn string_view_substr(
     let count_array_opt = args.get(1).map(|a| as_int64_array(a)).transpose()?;
 
     let is_ascii = string_view_array.is_ascii();
-
     let mut views_buf = Vec::with_capacity(string_view_array.len());
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
@@ -524,7 +526,7 @@ fn generic_string_substr<T: OffsetSizeTrait>(
     let offsets = string_array.value_offsets();
     let mut views_buf = Vec::with_capacity(string_array.len());
     let mut null_builder = NullBufferBuilder::new(string_array.len());
-    let mut uses_source_buffer = false;
+    let mut has_out_of_line = false;
 
     for i in 0..string_array.len() {
         if string_array.is_null(i)
@@ -542,7 +544,7 @@ fn generic_string_substr<T: OffsetSizeTrait>(
         let count = count_array_opt.map(|a| a.value(i));
 
         let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
-        uses_source_buffer |= make_and_append_view_from_string_values(
+        has_out_of_line |= append_new_view(
             &mut views_buf,
             &mut null_builder,
             &string[byte_start..byte_end],
@@ -552,7 +554,10 @@ fn generic_string_substr<T: OffsetSizeTrait>(
 
     let views_buf = ScalarBuffer::from(views_buf);
     let nulls_buf = null_builder.finish();
-    let data_buffers = if uses_source_buffer {
+
+    // If all result strings are stored inline, we don't need to retain the
+    // input string array.
+    let data_buffers = if has_out_of_line {
         vec![string_array.values().clone()]
     } else {
         vec![]

@@ -31,7 +31,7 @@ use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use datafusion_functions::unicode::substr::{enable_ascii_fast_path, get_true_start_end};
+use datafusion_functions::unicode::substr::get_true_start_end;
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::Arc;
 
@@ -204,7 +204,7 @@ where
     V: StringArrayType<'a>,
     B: StringArrayBuilder,
 {
-    let is_ascii = enable_ascii_fast_path(string_array, start_array, length_array);
+    let is_ascii = string_array.is_ascii();
 
     for i in 0..string_array.len() {
         if string_array.is_null(i) || start_array.is_null(i) {

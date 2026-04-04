@@ -21,8 +21,8 @@ use crate::strings::make_and_append_view;
 use crate::unicode::common::try_as_scalar_i64;
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    Array, ArrayRef, AsArray, GenericStringArray, Int64Array, NullBufferBuilder,
-    OffsetSizeTrait, StringArrayType, StringViewArray, StringViewBuilder, make_view,
+    Array, ArrayRef, AsArray, GenericStringArray, NullBufferBuilder, OffsetSizeTrait,
+    StringArrayType, StringViewArray, StringViewBuilder, make_view,
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::DataType;
@@ -165,18 +165,14 @@ fn invoke_substr_scalar(
     let string_array = args[0].to_array(batch_len)?;
 
     let result = match string_array.data_type() {
-        DataType::Utf8 => generic_string_substr_scalar_args(
-            string_array.as_string::<i32>(),
-            start,
-            count,
-        ),
-        DataType::LargeUtf8 => generic_string_substr_scalar_args(
-            string_array.as_string::<i64>(),
-            start,
-            count,
-        ),
+        DataType::Utf8 => {
+            generic_string_substr_scalar(string_array.as_string::<i32>(), start, count)
+        }
+        DataType::LargeUtf8 => {
+            generic_string_substr_scalar(string_array.as_string::<i64>(), start, count)
+        }
         DataType::Utf8View => {
-            string_view_substr_scalar_args(string_array.as_string_view(), start, count)
+            string_view_substr_scalar(string_array.as_string_view(), start, count)
         }
         other => exec_err!(
             "Unsupported data type {other:?} for function substr,\
@@ -283,39 +279,22 @@ pub fn get_true_start_end(
     Ok((byte_start, byte_end))
 }
 
-/// When start and count are known scalar values, decide whether to skip the
-/// `is_ascii()` scan. Scanning the entire array for ASCII is O(total string
-/// bytes); if the prefix is short, per-row `char_indices` iteration is
-/// cheaper because it only touches `start + count` characters per row.
-fn enable_ascii_fast_path_scalar<'a, V: StringArrayType<'a>>(
+/// We can take a fast-path when the input is ASCII-only, but checking if the
+/// input is ASCII-only itself has a cost. When we are called with scalar`start`
+/// and `count`, we can tell if we are only reading a short prefix of each
+/// string, in which case it isn't worth checking if the entire input is ASCII.
+fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
     string_array: &V,
     start: i64,
     count: Option<i64>,
 ) -> bool {
-    let short_prefix_threshold = 32i64;
-    let is_short_prefix = match count {
-        Some(count) => {
-            start.saturating_sub(1).max(0).saturating_add(count) <= short_prefix_threshold
-        }
-        None => false,
+    let chars_to_scan = match count {
+        Some(count) => start.saturating_sub(1).max(0).saturating_add(count),
+        None => i64::MAX,
     };
 
-    !is_short_prefix && string_array.is_ascii()
+    chars_to_scan > 32 && string_array.is_ascii()
 }
-
-/// When start/count are arrays (not constant), always check `is_ascii()`
-/// since we cannot cheaply determine a representative prefix length.
-pub fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
-    string_array: &V,
-    _start: &Int64Array,
-    _count: Option<&Int64Array>,
-) -> bool {
-    string_array.is_ascii()
-}
-
-// ---------------------------------------------------------------------------
-// Scalar start/count implementations
-// ---------------------------------------------------------------------------
 
 fn values_fit_in_u32<T: OffsetSizeTrait>(string_array: &GenericStringArray<T>) -> bool {
     string_array
@@ -346,12 +325,89 @@ fn make_and_append_view_from_string_values(
     uses_source_buffer
 }
 
-fn string_view_substr_scalar_args(
+fn generic_string_substr_scalar<T: OffsetSizeTrait>(
+    string_array: &GenericStringArray<T>,
+    start: i64,
+    count: Option<i64>,
+) -> Result<ArrayRef> {
+    // We return a StringViewArray that points into the input string array's
+    // values buffer, avoiding copies. This is only possible when the values
+    // buffer is <= 4GB, since StringView offsets are u32.
+    if !values_fit_in_u32(string_array) {
+        return generic_string_substr_scalar_copy(string_array, start, count);
+    }
+
+    let is_ascii = enable_ascii_fast_path(&string_array, start, count);
+    let offsets = string_array.value_offsets();
+    let mut views_buf = Vec::with_capacity(string_array.len());
+    let mut null_builder = NullBufferBuilder::new(string_array.len());
+    let mut uses_source_buffer = false;
+
+    for i in 0..string_array.len() {
+        if string_array.is_null(i) {
+            null_builder.append_null();
+            views_buf.push(0);
+            continue;
+        }
+
+        let string = string_array.value(i);
+        let source_offset = offsets[i].as_usize();
+
+        let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
+        uses_source_buffer |= make_and_append_view_from_string_values(
+            &mut views_buf,
+            &mut null_builder,
+            &string[byte_start..byte_end],
+            source_offset + byte_start,
+        );
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let nulls_buf = null_builder.finish();
+    let data_buffers = if uses_source_buffer {
+        vec![string_array.values().clone()]
+    } else {
+        vec![]
+    };
+
+    // Safety:
+    // (1) The blocks of the given views are all provided
+    // (2) Each referenced range in the source values buffer is within bounds
+    unsafe {
+        let array = StringViewArray::new_unchecked(views_buf, data_buffers, nulls_buf);
+        Ok(Arc::new(array) as ArrayRef)
+    }
+}
+
+fn generic_string_substr_scalar_copy<T: OffsetSizeTrait>(
+    string_array: &GenericStringArray<T>,
+    start: i64,
+    count: Option<i64>,
+) -> Result<ArrayRef> {
+    let is_ascii = enable_ascii_fast_path(&string_array, start, count);
+    let mut result_builder = StringViewBuilder::with_capacity(string_array.len());
+
+    for i in 0..string_array.len() {
+        if string_array.is_null(i) {
+            result_builder.append_null();
+            continue;
+        }
+
+        let string = string_array.value(i);
+
+        let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
+        result_builder.append_value(&string[byte_start..byte_end]);
+    }
+
+    Ok(Arc::new(result_builder.finish()) as ArrayRef)
+}
+
+fn string_view_substr_scalar(
     string_view_array: &StringViewArray,
     start: i64,
     count: Option<i64>,
 ) -> Result<ArrayRef> {
-    let is_ascii = enable_ascii_fast_path_scalar(&string_view_array, start, count);
+    let is_ascii = enable_ascii_fast_path(&string_view_array, start, count);
     let mut views_buf = Vec::with_capacity(string_view_array.len());
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
@@ -394,83 +450,6 @@ fn string_view_substr_scalar_args(
     }
 }
 
-fn generic_string_substr_scalar_args<T: OffsetSizeTrait>(
-    string_array: &GenericStringArray<T>,
-    start: i64,
-    count: Option<i64>,
-) -> Result<ArrayRef> {
-    // We return a StringViewArray that points into the input string array's
-    // values buffer, avoiding copies. This is only possible when the values
-    // buffer is <= 4GB, since StringView offsets are u32.
-    if !values_fit_in_u32(string_array) {
-        return generic_string_substr_scalar_args_copy(string_array, start, count);
-    }
-
-    let is_ascii = enable_ascii_fast_path_scalar(&string_array, start, count);
-    let offsets = string_array.value_offsets();
-    let mut views_buf = Vec::with_capacity(string_array.len());
-    let mut null_builder = NullBufferBuilder::new(string_array.len());
-    let mut uses_source_buffer = false;
-
-    for i in 0..string_array.len() {
-        if string_array.is_null(i) {
-            null_builder.append_null();
-            views_buf.push(0);
-            continue;
-        }
-
-        let string = string_array.value(i);
-        let source_offset = offsets[i].as_usize();
-
-        let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
-        uses_source_buffer |= make_and_append_view_from_string_values(
-            &mut views_buf,
-            &mut null_builder,
-            &string[byte_start..byte_end],
-            source_offset + byte_start,
-        );
-    }
-
-    let views_buf = ScalarBuffer::from(views_buf);
-    let nulls_buf = null_builder.finish();
-    let data_buffers = if uses_source_buffer {
-        vec![string_array.values().clone()]
-    } else {
-        vec![]
-    };
-
-    // Safety:
-    // (1) The blocks of the given views are all provided
-    // (2) Each referenced range in the source values buffer is within bounds
-    unsafe {
-        let array = StringViewArray::new_unchecked(views_buf, data_buffers, nulls_buf);
-        Ok(Arc::new(array) as ArrayRef)
-    }
-}
-
-fn generic_string_substr_scalar_args_copy<T: OffsetSizeTrait>(
-    string_array: &GenericStringArray<T>,
-    start: i64,
-    count: Option<i64>,
-) -> Result<ArrayRef> {
-    let is_ascii = enable_ascii_fast_path_scalar(&string_array, start, count);
-    let mut result_builder = StringViewBuilder::with_capacity(string_array.len());
-
-    for i in 0..string_array.len() {
-        if string_array.is_null(i) {
-            result_builder.append_null();
-            continue;
-        }
-
-        let string = string_array.value(i);
-
-        let (byte_start, byte_end) = get_true_start_end(string, start, count, is_ascii)?;
-        result_builder.append_value(&string[byte_start..byte_end]);
-    }
-
-    Ok(Arc::new(result_builder.finish()) as ArrayRef)
-}
-
 fn string_view_substr(
     string_view_array: &StringViewArray,
     args: &[ArrayRef],
@@ -478,8 +457,7 @@ fn string_view_substr(
     let start_array = as_int64_array(&args[0])?;
     let count_array_opt = args.get(1).map(|a| as_int64_array(a)).transpose()?;
 
-    let is_ascii =
-        enable_ascii_fast_path(&string_view_array, start_array, count_array_opt);
+    let is_ascii = string_view_array.is_ascii();
 
     let mut views_buf = Vec::with_capacity(string_view_array.len());
     let mut null_builder = NullBufferBuilder::new(string_view_array.len());
@@ -532,6 +510,9 @@ fn generic_string_substr<T: OffsetSizeTrait>(
     string_array: &GenericStringArray<T>,
     args: &[ArrayRef],
 ) -> Result<ArrayRef> {
+    // We return a StringViewArray that points into the input string array's
+    // values buffer, avoiding copies. This is only possible when the values
+    // buffer is <= 4GB, since StringView offsets are u32.
     if !values_fit_in_u32(string_array) {
         return generic_string_substr_copy(string_array, args);
     }
@@ -539,7 +520,7 @@ fn generic_string_substr<T: OffsetSizeTrait>(
     let start_array = as_int64_array(&args[0])?;
     let count_array_opt = args.get(1).map(|a| as_int64_array(a)).transpose()?;
 
-    let is_ascii = enable_ascii_fast_path(&string_array, start_array, count_array_opt);
+    let is_ascii = string_array.is_ascii();
     let offsets = string_array.value_offsets();
     let mut views_buf = Vec::with_capacity(string_array.len());
     let mut null_builder = NullBufferBuilder::new(string_array.len());
@@ -593,7 +574,7 @@ fn generic_string_substr_copy<T: OffsetSizeTrait>(
     let start_array = as_int64_array(&args[0])?;
     let count_array_opt = args.get(1).map(|a| as_int64_array(a)).transpose()?;
 
-    let is_ascii = enable_ascii_fast_path(&string_array, start_array, count_array_opt);
+    let is_ascii = string_array.is_ascii();
     let mut result_builder = StringViewBuilder::with_capacity(string_array.len());
 
     for i in 0..string_array.len() {
@@ -1005,7 +986,7 @@ mod tests {
         let string_array = StringArray::from(vec!["unused", "alphabet", "joséésoj"]);
         let string_array = string_array.slice(1, 2);
 
-        let result = super::generic_string_substr_scalar_args(&string_array, 3, Some(2))?;
+        let result = super::generic_string_substr_scalar(&string_array, 3, Some(2))?;
         let result = result.as_string_view();
 
         assert_eq!(result.value(0), "ph");

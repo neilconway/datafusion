@@ -286,11 +286,13 @@ pub fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
     start: i64,
     count: Option<i64>,
 ) -> bool {
-    // When count is given, get_true_start_end iterates to start - 1 + count.
-    // When count is omitted, it only needs to find the start position.
+    // When count is given, get_true_start_end iterates to start - 1 + count
+    // characters. When count is omitted, it only needs to find the start
+    // position, but even a few char_indices iterations per row add up
+    // across a large batch — always scan for ASCII in that case.
     let chars_to_scan = match count {
         Some(count) => start.saturating_sub(1).max(0).saturating_add(count),
-        None => start.saturating_sub(1).max(0),
+        None => i64::MAX,
     };
 
     chars_to_scan > 32 && string_array.is_ascii()

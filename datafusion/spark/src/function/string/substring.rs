@@ -25,13 +25,13 @@ use datafusion_common::cast::as_int64_array;
 use datafusion_common::types::{
     NativeType, logical_int32, logical_int64, logical_string,
 };
-use datafusion_common::{Result, exec_err};
+use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::{Coercion, ReturnFieldArgs, TypeSignatureClass};
 use datafusion_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
     Volatility,
 };
-use datafusion_functions::unicode::substr::get_true_start_end;
+use datafusion_functions::unicode::substr::{enable_ascii_fast_path, get_true_start_end};
 use datafusion_functions::utils::make_scalar_function;
 use std::sync::Arc;
 
@@ -98,7 +98,11 @@ impl ScalarUDFImpl for SparkSubstring {
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
-        make_scalar_function(spark_substring, vec![])(&args.args)
+        let scalar_start_count = extract_scalar_start_count(&args.args);
+        make_scalar_function(
+            move |arrays| spark_substring(arrays, scalar_start_count),
+            vec![],
+        )(&args.args)
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
@@ -119,7 +123,27 @@ impl ScalarUDFImpl for SparkSubstring {
     }
 }
 
-fn spark_substring(args: &[ArrayRef]) -> Result<ArrayRef> {
+/// If start (and count, when present) are non-null scalar values, return
+/// `Some((start, count))`.
+fn extract_scalar_start_count(args: &[ColumnarValue]) -> Option<(i64, Option<i64>)> {
+    let start = match &args[1] {
+        ColumnarValue::Scalar(ScalarValue::Int64(v)) => (*v)?,
+        _ => return None,
+    };
+    let count = match args.get(2) {
+        Some(ColumnarValue::Scalar(ScalarValue::Int64(v))) => {
+            Some((*v)?)
+        }
+        Some(_) => return None,
+        None => None,
+    };
+    Some((start, count))
+}
+
+fn spark_substring(
+    args: &[ArrayRef],
+    scalar_start_count: Option<(i64, Option<i64>)>,
+) -> Result<ArrayRef> {
     let start_array = as_int64_array(&args[1])?;
     let length_array = if args.len() > 2 {
         Some(as_int64_array(&args[2])?)
@@ -128,27 +152,55 @@ fn spark_substring(args: &[ArrayRef]) -> Result<ArrayRef> {
     };
 
     match args[0].data_type() {
-        DataType::Utf8 => spark_substring_impl(
-            &args[0].as_string::<i32>(),
-            start_array,
-            length_array,
-            GenericStringBuilder::<i32>::new(),
-        ),
-        DataType::LargeUtf8 => spark_substring_impl(
-            &args[0].as_string::<i64>(),
-            start_array,
-            length_array,
-            GenericStringBuilder::<i64>::new(),
-        ),
-        DataType::Utf8View => spark_substring_impl(
-            &args[0].as_string_view(),
-            start_array,
-            length_array,
-            StringViewBuilder::new(),
-        ),
+        DataType::Utf8 => {
+            let string_array = args[0].as_string::<i32>();
+            let is_ascii = compute_is_ascii(&string_array, scalar_start_count);
+            spark_substring_impl(
+                &string_array,
+                start_array,
+                length_array,
+                is_ascii,
+                GenericStringBuilder::<i32>::new(),
+            )
+        }
+        DataType::LargeUtf8 => {
+            let string_array = args[0].as_string::<i64>();
+            let is_ascii = compute_is_ascii(&string_array, scalar_start_count);
+            spark_substring_impl(
+                &string_array,
+                start_array,
+                length_array,
+                is_ascii,
+                GenericStringBuilder::<i64>::new(),
+            )
+        }
+        DataType::Utf8View => {
+            let string_array = args[0].as_string_view();
+            let is_ascii = compute_is_ascii(&string_array, scalar_start_count);
+            spark_substring_impl(
+                &string_array,
+                start_array,
+                length_array,
+                is_ascii,
+                StringViewBuilder::new(),
+            )
+        }
         other => exec_err!(
             "Unsupported data type {other:?} for function spark_substring, expected Utf8View, Utf8 or LargeUtf8."
         ),
+    }
+}
+
+/// When start/count are known scalar values, use the short-prefix heuristic
+/// to decide whether to scan the entire array for ASCII. Otherwise, always
+/// scan.
+fn compute_is_ascii<'a, V: StringArrayType<'a>>(
+    string_array: &V,
+    scalar_start_count: Option<(i64, Option<i64>)>,
+) -> bool {
+    match scalar_start_count {
+        Some((start, count)) => enable_ascii_fast_path(string_array, start, count),
+        None => string_array.is_ascii(),
     }
 }
 
@@ -198,14 +250,13 @@ fn spark_substring_impl<'a, V, B>(
     string_array: &V,
     start_array: &Int64Array,
     length_array: Option<&Int64Array>,
+    is_ascii: bool,
     mut builder: B,
 ) -> Result<ArrayRef>
 where
     V: StringArrayType<'a>,
     B: StringArrayBuilder,
 {
-    let is_ascii = string_array.is_ascii();
-
     for i in 0..string_array.len() {
         if string_array.is_null(i) || start_array.is_null(i) {
             builder.append_null();

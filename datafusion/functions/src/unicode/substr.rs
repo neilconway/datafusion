@@ -120,12 +120,10 @@ impl ScalarUDFImpl for SubstrFunc {
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         let ScalarFunctionArgs { args, .. } = args;
 
-        // Fast-path for scalar start (and count, if provided)
         if let Some((start, count)) = extract_scalar_start_count(&args) {
             return invoke_substr_scalar(&args, start, count);
         }
 
-        // Fallback for array start/count
         make_scalar_function(substr, vec![])(&args)
     }
 
@@ -149,7 +147,7 @@ fn extract_scalar_start_count(args: &[ColumnarValue]) -> Option<(i64, Option<i64
     Some((start, count))
 }
 
-/// Fast-path for scalar start/count fast path.
+/// Fast-path for scalar start/count.
 fn invoke_substr_scalar(
     args: &[ColumnarValue],
     start: i64,
@@ -280,10 +278,10 @@ pub fn get_true_start_end(
 }
 
 /// We can take a fast-path when the input is ASCII-only, but checking if the
-/// input is ASCII-only itself has a cost. When we are called with scalar`start`
+/// input is ASCII-only itself has a cost. When we are called with scalar `start`
 /// and `count`, we can tell if we are only reading a short prefix of each
 /// string, in which case it isn't worth checking if the entire input is ASCII.
-fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
+pub fn enable_ascii_fast_path<'a, V: StringArrayType<'a>>(
     string_array: &V,
     start: i64,
     count: Option<i64>,

@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::strings::make_and_append_view;
 use arrow::array::{
     Array, ArrayRef, GenericStringArray, GenericStringBuilder, NullBufferBuilder,
-    OffsetSizeTrait, StringViewArray, StringViewBuilder, new_null_array,
+    OffsetSizeTrait, StringViewArray, StringViewBuilder, make_view, new_null_array,
 };
 use arrow::buffer::{Buffer, ScalarBuffer};
 use arrow::datatypes::DataType;
@@ -129,7 +129,229 @@ pub(crate) fn general_trim<T: OffsetSizeTrait, Tr: Trimmer>(
     if use_string_view {
         string_view_trim::<Tr>(args)
     } else {
-        string_trim::<T, Tr>(args)
+        generic_string_trim::<T, Tr>(args)
+    }
+}
+
+/// Returns true if the values buffer of the given string array fits in a u32
+/// offset, which is required for StringView.
+#[expect(dead_code)]
+fn values_fit_in_u32<T: OffsetSizeTrait>(string_array: &GenericStringArray<T>) -> bool {
+    string_array
+        .offsets()
+        .last()
+        .map(|offset| offset.as_usize() <= u32::MAX as usize)
+        .unwrap_or(true)
+}
+
+/// Creates a new StringView and appends it to the views buffer.
+///
+/// Returns true if the view is out-of-line (string length > 12 bytes).
+#[inline]
+fn append_new_view(
+    views_buf: &mut Vec<u128>,
+    null_builder: &mut NullBufferBuilder,
+    substr: &str,
+    byte_offset: usize,
+) -> bool {
+    let is_out_of_line = substr.len() > 12;
+    let view = if is_out_of_line {
+        let byte_offset =
+            u32::try_from(byte_offset).expect("validated string buffer offset fits in u32");
+        make_view(substr.as_bytes(), 0, byte_offset)
+    } else {
+        make_view(substr.as_bytes(), 0, 0)
+    };
+
+    views_buf.push(view);
+    null_builder.append_non_null();
+    is_out_of_line
+}
+
+/// Applies the trim function to the given Utf8/LargeUtf8 string array(s)
+/// and returns a StringViewArray.
+///
+/// Uses zero-copy (views into the original values buffer) when the average
+/// string length exceeds 12 bytes, since those results will be stored
+/// out-of-line in the StringView and benefit from avoiding the copy.
+/// For shorter strings, uses `collect::<StringViewArray>()` which has
+/// lower per-element overhead via Arrow's optimized `FromIterator`.
+///
+/// Falls back to the copy-based path for arrays whose values buffer
+/// exceeds 4GB (cannot be addressed by u32 StringView offsets).
+fn generic_string_trim<T: OffsetSizeTrait, Tr: Trimmer>(
+    args: &[ArrayRef],
+) -> Result<ArrayRef> {
+    let string_array = as_generic_string_array::<T>(&args[0])?;
+
+    generic_string_trim_collect::<T, Tr>(string_array, args)
+}
+
+/// Trim via `collect::<StringViewArray>()`. Copies data but uses Arrow's
+/// optimized `FromIterator` which has low per-element overhead.
+fn generic_string_trim_collect<T: OffsetSizeTrait, Tr: Trimmer>(
+    string_array: &GenericStringArray<T>,
+    args: &[ArrayRef],
+) -> Result<ArrayRef> {
+    match args.len() {
+        1 => {
+            let result = string_array
+                .iter()
+                .map(|string| string.map(|s| Tr::trim_ascii_char(s, b' ').0))
+                .collect::<StringViewArray>();
+            Ok(Arc::new(result) as ArrayRef)
+        }
+        2 => {
+            let characters_array = as_generic_string_array::<T>(&args[1])?;
+
+            if characters_array.len() == 1 {
+                if characters_array.is_null(0) {
+                    return Ok(new_null_array(
+                        &DataType::Utf8View,
+                        string_array.len(),
+                    ));
+                }
+                let pattern: Vec<char> = characters_array.value(0).chars().collect();
+                let result = string_array
+                    .iter()
+                    .map(|item| item.map(|s| Tr::trim(s, &pattern).0))
+                    .collect::<StringViewArray>();
+                return Ok(Arc::new(result) as ArrayRef);
+            }
+
+            let mut pattern: Vec<char> = Vec::new();
+            let result = string_array
+                .iter()
+                .zip(characters_array.iter())
+                .map(|(string, characters)| match (string, characters) {
+                    (Some(s), Some(c)) => {
+                        pattern.clear();
+                        pattern.extend(c.chars());
+                        Some(Tr::trim(s, &pattern).0)
+                    }
+                    _ => None,
+                })
+                .collect::<StringViewArray>();
+            Ok(Arc::new(result) as ArrayRef)
+        }
+        other => {
+            exec_err!(
+                "Function TRIM was called with {other} arguments. It requires at least 1 and at most 2."
+            )
+        }
+    }
+}
+
+/// Trim via zero-copy: constructs StringView views pointing into the
+/// original GenericStringArray values buffer, avoiding data copies
+/// for out-of-line strings (> 12 bytes).
+#[expect(dead_code)]
+#[expect(clippy::needless_range_loop)]
+fn generic_string_trim_zerocopy<T: OffsetSizeTrait, Tr: Trimmer>(
+    string_array: &GenericStringArray<T>,
+    args: &[ArrayRef],
+) -> Result<ArrayRef> {
+    let offsets = string_array.value_offsets();
+    let mut views_buf = Vec::with_capacity(string_array.len());
+    let mut null_builder = NullBufferBuilder::new(string_array.len());
+    let mut has_out_of_line = false;
+
+    match args.len() {
+        1 => {
+            for i in 0..string_array.len() {
+                if string_array.is_null(i) {
+                    null_builder.append_null();
+                    views_buf.push(0);
+                    continue;
+                }
+                let src_str = string_array.value(i);
+                let source_offset = offsets[i].as_usize();
+                let (trimmed, trim_offset) = Tr::trim_ascii_char(src_str, b' ');
+                has_out_of_line |= append_new_view(
+                    &mut views_buf,
+                    &mut null_builder,
+                    trimmed,
+                    source_offset + trim_offset as usize,
+                );
+            }
+        }
+        2 => {
+            let characters_array = as_generic_string_array::<T>(&args[1])?;
+
+            if characters_array.len() == 1 {
+                if characters_array.is_null(0) {
+                    return Ok(new_null_array(
+                        &DataType::Utf8View,
+                        string_array.len(),
+                    ));
+                }
+
+                let pattern: Vec<char> = characters_array.value(0).chars().collect();
+                for i in 0..string_array.len() {
+                    if string_array.is_null(i) {
+                        null_builder.append_null();
+                        views_buf.push(0);
+                        continue;
+                    }
+                    let src_str = string_array.value(i);
+                    let source_offset = offsets[i].as_usize();
+                    let (trimmed, trim_offset) = Tr::trim(src_str, &pattern);
+                    has_out_of_line |= append_new_view(
+                        &mut views_buf,
+                        &mut null_builder,
+                        trimmed,
+                        source_offset + trim_offset as usize,
+                    );
+                }
+            } else {
+                let mut pattern: Vec<char> = Vec::new();
+                for i in 0..string_array.len() {
+                    if string_array.is_null(i) || characters_array.is_null(i) {
+                        null_builder.append_null();
+                        views_buf.push(0);
+                        continue;
+                    }
+                    let src_str = string_array.value(i);
+                    let source_offset = offsets[i].as_usize();
+                    let characters = characters_array.value(i);
+                    pattern.clear();
+                    pattern.extend(characters.chars());
+                    let (trimmed, trim_offset) = Tr::trim(src_str, &pattern);
+                    has_out_of_line |= append_new_view(
+                        &mut views_buf,
+                        &mut null_builder,
+                        trimmed,
+                        source_offset + trim_offset as usize,
+                    );
+                }
+            }
+        }
+        other => {
+            return exec_err!(
+                "Function TRIM was called with {other} arguments. It requires at least 1 and at most 2."
+            );
+        }
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let nulls_buf = null_builder.finish();
+
+    // If all results are inline (≤ 12 bytes), no need to retain the
+    // input buffer.
+    let data_buffers = if has_out_of_line {
+        vec![string_array.values().clone()]
+    } else {
+        vec![]
+    };
+
+    // Safety:
+    // (1) The data buffers referenced by the views are provided
+    // (2) Each view's offset+length range is within the bounds of the
+    //     source values buffer (trimmed substrings are subsets of original strings)
+    unsafe {
+        let array =
+            StringViewArray::new_unchecked(views_buf, data_buffers, nulls_buf);
+        Ok(Arc::new(array) as ArrayRef)
     }
 }
 
@@ -265,69 +487,6 @@ fn trim_and_append_view<Tr: Trimmer>(
     } else {
         null_builder.append_null();
         views_buf.push(0);
-    }
-}
-
-/// Applies the trim function to the given string array(s)
-/// and returns a new string array with the trimmed values.
-///
-/// Pre-computes the pattern characters once for scalar patterns to avoid
-/// repeated allocations per row.
-fn string_trim<T: OffsetSizeTrait, Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
-    let string_array = as_generic_string_array::<T>(&args[0])?;
-
-    match args.len() {
-        1 => {
-            // Trim spaces by default
-            let result = string_array
-                .iter()
-                .map(|string| string.map(|s| Tr::trim_ascii_char(s, b' ').0))
-                .collect::<GenericStringArray<T>>();
-
-            Ok(Arc::new(result) as ArrayRef)
-        }
-        2 => {
-            let characters_array = as_generic_string_array::<T>(&args[1])?;
-
-            if characters_array.len() == 1 {
-                // Scalar pattern - pre-compute pattern chars once
-                if characters_array.is_null(0) {
-                    return Ok(new_null_array(
-                        string_array.data_type(),
-                        string_array.len(),
-                    ));
-                }
-
-                let pattern: Vec<char> = characters_array.value(0).chars().collect();
-                let result = string_array
-                    .iter()
-                    .map(|item| item.map(|s| Tr::trim(s, &pattern).0))
-                    .collect::<GenericStringArray<T>>();
-                return Ok(Arc::new(result) as ArrayRef);
-            }
-
-            // Per-row pattern - must compute pattern chars for each row
-            let mut pattern: Vec<char> = Vec::new();
-            let result = string_array
-                .iter()
-                .zip(characters_array.iter())
-                .map(|(string, characters)| match (string, characters) {
-                    (Some(s), Some(c)) => {
-                        pattern.clear();
-                        pattern.extend(c.chars());
-                        Some(Tr::trim(s, &pattern).0)
-                    }
-                    _ => None,
-                })
-                .collect::<GenericStringArray<T>>();
-
-            Ok(Arc::new(result) as ArrayRef)
-        }
-        other => {
-            exec_err!(
-                "Function TRIM was called with {other} arguments. It requires at least 1 and at most 2."
-            )
-        }
     }
 }
 

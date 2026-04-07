@@ -109,8 +109,8 @@ impl ScalarUDFImpl for RtrimFunc {
         &self.signature
     }
 
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        Ok(arg_types[0].clone())
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -137,8 +137,8 @@ impl ScalarUDFImpl for RtrimFunc {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Array, StringArray, StringViewArray};
-    use arrow::datatypes::DataType::{Utf8, Utf8View};
+    use arrow::array::{Array, StringViewArray};
+    use arrow::datatypes::DataType::Utf8View;
 
     use datafusion_common::{Result, ScalarValue};
     use datafusion_expr::{ColumnarValue, ScalarUDFImpl};
@@ -224,7 +224,7 @@ mod tests {
             Utf8View,
             StringViewArray
         );
-        // String cases
+        // String cases (Utf8 input produces Utf8View output)
         test_function!(
             RtrimFunc::new(),
             vec![ColumnarValue::Scalar(ScalarValue::Utf8(Some(
@@ -232,8 +232,8 @@ mod tests {
             ))),],
             Ok(Some("alphabet")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             RtrimFunc::new(),
@@ -242,8 +242,8 @@ mod tests {
             ))),],
             Ok(Some("  alphabet")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             RtrimFunc::new(),
@@ -253,8 +253,8 @@ mod tests {
             ],
             Ok(Some("alphabe")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             RtrimFunc::new(),
@@ -264,8 +264,8 @@ mod tests {
             ],
             Ok(Some("alphabet")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             RtrimFunc::new(),
@@ -275,8 +275,8 @@ mod tests {
             ],
             Ok(None),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
     }
 }

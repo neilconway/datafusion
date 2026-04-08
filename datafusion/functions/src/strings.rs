@@ -408,6 +408,32 @@ pub fn make_and_append_view(
     null_builder.append_non_null();
 }
 
+/// Computes a trimmed string view and appends it to the views buffer,
+/// without tracking nulls.
+///
+/// Same logic as [`make_and_append_view`] but does not write to a
+/// `NullBufferBuilder`, allowing callers to manage null buffers in bulk
+/// rather than per-row.
+pub fn append_trimmed_view(
+    views_buffer: &mut Vec<u128>,
+    original_view: &u128,
+    substr: &str,
+    start_offset: u32,
+) {
+    let substr_len = substr.len();
+    let sub_view = if substr_len > 12 {
+        let view = ByteView::from(*original_view);
+        make_view(
+            substr.as_bytes(),
+            view.buffer_index,
+            view.offset + start_offset,
+        )
+    } else {
+        make_view(substr.as_bytes(), 0, 0)
+    };
+    views_buffer.push(sub_view);
+}
+
 #[derive(Debug)]
 pub enum ColumnarValueRef<'a> {
     Scalar(&'a [u8]),

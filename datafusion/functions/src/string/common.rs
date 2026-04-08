@@ -19,12 +19,12 @@
 
 use std::sync::Arc;
 
-use crate::strings::make_and_append_view;
+use crate::strings::append_trimmed_view;
 use arrow::array::{
-    Array, ArrayRef, GenericStringArray, GenericStringBuilder, NullBufferBuilder,
-    OffsetSizeTrait, StringViewArray, StringViewBuilder, new_null_array,
+    Array, ArrayRef, GenericStringArray, GenericStringBuilder, OffsetSizeTrait,
+    StringViewArray, StringViewBuilder, new_null_array,
 };
-use arrow::buffer::{Buffer, ScalarBuffer};
+use arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use datafusion_common::Result;
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
@@ -141,29 +141,23 @@ pub(crate) fn general_trim<T: OffsetSizeTrait, Tr: Trimmer>(
 fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
     let string_view_array = as_string_view_array(&args[0])?;
     let mut views_buf = Vec::with_capacity(string_view_array.len());
-    let mut null_builder = NullBufferBuilder::new(string_view_array.len());
 
-    match args.len() {
+    // Compute output nulls in bulk rather than tracking per-row via NullBufferBuilder.
+    let nulls = match args.len() {
         1 => {
-            // Trim spaces by default
+            // Trim spaces by default. Output nulls = input nulls.
             for (src_str_opt, raw_view) in string_view_array
                 .iter()
                 .zip(string_view_array.views().iter())
             {
                 if let Some(src_str) = src_str_opt {
                     let (trimmed, offset) = Tr::trim_ascii_char(src_str, b' ');
-                    make_and_append_view(
-                        &mut views_buf,
-                        &mut null_builder,
-                        raw_view,
-                        trimmed,
-                        offset,
-                    );
+                    append_trimmed_view(&mut views_buf, raw_view, trimmed, offset);
                 } else {
-                    null_builder.append_null();
                     views_buf.push(0);
                 }
             }
+            string_view_array.nulls().cloned()
         }
         2 => {
             let characters_array = as_string_view_array(&args[1])?;
@@ -177,45 +171,40 @@ fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     ));
                 }
 
+                // Output nulls = input string nulls (scalar pattern is non-null).
                 let pattern: Vec<char> = characters_array.value(0).chars().collect();
                 for (src_str_opt, raw_view) in string_view_array
                     .iter()
                     .zip(string_view_array.views().iter())
                 {
-                    trim_and_append_view::<Tr>(
-                        src_str_opt,
-                        &pattern,
-                        &mut views_buf,
-                        &mut null_builder,
-                        raw_view,
-                    );
-                }
-            } else {
-                // Per-row pattern - must compute pattern chars for each row
-                let mut pattern: Vec<char> = Vec::new();
-                for ((src_str_opt, raw_view), characters_opt) in string_view_array
-                    .iter()
-                    .zip(string_view_array.views().iter())
-                    .zip(characters_array.iter())
-                {
-                    if let (Some(src_str), Some(characters)) =
-                        (src_str_opt, characters_opt)
-                    {
-                        pattern.clear();
-                        pattern.extend(characters.chars());
+                    if let Some(src_str) = src_str_opt {
                         let (trimmed, offset) = Tr::trim(src_str, &pattern);
-                        make_and_append_view(
-                            &mut views_buf,
-                            &mut null_builder,
-                            raw_view,
-                            trimmed,
-                            offset,
-                        );
+                        append_trimmed_view(&mut views_buf, raw_view, trimmed, offset);
                     } else {
-                        null_builder.append_null();
                         views_buf.push(0);
                     }
                 }
+                string_view_array.nulls().cloned()
+            } else {
+                // Per-row pattern. Output null = either input null.
+                let nulls = NullBuffer::union(
+                    string_view_array.nulls(),
+                    characters_array.nulls(),
+                );
+                let mut pattern: Vec<char> = Vec::new();
+                for (i, raw_view) in string_view_array.views().iter().enumerate() {
+                    if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+                        views_buf.push(0);
+                    } else {
+                        let src_str = string_view_array.value(i);
+                        let characters = characters_array.value(i);
+                        pattern.clear();
+                        pattern.extend(characters.chars());
+                        let (trimmed, offset) = Tr::trim(src_str, &pattern);
+                        append_trimmed_view(&mut views_buf, raw_view, trimmed, offset);
+                    }
+                }
+                nulls
             }
         }
         other => {
@@ -223,10 +212,9 @@ fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
                 "Function TRIM was called with {other} arguments. It requires at least 1 and at most 2."
             );
         }
-    }
+    };
 
     let views_buf = ScalarBuffer::from(views_buf);
-    let nulls_buf = null_builder.finish();
 
     // Safety:
     // (1) The blocks of the given views are all provided
@@ -236,35 +224,9 @@ fn string_view_trim<Tr: Trimmer>(args: &[ArrayRef]) -> Result<ArrayRef> {
         let array = StringViewArray::new_unchecked(
             views_buf,
             string_view_array.data_buffers().to_vec(),
-            nulls_buf,
+            nulls,
         );
         Ok(Arc::new(array) as ArrayRef)
-    }
-}
-
-/// Trims the given string and appends the trimmed string to the views buffer
-/// and the null buffer.
-///
-/// Arguments
-/// - `src_str_opt`: The original string value (represented by the view)
-/// - `pattern`: Pre-computed character pattern to trim
-/// - `views_buf`: The buffer to append the updated views to
-/// - `null_builder`: The buffer to append the null values to
-/// - `original_view`: The original view value (that contains src_str_opt)
-#[inline]
-fn trim_and_append_view<Tr: Trimmer>(
-    src_str_opt: Option<&str>,
-    pattern: &[char],
-    views_buf: &mut Vec<u128>,
-    null_builder: &mut NullBufferBuilder,
-    original_view: &u128,
-) {
-    if let Some(src_str) = src_str_opt {
-        let (trimmed, offset) = Tr::trim(src_str, pattern);
-        make_and_append_view(views_buf, null_builder, original_view, trimmed, offset);
-    } else {
-        null_builder.append_null();
-        views_buf.push(0);
     }
 }
 

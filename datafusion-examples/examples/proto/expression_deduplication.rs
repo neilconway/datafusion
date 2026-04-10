@@ -49,8 +49,8 @@ use datafusion::prelude::SessionContext;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr_with_converter;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
-    PhysicalProtoConverterExtension,
+    DefaultPhysicalExtensionCodec, PhysicalDeserializationContext,
+    PhysicalExtensionCodec, PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::{PhysicalExprNode, PhysicalPlanNode};
 use prost::Message;
@@ -116,11 +116,11 @@ pub async fn expression_deduplication() -> Result<()> {
     println!("Step 4: Deserializing plan with CachingCodec...");
 
     let ctx = SessionContext::new();
-    let deserialized_plan = proto.try_into_physical_plan_with_converter(
-        &ctx.task_ctx(),
-        &extension_codec,
-        &caching_converter,
-    )?;
+    let task_ctx = ctx.task_ctx();
+    let deser_ctx =
+        PhysicalDeserializationContext::new(task_ctx.as_ref(), &extension_codec);
+    let deserialized_plan =
+        proto.try_into_physical_plan_with_converter(&deser_ctx, &caching_converter)?;
 
     // Step 5: check that we deduplicated expressions
     println!("Step 5: Checking for deduplicated expressions...");
@@ -203,11 +203,10 @@ impl PhysicalExtensionCodec for CachingCodec {
 impl PhysicalProtoConverterExtension for CachingCodec {
     fn proto_to_execution_plan(
         &self,
-        ctx: &TaskContext,
-        extension_codec: &dyn PhysicalExtensionCodec,
+        deser_ctx: &PhysicalDeserializationContext,
         proto: &PhysicalPlanNode,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        proto.try_into_physical_plan_with_converter(ctx, extension_codec, self)
+        proto.try_into_physical_plan_with_converter(deser_ctx, self)
     }
 
     fn execution_plan_to_proto(
@@ -226,9 +225,8 @@ impl PhysicalProtoConverterExtension for CachingCodec {
     fn proto_to_physical_expr(
         &self,
         proto: &PhysicalExprNode,
-        ctx: &TaskContext,
+        deser_ctx: &PhysicalDeserializationContext,
         input_schema: &Schema,
-        codec: &dyn PhysicalExtensionCodec,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         // Create cache key from protobuf bytes
         let mut key = Vec::new();
@@ -251,7 +249,7 @@ impl PhysicalProtoConverterExtension for CachingCodec {
 
         // Cache miss - deserialize and store
         let expr =
-            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)?;
+            parse_physical_expr_with_converter(proto, deser_ctx, input_schema, self)?;
 
         // Store in cache
         {

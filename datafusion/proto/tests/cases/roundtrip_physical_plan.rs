@@ -122,8 +122,8 @@ use datafusion_proto::physical_plan::from_proto::parse_physical_expr_with_conver
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
     AsExecutionPlan, DeduplicatingProtoConverter, DefaultPhysicalExtensionCodec,
-    DefaultPhysicalProtoConverter, PhysicalExtensionCodec,
-    PhysicalProtoConverterExtension,
+    DefaultPhysicalProtoConverter, PhysicalDeserializationContext,
+    PhysicalExtensionCodec, PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf;
 use datafusion_proto::protobuf::{PhysicalExprNode, PhysicalPlanNode};
@@ -140,7 +140,7 @@ use crate::cases::{
 fn roundtrip_test(exec_plan: Arc<dyn ExecutionPlan>) -> Result<()> {
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     roundtrip_test_and_return(exec_plan, &ctx, &codec, &proto_converter)?;
     Ok(())
 }
@@ -187,7 +187,7 @@ fn roundtrip_test_with_context(
     ctx: &SessionContext,
 ) -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     roundtrip_test_and_return(exec_plan, ctx, &codec, &proto_converter)?;
     Ok(())
 }
@@ -196,7 +196,7 @@ fn roundtrip_test_with_context(
 /// query results are identical.
 async fn roundtrip_test_sql_with_context(sql: &str, ctx: &SessionContext) -> Result<()> {
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     let initial_plan = ctx.sql(sql).await?.create_physical_plan().await?;
 
     roundtrip_test_and_return(initial_plan, ctx, &codec, &proto_converter)?;
@@ -968,7 +968,7 @@ fn roundtrip_parquet_exec_attaches_cached_reader_factory_after_roundtrip() -> Re
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     let roundtripped =
         roundtrip_test_and_return(exec_plan, &ctx, &codec, &proto_converter)?;
 
@@ -1195,7 +1195,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
         exec_plan,
         &ctx,
         &CustomPhysicalExtensionCodec {},
-        &DefaultPhysicalProtoConverter::default(),
+        &DefaultPhysicalProtoConverter,
     )?;
     Ok(())
 }
@@ -1402,7 +1402,7 @@ fn roundtrip_scalar_udf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     roundtrip_test_and_return(aggregate, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1450,7 +1450,7 @@ fn roundtrip_udwf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     roundtrip_test_and_return(window, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1522,7 +1522,7 @@ fn roundtrip_aggregate_udf_extension_codec() -> Result<()> {
     )?);
 
     let ctx = SessionContext::new();
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
     roundtrip_test_and_return(aggregate, &ctx, &UDFExtensionCodec, &proto_converter)?;
     Ok(())
 }
@@ -1650,7 +1650,7 @@ fn roundtrip_csv_sink() -> Result<()> {
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
 
     let roundtrip_plan = roundtrip_test_and_return(
         Arc::new(DataSinkExec::new(input, data_sink, Some(sort_order))),
@@ -2575,8 +2575,7 @@ fn custom_proto_converter_intercepts() -> Result<()> {
     impl PhysicalProtoConverterExtension for CustomConverterInterceptor {
         fn proto_to_execution_plan(
             &self,
-            ctx: &TaskContext,
-            codec: &dyn PhysicalExtensionCodec,
+            deser_ctx: &PhysicalDeserializationContext,
             proto: &protobuf::PhysicalPlanNode,
         ) -> Result<Arc<dyn ExecutionPlan>> {
             {
@@ -2586,7 +2585,7 @@ fn custom_proto_converter_intercepts() -> Result<()> {
                     .map_err(|err| exec_datafusion_err!("{err}"))?;
                 *counter += 1;
             }
-            proto.try_into_physical_plan_with_converter(ctx, codec, self)
+            proto.try_into_physical_plan_with_converter(deser_ctx, self)
         }
 
         fn execution_plan_to_proto(
@@ -2614,9 +2613,8 @@ fn custom_proto_converter_intercepts() -> Result<()> {
         fn proto_to_physical_expr(
             &self,
             proto: &PhysicalExprNode,
-            ctx: &TaskContext,
+            deser_ctx: &PhysicalDeserializationContext,
             input_schema: &Schema,
-            codec: &dyn PhysicalExtensionCodec,
         ) -> Result<Arc<dyn PhysicalExpr>>
         where
             Self: Sized,
@@ -2628,7 +2626,7 @@ fn custom_proto_converter_intercepts() -> Result<()> {
                     .map_err(|err| exec_datafusion_err!("{err}"))?;
                 *counter += 1;
             }
-            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)
+            parse_physical_expr_with_converter(proto, deser_ctx, input_schema, self)
         }
 
         fn physical_expr_to_proto(
@@ -2855,15 +2853,12 @@ fn test_backward_compatibility_no_expr_id() -> Result<()> {
 
     let ctx = SessionContext::new();
     let codec = DefaultPhysicalExtensionCodec {};
-    let proto_converter = DefaultPhysicalProtoConverter::default();
+    let proto_converter = DefaultPhysicalProtoConverter;
 
     // Should deserialize without error
-    let result = proto_converter.proto_to_physical_expr(
-        &proto,
-        ctx.task_ctx().as_ref(),
-        &schema,
-        &codec,
-    )?;
+    let task_ctx = ctx.task_ctx();
+    let deser_ctx = PhysicalDeserializationContext::new(task_ctx.as_ref(), &codec);
+    let result = proto_converter.proto_to_physical_expr(&proto, &deser_ctx, &schema)?;
 
     // Verify the result is correct
     let col = result
@@ -2991,12 +2986,9 @@ fn test_deduplication_within_expr_deserialization() -> Result<()> {
     let proto = proto_converter.physical_expr_to_proto(&binary_expr, &codec)?;
 
     // First expression deserialization
-    let expr1 = proto_converter.proto_to_physical_expr(
-        &proto,
-        ctx.task_ctx().as_ref(),
-        &schema,
-        &codec,
-    )?;
+    let task_ctx = ctx.task_ctx();
+    let deser_ctx = PhysicalDeserializationContext::new(task_ctx.as_ref(), &codec);
+    let expr1 = proto_converter.proto_to_physical_expr(&proto, &deser_ctx, &schema)?;
 
     // Check that deduplication worked within the deserialization
     let binary1 = expr1
@@ -3009,12 +3001,7 @@ fn test_deduplication_within_expr_deserialization() -> Result<()> {
     );
 
     // Second expression deserialization
-    let expr2 = proto_converter.proto_to_physical_expr(
-        &proto,
-        ctx.task_ctx().as_ref(),
-        &schema,
-        &codec,
-    )?;
+    let expr2 = proto_converter.proto_to_physical_expr(&proto, &deser_ctx, &schema)?;
 
     // Check that the second expression was also deserialized correctly
     let binary2 = expr2

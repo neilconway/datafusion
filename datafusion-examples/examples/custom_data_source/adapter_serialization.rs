@@ -61,7 +61,8 @@ use datafusion_proto::bytes::{
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr_with_converter;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
-    PhysicalExtensionCodec, PhysicalProtoConverterExtension,
+    PhysicalDeserializationContext, PhysicalExtensionCodec,
+    PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::physical_plan_node::PhysicalPlanType;
 use datafusion_proto::protobuf::{
@@ -372,8 +373,7 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
     // Interception point: override deserialization to unwrap adapters
     fn proto_to_execution_plan(
         &self,
-        ctx: &TaskContext,
-        extension_codec: &dyn PhysicalExtensionCodec,
+        deser_ctx: &PhysicalDeserializationContext,
         proto: &PhysicalPlanNode,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Check if this is our custom extension wrapper
@@ -396,11 +396,8 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
             let inner_proto = &extension.inputs[0];
 
             // Deserialize the inner plan
-            let inner_plan = inner_proto.try_into_physical_plan_with_converter(
-                ctx,
-                extension_codec,
-                self,
-            )?;
+            let inner_plan =
+                inner_proto.try_into_physical_plan_with_converter(deser_ctx, self)?;
 
             // Recreate the adapter factory
             let adapter_factory = create_adapter_factory(&payload.adapter_metadata.tag);
@@ -410,17 +407,16 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
         }
 
         // Not our extension - use default deserialization
-        proto.try_into_physical_plan_with_converter(ctx, extension_codec, self)
+        proto.try_into_physical_plan_with_converter(deser_ctx, self)
     }
 
     fn proto_to_physical_expr(
         &self,
         proto: &PhysicalExprNode,
-        ctx: &TaskContext,
+        deser_ctx: &PhysicalDeserializationContext,
         input_schema: &Schema,
-        codec: &dyn PhysicalExtensionCodec,
     ) -> Result<Arc<dyn PhysicalExpr>> {
-        parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)
+        parse_physical_expr_with_converter(proto, deser_ctx, input_schema, self)
     }
 
     fn physical_expr_to_proto(

@@ -338,26 +338,12 @@ fn split_part_scalar_generic_string<T: OffsetSizeTrait>(
             )
         })?;
         let finder = memmem::Finder::new(delimiter.as_bytes());
-        for (i, source_offset) in offsets.iter().enumerate().take(len) {
-            if string_array.is_null(i) {
-                views_buf.push(0);
-                continue;
-            }
-
-            let string = string_array.value(i);
-            match split_nth_finder(string, &finder, delimiter.len(), idx) {
-                Some(substr) => {
-                    let start_offset =
-                        substr.as_ptr() as usize - string.as_ptr() as usize;
-                    has_out_of_line |= append_view_from_buffer(
-                        &mut views_buf,
-                        substr,
-                        source_offset.as_usize() + start_offset,
-                    );
-                }
-                None => views_buf.push(make_view(b"", 0, 0)),
-            }
-        }
+        generic_string_view_loop(
+            string_array,
+            &mut views_buf,
+            &mut has_out_of_line,
+            |s| split_nth_finder(s, &finder, delimiter.len(), idx),
+        );
     } else {
         let idx: usize = (position.unsigned_abs() - 1).try_into().map_err(|_| {
             exec_datafusion_err!(
@@ -365,26 +351,12 @@ fn split_part_scalar_generic_string<T: OffsetSizeTrait>(
             )
         })?;
         let finder_rev = memmem::FinderRev::new(delimiter.as_bytes());
-        for (i, source_offset) in offsets.iter().enumerate().take(len) {
-            if string_array.is_null(i) {
-                views_buf.push(0);
-                continue;
-            }
-
-            let string = string_array.value(i);
-            match rsplit_nth_finder(string, &finder_rev, delimiter.len(), idx) {
-                Some(substr) => {
-                    let start_offset =
-                        substr.as_ptr() as usize - string.as_ptr() as usize;
-                    has_out_of_line |= append_view_from_buffer(
-                        &mut views_buf,
-                        substr,
-                        source_offset.as_usize() + start_offset,
-                    );
-                }
-                None => views_buf.push(make_view(b"", 0, 0)),
-            }
-        }
+        generic_string_view_loop(
+            string_array,
+            &mut views_buf,
+            &mut has_out_of_line,
+            |s| rsplit_nth_finder(s, &finder_rev, delimiter.len(), idx),
+        );
     }
 
     let views_buf = ScalarBuffer::from(views_buf);
@@ -394,12 +366,50 @@ fn split_part_scalar_generic_string<T: OffsetSizeTrait>(
         vec![]
     };
 
+    // Safety: each view is either 0 (null), an empty inline view, or
+    // built by `append_view_from_buffer` pointing to a valid sub-range
+    // of the original `GenericStringArray` values buffer.
     unsafe {
         Ok(Arc::new(StringViewArray::new_unchecked(
             views_buf,
             data_buffers,
             string_array.nulls().cloned(),
         )) as ArrayRef)
+    }
+}
+
+/// Applies `split_fn` to each non-null string in `string_array` and appends
+/// a zero-copy `StringView` referencing the result substring back into the
+/// original values buffer.
+#[inline(always)]
+fn generic_string_view_loop<T: OffsetSizeTrait, F>(
+    string_array: &GenericStringArray<T>,
+    views_buf: &mut Vec<u128>,
+    has_out_of_line: &mut bool,
+    split_fn: F,
+) where
+    F: Fn(&str) -> Option<&str>,
+{
+    let offsets = string_array.value_offsets();
+    let empty_view = make_view(b"", 0, 0);
+    for (i, source_offset) in offsets.iter().enumerate().take(string_array.len()) {
+        if string_array.is_null(i) {
+            views_buf.push(0);
+            continue;
+        }
+        let string = string_array.value(i);
+        match split_fn(string) {
+            Some(substr) => {
+                let start_offset =
+                    substr.as_ptr() as usize - string.as_ptr() as usize;
+                *has_out_of_line |= append_view_from_buffer(
+                    views_buf,
+                    substr,
+                    source_offset.as_usize() + start_offset,
+                );
+            }
+            None => views_buf.push(empty_view),
+        }
     }
 }
 
@@ -722,6 +732,9 @@ where
         vec![]
     };
 
+    // Safety: each view is either 0 (null), an empty inline view, or
+    // built by `substr_view` pointing to a valid sub-range of the
+    // original `StringViewArray`'s data buffers.
     unsafe {
         Ok(Arc::new(StringViewArray::new_unchecked(
             views_buf,
@@ -789,6 +802,9 @@ where
         vec![]
     };
 
+    // Safety: each view is either 0 (null), an empty inline view, or
+    // built by `append_view_from_buffer` pointing to a valid sub-range
+    // of the original `GenericStringArray` values buffer.
     unsafe {
         Ok(Arc::new(StringViewArray::new_unchecked(
             views_buf,

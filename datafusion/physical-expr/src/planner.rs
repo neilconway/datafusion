@@ -414,6 +414,12 @@ pub fn create_physical_expr(
             match execution_props.subquery_indexes.get(sq) {
                 Some(&index) => {
                     let schema = sq.subquery.schema();
+                    if schema.fields().len() != 1 {
+                        return plan_err!(
+                            "Scalar subquery must return exactly one column, got {}",
+                            schema.fields().len()
+                        );
+                    }
                     let dt = schema.field(0).data_type().clone();
                     let nullable = schema.field(0).is_nullable();
                     Ok(Arc::new(ScalarSubqueryExpr::new(

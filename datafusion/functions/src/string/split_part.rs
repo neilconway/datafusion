@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::utils::utf8_to_str_type;
 use arrow::array::{
-    Array, ArrayRef, AsArray, ByteView, GenericStringBuilder, Int64Array,
+    Array, ArrayRef, AsArray, ByteView, GenericStringArray, Int64Array, OffsetSizeTrait,
     StringArrayType, StringLikeArrayBuilder, StringViewArray, StringViewBuilder,
     make_view, new_null_array,
 };
-use arrow::buffer::ScalarBuffer;
+use arrow::buffer::{NullBuffer, ScalarBuffer};
 use arrow::datatypes::DataType;
 use datafusion_common::ScalarValue;
 use datafusion_common::cast::as_int64_array;
@@ -93,12 +92,8 @@ impl ScalarUDFImpl for SplitPartFunc {
         &self.signature
     }
 
-    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        if arg_types[0] == DataType::Utf8View {
-            Ok(DataType::Utf8View)
-        } else {
-            utf8_to_str_type(&arg_types[0], "split_part")
-        }
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8View)
     }
 
     fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
@@ -135,28 +130,19 @@ impl ScalarUDFImpl for SplitPartFunc {
         // Unpack the ArrayRefs from the arguments
         let n_array = as_int64_array(&args[2])?;
 
-        // Dispatch on delimiter type for a given string array and builder.
+        // Dispatch on delimiter type for a given string array implementation.
         macro_rules! split_part_for_delimiter_type {
-            ($str_arr:expr, $builder:expr) => {
+            ($split_impl:ident, $str_arr:expr) => {
                 match args[1].data_type() {
-                    DataType::Utf8View => split_part_impl(
-                        $str_arr,
-                        &args[1].as_string_view(),
-                        n_array,
-                        $builder,
-                    ),
-                    DataType::Utf8 => split_part_impl(
-                        $str_arr,
-                        &args[1].as_string::<i32>(),
-                        n_array,
-                        $builder,
-                    ),
-                    DataType::LargeUtf8 => split_part_impl(
-                        $str_arr,
-                        &args[1].as_string::<i64>(),
-                        n_array,
-                        $builder,
-                    ),
+                    DataType::Utf8View => {
+                        $split_impl($str_arr, &args[1].as_string_view(), n_array)
+                    }
+                    DataType::Utf8 => {
+                        $split_impl($str_arr, &args[1].as_string::<i32>(), n_array)
+                    }
+                    DataType::LargeUtf8 => {
+                        $split_impl($str_arr, &args[1].as_string::<i64>(), n_array)
+                    }
                     other => {
                         exec_err!("Unsupported delimiter type {other:?} for split_part")
                     }
@@ -165,34 +151,20 @@ impl ScalarUDFImpl for SplitPartFunc {
         }
 
         let result = match args[0].data_type() {
-            DataType::Utf8View => split_part_for_delimiter_type!(
-                &args[0].as_string_view(),
-                StringViewBuilder::with_capacity(inferred_length)
+            DataType::Utf8View => {
+                split_part_for_delimiter_type!(
+                    split_part_view_impl,
+                    &args[0].as_string_view()
+                )
+            }
+            DataType::Utf8 => split_part_for_delimiter_type!(
+                split_part_generic_string,
+                &args[0].as_string::<i32>()
             ),
-            DataType::Utf8 => {
-                let str_arr = &args[0].as_string::<i32>();
-                // Conservative under-estimate for data capacity: split_part
-                // output is typically much smaller than the input, so avoid
-                // pre-allocating the full input data size.
-                split_part_for_delimiter_type!(
-                    str_arr,
-                    GenericStringBuilder::<i32>::with_capacity(
-                        inferred_length,
-                        inferred_length,
-                    )
-                )
-            }
-            DataType::LargeUtf8 => {
-                let str_arr = &args[0].as_string::<i64>();
-                // Conservative under-estimate; see Utf8 comment above.
-                split_part_for_delimiter_type!(
-                    str_arr,
-                    GenericStringBuilder::<i64>::with_capacity(
-                        inferred_length,
-                        inferred_length,
-                    )
-                )
-            }
+            DataType::LargeUtf8 => split_part_for_delimiter_type!(
+                split_part_generic_string,
+                &args[0].as_string::<i64>()
+            ),
             other => exec_err!("Unsupported string type {other:?} for split_part"),
         };
         if is_scalar {
@@ -245,10 +217,7 @@ fn split_part_scalar(
 ) -> Result<ColumnarValue> {
     // Empty input array → empty result.
     if string_array.is_empty() {
-        return Ok(ColumnarValue::Array(new_null_array(
-            string_array.data_type(),
-            0,
-        )));
+        return Ok(ColumnarValue::Array(new_null_array(&DataType::Utf8View, 0)));
     }
 
     let delimiter = delim_scalar.try_as_str().ok_or_else(|| {
@@ -271,7 +240,7 @@ fn split_part_scalar(
     // Null delimiter or position → every row is null.
     let (Some(delimiter), Some(position)) = (delimiter, position) else {
         return Ok(ColumnarValue::Array(new_null_array(
-            string_array.data_type(),
+            &DataType::Utf8View,
             string_array.len(),
         )));
     };
@@ -284,32 +253,154 @@ fn split_part_scalar(
         DataType::Utf8View => {
             split_part_scalar_view(string_array.as_string_view(), delimiter, position)
         }
-        DataType::Utf8 => {
-            let arr = string_array.as_string::<i32>();
-            // Conservative under-estimate for data capacity: split_part output
-            // is typically much smaller than the input, so avoid pre-allocating
-            // the full input data size.
-            split_part_scalar_impl(
-                arr,
-                delimiter,
-                position,
-                GenericStringBuilder::<i32>::with_capacity(arr.len(), arr.len()),
-            )
-        }
-        DataType::LargeUtf8 => {
-            let arr = string_array.as_string::<i64>();
-            // Conservative under-estimate; see Utf8 comment above.
-            split_part_scalar_impl(
-                arr,
-                delimiter,
-                position,
-                GenericStringBuilder::<i64>::with_capacity(arr.len(), arr.len()),
-            )
-        }
+        DataType::Utf8 => split_part_scalar_generic_string(
+            string_array.as_string::<i32>(),
+            delimiter,
+            position,
+        ),
+        DataType::LargeUtf8 => split_part_scalar_generic_string(
+            string_array.as_string::<i64>(),
+            delimiter,
+            position,
+        ),
         other => exec_err!("Unsupported string type {other:?} for split_part"),
     }?;
 
     Ok(ColumnarValue::Array(result))
+}
+
+fn values_fit_in_u32<T: OffsetSizeTrait>(string_array: &GenericStringArray<T>) -> bool {
+    string_array
+        .value_offsets()
+        .last()
+        .map(|offset| offset.as_usize() <= u32::MAX as usize)
+        .unwrap_or(true)
+}
+
+#[inline]
+fn append_view_from_buffer(
+    views_buf: &mut Vec<u128>,
+    substr: &str,
+    byte_offset: usize,
+) -> bool {
+    let is_out_of_line = substr.len() > 12;
+    let view = if is_out_of_line {
+        let byte_offset = u32::try_from(byte_offset)
+            .expect("validated string buffer offset fits in u32");
+        make_view(substr.as_bytes(), 0, byte_offset)
+    } else {
+        make_view(substr.as_bytes(), 0, 0)
+    };
+
+    views_buf.push(view);
+    is_out_of_line
+}
+
+fn split_part_scalar_generic_string<T: OffsetSizeTrait>(
+    string_array: &GenericStringArray<T>,
+    delimiter: &str,
+    position: i64,
+) -> Result<ArrayRef> {
+    if !values_fit_in_u32(string_array) {
+        return split_part_scalar_impl(
+            string_array,
+            delimiter,
+            position,
+            StringViewBuilder::with_capacity(string_array.len()),
+        );
+    }
+
+    let len = string_array.len();
+    let mut views_buf = Vec::with_capacity(len);
+    let offsets = string_array.value_offsets();
+    let mut has_out_of_line = false;
+
+    if delimiter.is_empty() {
+        let empty_view = make_view(b"", 0, 0);
+        let return_input = position == 1 || position == -1;
+        for (i, source_offset) in offsets.iter().enumerate().take(len) {
+            if string_array.is_null(i) {
+                views_buf.push(0);
+            } else if return_input {
+                has_out_of_line |= append_view_from_buffer(
+                    &mut views_buf,
+                    string_array.value(i),
+                    source_offset.as_usize(),
+                );
+            } else {
+                views_buf.push(empty_view);
+            }
+        }
+    } else if position > 0 {
+        let idx: usize = (position - 1).try_into().map_err(|_| {
+            exec_datafusion_err!(
+                "split_part index {position} exceeds maximum supported value"
+            )
+        })?;
+        let finder = memmem::Finder::new(delimiter.as_bytes());
+        for (i, source_offset) in offsets.iter().enumerate().take(len) {
+            if string_array.is_null(i) {
+                views_buf.push(0);
+                continue;
+            }
+
+            let string = string_array.value(i);
+            match split_nth_finder(string, &finder, delimiter.len(), idx) {
+                Some(substr) => {
+                    let start_offset =
+                        substr.as_ptr() as usize - string.as_ptr() as usize;
+                    has_out_of_line |= append_view_from_buffer(
+                        &mut views_buf,
+                        substr,
+                        source_offset.as_usize() + start_offset,
+                    );
+                }
+                None => views_buf.push(make_view(b"", 0, 0)),
+            }
+        }
+    } else {
+        let idx: usize = (position.unsigned_abs() - 1).try_into().map_err(|_| {
+            exec_datafusion_err!(
+                "split_part index {position} exceeds minimum supported value"
+            )
+        })?;
+        let finder_rev = memmem::FinderRev::new(delimiter.as_bytes());
+        for (i, source_offset) in offsets.iter().enumerate().take(len) {
+            if string_array.is_null(i) {
+                views_buf.push(0);
+                continue;
+            }
+
+            let string = string_array.value(i);
+            match rsplit_nth_finder(string, &finder_rev, delimiter.len(), idx) {
+                Some(substr) => {
+                    let start_offset =
+                        substr.as_ptr() as usize - string.as_ptr() as usize;
+                    has_out_of_line |= append_view_from_buffer(
+                        &mut views_buf,
+                        substr,
+                        source_offset.as_usize() + start_offset,
+                    );
+                }
+                None => views_buf.push(make_view(b"", 0, 0)),
+            }
+        }
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let data_buffers = if has_out_of_line {
+        vec![string_array.values().clone()]
+    } else {
+        vec![]
+    };
+
+    unsafe {
+        Ok(Arc::new(StringViewArray::new_unchecked(
+            views_buf,
+            data_buffers,
+            string_array.nulls().cloned(),
+        )) as ArrayRef)
+    }
 }
 
 /// Inner implementation for the scalar-delimiter, scalar-position fast path.
@@ -437,6 +528,7 @@ fn split_part_scalar_view(
     let len = string_view_array.len();
     let mut views_buf = Vec::with_capacity(len);
     let views = string_view_array.views();
+    let mut has_out_of_line = false;
 
     if delimiter.is_empty() {
         // PostgreSQL: empty delimiter treats input as a single field.
@@ -446,7 +538,9 @@ fn split_part_scalar_view(
             if string_view_array.is_null(i) {
                 views_buf.push(0);
             } else if return_input {
-                views_buf.push(views[i]);
+                let string = string_view_array.value(i);
+                has_out_of_line |= string.len() > 12;
+                views_buf.push(substr_view(&views[i], string, 0));
             } else {
                 views_buf.push(empty_view);
             }
@@ -458,9 +552,13 @@ fn split_part_scalar_view(
             )
         })?;
         let finder = memmem::Finder::new(delimiter.as_bytes());
-        split_view_loop(string_view_array, views, &mut views_buf, |s| {
-            split_nth_finder(s, &finder, delimiter.len(), idx)
-        });
+        split_view_loop(
+            string_view_array,
+            views,
+            &mut views_buf,
+            &mut has_out_of_line,
+            |s| split_nth_finder(s, &finder, delimiter.len(), idx),
+        );
     } else {
         let idx: usize = (position.unsigned_abs() - 1).try_into().map_err(|_| {
             exec_datafusion_err!(
@@ -468,15 +566,24 @@ fn split_part_scalar_view(
             )
         })?;
         let finder_rev = memmem::FinderRev::new(delimiter.as_bytes());
-        split_view_loop(string_view_array, views, &mut views_buf, |s| {
-            rsplit_nth_finder(s, &finder_rev, delimiter.len(), idx)
-        });
+        split_view_loop(
+            string_view_array,
+            views,
+            &mut views_buf,
+            &mut has_out_of_line,
+            |s| rsplit_nth_finder(s, &finder_rev, delimiter.len(), idx),
+        );
     }
 
     let views_buf = ScalarBuffer::from(views_buf);
 
     // Nulls pass through unchanged, so we can use the input's null array.
     let nulls = string_view_array.nulls().cloned();
+    let data_buffers = if has_out_of_line {
+        string_view_array.data_buffers().to_vec()
+    } else {
+        vec![]
+    };
 
     // Safety: each view is either copied unchanged from the input, or built
     // by `substr_view` from a substring that is a contiguous sub-range of the
@@ -484,7 +591,7 @@ fn split_part_scalar_view(
     unsafe {
         Ok(Arc::new(StringViewArray::new_unchecked(
             views_buf,
-            string_view_array.data_buffers().to_vec(),
+            data_buffers,
             nulls,
         )) as ArrayRef)
     }
@@ -513,6 +620,7 @@ fn split_view_loop<F>(
     string_view_array: &StringViewArray,
     views: &[u128],
     views_buf: &mut Vec<u128>,
+    has_out_of_line: &mut bool,
     split_fn: F,
 ) where
     F: Fn(&str) -> Option<&str>,
@@ -526,11 +634,167 @@ fn split_view_loop<F>(
         let string = string_view_array.value(i);
         match split_fn(string) {
             Some(substr) => {
+                *has_out_of_line |= substr.len() > 12;
                 let start_offset = substr.as_ptr() as usize - string.as_ptr() as usize;
                 views_buf.push(substr_view(raw_view, substr, start_offset as u32));
             }
             None => views_buf.push(empty_view),
         }
+    }
+}
+
+fn split_part_at<'a>(
+    string: &'a str,
+    delimiter: &str,
+    position: i64,
+) -> Result<Option<&'a str>> {
+    match position.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            let idx: usize = (position - 1).try_into().map_err(|_| {
+                exec_datafusion_err!(
+                    "split_part index {position} exceeds maximum supported value"
+                )
+            })?;
+            if delimiter.is_empty() {
+                Ok((position == 1).then_some(string))
+            } else {
+                Ok(split_nth(string, delimiter, idx))
+            }
+        }
+        std::cmp::Ordering::Less => {
+            let idx: usize = (position.unsigned_abs() - 1).try_into().map_err(|_| {
+                exec_datafusion_err!(
+                    "split_part index {position} exceeds minimum supported value"
+                )
+            })?;
+            if delimiter.is_empty() {
+                Ok((position == -1).then_some(string))
+            } else {
+                Ok(rsplit_nth(string, delimiter, idx))
+            }
+        }
+        std::cmp::Ordering::Equal => exec_err!("field position must not be zero"),
+    }
+}
+
+fn split_part_view_impl<'a, DelimiterArrType>(
+    string_view_array: &StringViewArray,
+    delimiter_array: &DelimiterArrType,
+    n_array: &Int64Array,
+) -> Result<ArrayRef>
+where
+    DelimiterArrType: StringArrayType<'a>,
+{
+    let len = string_view_array.len();
+    let views = string_view_array.views();
+    let mut views_buf = Vec::with_capacity(len);
+    let mut has_out_of_line = false;
+    let empty_view = make_view(b"", 0, 0);
+    let nulls = NullBuffer::union(
+        NullBuffer::union(string_view_array.nulls(), delimiter_array.nulls()).as_ref(),
+        n_array.nulls(),
+    );
+
+    for i in 0..len {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+            views_buf.push(0);
+            continue;
+        }
+
+        let string = string_view_array.value(i);
+        let delimiter = delimiter_array.value(i);
+        let position = n_array.value(i);
+
+        match split_part_at(string, delimiter, position)? {
+            Some(substr) => {
+                let start_offset = substr.as_ptr() as usize - string.as_ptr() as usize;
+                has_out_of_line |= substr.len() > 12;
+                views_buf.push(substr_view(&views[i], substr, start_offset as u32));
+            }
+            None => views_buf.push(empty_view),
+        }
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let data_buffers = if has_out_of_line {
+        string_view_array.data_buffers().to_vec()
+    } else {
+        vec![]
+    };
+
+    unsafe {
+        Ok(Arc::new(StringViewArray::new_unchecked(
+            views_buf,
+            data_buffers,
+            nulls,
+        )) as ArrayRef)
+    }
+}
+
+fn split_part_generic_string<'a, T, DelimiterArrType>(
+    string_array: &'a GenericStringArray<T>,
+    delimiter_array: &DelimiterArrType,
+    n_array: &Int64Array,
+) -> Result<ArrayRef>
+where
+    T: OffsetSizeTrait,
+    DelimiterArrType: StringArrayType<'a>,
+{
+    if !values_fit_in_u32(string_array) {
+        return split_part_impl(
+            &string_array,
+            delimiter_array,
+            n_array,
+            StringViewBuilder::with_capacity(string_array.len()),
+        );
+    }
+
+    let len = string_array.len();
+    let offsets = string_array.value_offsets();
+    let mut views_buf = Vec::with_capacity(len);
+    let mut has_out_of_line = false;
+    let empty_view = make_view(b"", 0, 0);
+    let nulls = NullBuffer::union(
+        NullBuffer::union(string_array.nulls(), delimiter_array.nulls()).as_ref(),
+        n_array.nulls(),
+    );
+
+    for (i, source_offset) in offsets.iter().enumerate().take(len) {
+        if nulls.as_ref().is_some_and(|n| n.is_null(i)) {
+            views_buf.push(0);
+            continue;
+        }
+
+        let string = string_array.value(i);
+        let delimiter = delimiter_array.value(i);
+        let position = n_array.value(i);
+
+        match split_part_at(string, delimiter, position)? {
+            Some(substr) => {
+                let start_offset = substr.as_ptr() as usize - string.as_ptr() as usize;
+                has_out_of_line |= append_view_from_buffer(
+                    &mut views_buf,
+                    substr,
+                    source_offset.as_usize() + start_offset,
+                );
+            }
+            None => views_buf.push(empty_view),
+        }
+    }
+
+    let views_buf = ScalarBuffer::from(views_buf);
+    let data_buffers = if has_out_of_line {
+        vec![string_array.values().clone()]
+    } else {
+        vec![]
+    };
+
+    unsafe {
+        Ok(Arc::new(StringViewArray::new_unchecked(
+            views_buf,
+            data_buffers,
+            nulls,
+        )) as ArrayRef)
     }
 }
 
@@ -552,42 +816,7 @@ where
     {
         match (string, delimiter, n) {
             (Some(string), Some(delimiter), Some(n)) => {
-                let result = match n.cmp(&0) {
-                    std::cmp::Ordering::Greater => {
-                        let idx: usize = (n - 1).try_into().map_err(|_| {
-                            exec_datafusion_err!(
-                                "split_part index {n} exceeds maximum supported value"
-                            )
-                        })?;
-                        if delimiter.is_empty() {
-                            // Match PostgreSQL's behavior: empty delimiter
-                            // treats input as a single field, so only position
-                            // 1 returns data.
-                            (n == 1).then_some(string)
-                        } else {
-                            split_nth(string, delimiter, idx)
-                        }
-                    }
-                    std::cmp::Ordering::Less => {
-                        let idx: usize =
-                            (n.unsigned_abs() - 1).try_into().map_err(|_| {
-                                exec_datafusion_err!(
-                                    "split_part index {n} exceeds minimum supported value"
-                                )
-                            })?;
-                        if delimiter.is_empty() {
-                            // Match PostgreSQL's behavior: empty delimiter
-                            // treats input as a single field, so only position
-                            // -1 returns data.
-                            (n == -1).then_some(string)
-                        } else {
-                            rsplit_nth(string, delimiter, idx)
-                        }
-                    }
-                    std::cmp::Ordering::Equal => {
-                        return exec_err!("field position must not be zero");
-                    }
-                };
+                let result = split_part_at(string, delimiter, n)?;
                 builder.append_value(result.unwrap_or(""));
             }
             _ => builder.append_null(),
@@ -600,7 +829,7 @@ where
 #[cfg(test)]
 mod tests {
     use arrow::array::{Array, AsArray, StringArray, StringViewArray};
-    use arrow::datatypes::DataType::Utf8;
+    use arrow::datatypes::DataType::Utf8View;
 
     use datafusion_common::ScalarValue;
     use datafusion_common::{Result, exec_err};
@@ -622,8 +851,8 @@ mod tests {
             ],
             Ok(Some("def")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -636,8 +865,8 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -650,8 +879,8 @@ mod tests {
             ],
             Ok(Some("ghi")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -664,8 +893,8 @@ mod tests {
             ],
             exec_err!("field position must not be zero"),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -678,8 +907,8 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         // Edge cases with delimiters
         test_function!(
@@ -691,8 +920,8 @@ mod tests {
             ],
             Ok(Some("a")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -703,8 +932,8 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -715,8 +944,8 @@ mod tests {
             ],
             Ok(Some("a,b")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -727,8 +956,8 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -739,8 +968,8 @@ mod tests {
             ],
             Ok(Some("a,b")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -751,8 +980,8 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
 
         // Edge cases with delimiters with negative n
@@ -765,8 +994,8 @@ mod tests {
             ],
             Ok(Some("a,b")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -777,8 +1006,8 @@ mod tests {
             ],
             Ok(Some("a,b")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
         test_function!(
             SplitPartFunc::new(),
@@ -789,9 +1018,35 @@ mod tests {
             ],
             Ok(Some("")),
             &str,
-            Utf8,
-            StringArray
+            Utf8View,
+            StringViewArray
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_part_utf8_sliced() -> Result<()> {
+        use super::split_part_scalar_generic_string;
+
+        let strings: StringArray = vec![
+            Some("skip_this.value"),
+            Some("this_is_a_long_prefix.suffix"),
+            Some("short.val"),
+            Some("another_long_result.rest"),
+            None,
+        ]
+        .into_iter()
+        .collect();
+
+        let sliced = strings.slice(1, 4);
+        let result = split_part_scalar_generic_string(&sliced, ".", 1)?;
+        let result = result.as_string_view();
+        assert_eq!(result.len(), 4);
+        assert_eq!(result.value(0), "this_is_a_long_prefix");
+        assert_eq!(result.value(1), "short");
+        assert_eq!(result.value(2), "another_long_result");
+        assert!(result.is_null(3));
 
         Ok(())
     }

@@ -81,11 +81,7 @@ fn bench_split_part(
         .enumerate()
         .map(|(idx, arg)| Field::new(format!("arg_{idx}"), arg.data_type(), true).into())
         .collect();
-    let return_type = match args[0].data_type() {
-        DataType::Utf8View => DataType::Utf8View,
-        _ => DataType::Utf8,
-    };
-    let return_field = Field::new("f", return_type, true).into();
+    let return_field = Field::new("f", DataType::Utf8View, true).into();
 
     group.bench_function(BenchmarkId::new(name, tag), |b| {
         b.iter(|| {
@@ -258,6 +254,25 @@ fn criterion_benchmark(c: &mut Criterion) {
             &split_part_func,
             &config_options,
             "array_utf8_multi_char",
+            "pos_middle",
+            strings,
+            delimiter,
+            positions,
+        );
+    }
+
+    // Utf8, long strings, array args
+    {
+        let strings = gen_string_array(N_ROWS, 50, 16, ".", false);
+        let delimiters: StringArray = vec![Some("."); N_ROWS].into_iter().collect();
+        let delimiter = ColumnarValue::Array(Arc::new(delimiters) as ArrayRef);
+        let positions =
+            ColumnarValue::Array(Arc::new(Int64Array::from(vec![25; N_ROWS])));
+        bench_split_part(
+            &mut group,
+            &split_part_func,
+            &config_options,
+            "array_utf8_long_strings",
             "pos_middle",
             strings,
             delimiter,

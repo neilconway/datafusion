@@ -19,8 +19,8 @@
 //!
 //! [`ScalarSubqueryExec`] wraps a main input plan and a set of subquery plans.
 //! At execution time, it runs each subquery exactly once, extracts the scalar
-//! result, and populates the shared results container that
-//! [`ScalarSubqueryExpr`] instances read from by index.
+//! result, and populates a shared [`ScalarSubqueryResults`] container that
+//! [`ScalarSubqueryExpr`] instances hold directly and read from by index.
 //!
 //! [`ScalarSubqueryExpr`]: datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr
 
@@ -58,13 +58,17 @@ pub struct ScalarSubqueryLink {
 /// Manages execution of uncorrelated scalar subqueries for a single plan
 /// level.
 ///
+/// From a query-results perspective, this node is a pass-through: it yields
+/// the same batches as its main input and exists only to populate scalar
+/// subquery results as a side effect before those batches are produced.
+///
 /// The first child node is the **main input plan**, whose batches are passed
 /// through unchanged. The remaining children are **subquery plans**, each of
 /// which must produce exactly zero or one row. Before any batches from the main
 /// input are yielded, all subquery plans are executed and their scalar results
-/// are stored in a shared results container ([`ScalarSubqueryResults`]).
-/// [`ScalarSubqueryExpr`] nodes embedded in the main input's expressions read
-/// from this container by index.
+/// are stored in a shared [`ScalarSubqueryResults`] container owned by this
+/// node. [`ScalarSubqueryExpr`] nodes embedded in the main input's expressions
+/// hold the same container and read from it by index.
 ///
 /// All subqueries are evaluated eagerly when the first output partition is
 /// requested, before any rows from the main input are produced.
@@ -81,7 +85,8 @@ pub struct ScalarSubqueryExec {
     subqueries: Vec<ScalarSubqueryLink>,
     /// Shared one-time async computation of subquery results.
     subquery_future: Arc<OnceAsync<()>>,
-    /// Shared results container; same instance held by ScalarSubqueryExpr nodes.
+    /// Shared results container; the same `Arc` is also held by the
+    /// corresponding [`ScalarSubqueryExpr`] nodes in the input plan.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).
     cache: Arc<PlanProperties>,

@@ -85,8 +85,8 @@ pub struct ScalarSubqueryExec {
     subqueries: Vec<ScalarSubqueryLink>,
     /// Shared one-time async computation of subquery results.
     subquery_future: Arc<OnceAsync<()>>,
-    /// Shared results container; the same `Arc` is also held by the
-    /// corresponding [`ScalarSubqueryExpr`] nodes in the input plan.
+    /// Shared results container; the corresponding [`ScalarSubqueryExpr`]
+    /// nodes in the input plan hold the same underlying container.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).
     cache: Arc<PlanProperties>,
@@ -181,7 +181,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
         Ok(Arc::new(ScalarSubqueryExec::new(
             input,
             subqueries,
-            Arc::clone(&self.results),
+            self.results.clone(),
         )))
     }
 
@@ -191,7 +191,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         let subqueries = self.subqueries.clone();
-        let results = Arc::clone(&self.results);
+        let results = self.results.clone();
         let subquery_ctx = Arc::clone(&context);
         let mut subquery_future = self.subquery_future.try_once(move || {
             Ok(async move { execute_subqueries(subqueries, results, subquery_ctx).await })
@@ -259,15 +259,11 @@ async fn execute_subqueries(
     let futures = subqueries.iter().map(|sq| {
         let plan = Arc::clone(&sq.plan);
         let ctx = Arc::clone(&context);
-        let results = Arc::clone(&results);
+        let results = results.clone();
         let index = sq.index;
         async move {
             let value = execute_scalar_subquery(plan, ctx).await?;
-            if results[index].set(value).is_err() {
-                return internal_err!(
-                    "ScalarSubqueryExec: result for index {index} was already populated"
-                );
-            }
+            results.set(index, value)?;
             Ok(()) as Result<()>
         }
     });
@@ -316,7 +312,6 @@ mod tests {
     use super::*;
     use crate::test::{self, TestMemoryExec};
 
-    use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::test::exec::ErrorExec;
@@ -396,7 +391,7 @@ mod tests {
     }
 
     fn make_results(n: usize) -> ScalarSubqueryResults {
-        Arc::new((0..n).map(|_| OnceLock::new()).collect())
+        ScalarSubqueryResults::new(n)
     }
 
     #[tokio::test]
@@ -417,13 +412,13 @@ mod tests {
         let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
             test::aggr_test_schema(),
         ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], Arc::clone(&results));
+        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx)?;
         let _batches = crate::common::collect(stream).await?;
 
-        assert_eq!(results[0].get(), Some(&ScalarValue::Int32(Some(42))));
+        assert_eq!(results.get(0), Some(&ScalarValue::Int32(Some(42))));
         Ok(())
     }
 
@@ -445,13 +440,13 @@ mod tests {
         let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
             test::aggr_test_schema(),
         ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], Arc::clone(&results));
+        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx)?;
         let _batches = crate::common::collect(stream).await?;
 
-        assert_eq!(results[0].get(), Some(&ScalarValue::Int64(None)));
+        assert_eq!(results.get(0), Some(&ScalarValue::Int64(None)));
         Ok(())
     }
 
@@ -473,7 +468,7 @@ mod tests {
         let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
             test::aggr_test_schema(),
         ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], Arc::clone(&results));
+        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, ctx)?;

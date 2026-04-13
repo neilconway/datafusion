@@ -51,9 +51,7 @@ use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
-use datafusion_expr::execution_props::{
-    ScalarSubqueryResults, new_scalar_subquery_results,
-};
+use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
@@ -2274,9 +2272,9 @@ impl protobuf::PhysicalPlanNode {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // First, deserialize the main input plan. We set up the subquery results
         // container first, so that ScalarSubqueryExpr nodes can reference it.
-        let subquery_results = new_scalar_subquery_results(sq.subqueries.len());
-        let prev = proto_converter
-            .set_scalar_subquery_results(Some(Arc::clone(&subquery_results)));
+        let subquery_results = ScalarSubqueryResults::new(sq.subqueries.len());
+        let prev =
+            proto_converter.set_scalar_subquery_results(Some(subquery_results.clone()));
         let input = into_physical_plan(&sq.input, ctx, codec, proto_converter);
         proto_converter.set_scalar_subquery_results(prev);
         let input = input?;

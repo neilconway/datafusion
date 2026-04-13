@@ -21,6 +21,9 @@ use datafusion_common::HashMap;
 use datafusion_common::ScalarValue;
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::{Result, internal_err};
+use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
 /// Shared results container for uncorrelated scalar subqueries.
@@ -28,11 +31,65 @@ use std::sync::{Arc, OnceLock};
 /// Each entry corresponds to one scalar subquery, identified by its index.
 /// The `OnceLock` is populated at execution time by `ScalarSubqueryExec` and
 /// read by `ScalarSubqueryExpr` instances that share this container.
-pub type ScalarSubqueryResults = Arc<Vec<OnceLock<ScalarValue>>>;
+#[derive(Clone, Default)]
+pub struct ScalarSubqueryResults {
+    slots: Arc<Vec<OnceLock<ScalarValue>>>,
+}
 
-/// Creates a [`ScalarSubqueryResults`] container with `n` empty slots.
-pub fn new_scalar_subquery_results(n: usize) -> ScalarSubqueryResults {
-    Arc::new((0..n).map(|_| OnceLock::new()).collect())
+impl ScalarSubqueryResults {
+    /// Creates a new shared results container with `n` empty slots.
+    pub fn new(n: usize) -> Self {
+        Self {
+            slots: Arc::new((0..n).map(|_| OnceLock::new()).collect()),
+        }
+    }
+
+    /// Returns the scalar value stored at `index`, if it has been populated.
+    pub fn get(&self, index: usize) -> Option<&ScalarValue> {
+        self.slots.get(index).and_then(OnceLock::get)
+    }
+
+    /// Stores `value` in the slot at `index`.
+    pub fn set(&self, index: usize, value: ScalarValue) -> Result<()> {
+        let Some(slot) = self.slots.get(index) else {
+            return internal_err!(
+                "ScalarSubqueryResults: result index {index} is out of bounds"
+            );
+        };
+
+        if slot.set(value).is_err() {
+            return internal_err!(
+                "ScalarSubqueryResults: result for index {index} was already populated"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Returns true if `this` and `other` point to the same shared container.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        Arc::ptr_eq(&this.slots, &other.slots)
+    }
+}
+
+impl fmt::Debug for ScalarSubqueryResults {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.slots.fmt(f)
+    }
+}
+
+impl PartialEq for ScalarSubqueryResults {
+    fn eq(&self, other: &Self) -> bool {
+        Self::ptr_eq(self, other)
+    }
+}
+
+impl Eq for ScalarSubqueryResults {}
+
+impl Hash for ScalarSubqueryResults {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.slots).hash(state);
+    }
 }
 
 /// Holds per-query execution properties and data (such as statement
@@ -78,7 +135,7 @@ impl ExecutionProps {
             config_options: None,
             var_providers: None,
             subquery_indexes: HashMap::new(),
-            subquery_results: Arc::new(vec![]),
+            subquery_results: ScalarSubqueryResults::default(),
         }
     }
 
@@ -143,6 +200,7 @@ impl ExecutionProps {
 #[cfg(test)]
 mod test {
     use super::*;
+
     #[test]
     fn debug() {
         let props = ExecutionProps::new();
@@ -150,5 +208,17 @@ mod test {
             "ExecutionProps { query_execution_start_time: None, alias_generator: AliasGenerator { next_id: 1 }, config_options: None, var_providers: None, subquery_indexes: {}, subquery_results: [] }",
             format!("{props:?}")
         );
+    }
+
+    #[test]
+    fn scalar_subquery_results_set_and_get() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        assert_eq!(results.get(0), None);
+
+        results.set(0, ScalarValue::Int32(Some(42)))?;
+        assert_eq!(results.get(0), Some(&ScalarValue::Int32(Some(42))));
+        assert!(results.set(0, ScalarValue::Int32(Some(7))).is_err());
+
+        Ok(())
     }
 }

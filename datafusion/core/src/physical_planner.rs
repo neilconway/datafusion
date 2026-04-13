@@ -79,9 +79,7 @@ use datafusion_common::{
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::dml::{CopyTo, InsertOp};
-use datafusion_expr::execution_props::{
-    ScalarSubqueryResults, new_scalar_subquery_results,
-};
+use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_expr::expr::{
     AggregateFunction, AggregateFunctionParams, Alias, GroupingSet, NullTreatment,
     WindowFunction, WindowFunctionParams, physical_name,
@@ -452,13 +450,13 @@ impl DefaultPhysicalPlanner {
             // context rather than on ExecutionProps. It's here because
             // `create_physical_expr` only receives `&ExecutionProps`, and
             // changing that signature would be a breaking public API change.
-            let results = new_scalar_subquery_results(links.len());
+            let results = ScalarSubqueryResults::new(links.len());
             let session_state = if links.is_empty() {
                 Cow::Borrowed(session_state)
             } else {
                 let mut owned = session_state.clone();
                 owned.execution_props_mut().subquery_indexes = index_map;
-                owned.execution_props_mut().subquery_results = Arc::clone(&results);
+                owned.execution_props_mut().subquery_results = results.clone();
                 Cow::Owned(owned)
             };
 

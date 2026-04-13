@@ -426,7 +426,7 @@ pub fn create_physical_expr(
                         dt,
                         nullable,
                         index,
-                        Arc::clone(&execution_props.subquery_results),
+                        execution_props.subquery_results.clone(),
                     )))
                 }
                 None => {

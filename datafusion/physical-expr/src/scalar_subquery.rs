@@ -23,11 +23,12 @@
 use std::any::Any;
 use std::fmt;
 use std::hash::Hash;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
-use datafusion_common::{Result, ScalarValue, internal_datafusion_err};
+use datafusion_common::{Result, internal_datafusion_err};
+use datafusion_expr::execution_props::ScalarSubqueryResults;
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -47,7 +48,7 @@ pub struct ScalarSubqueryExpr {
     /// Index of this subquery in the shared results container.
     index: usize,
     /// Shared results container populated by `ScalarSubqueryExec`.
-    results: Arc<Vec<OnceLock<ScalarValue>>>,
+    results: ScalarSubqueryResults,
 }
 
 impl ScalarSubqueryExpr {
@@ -55,7 +56,7 @@ impl ScalarSubqueryExpr {
         data_type: DataType,
         nullable: bool,
         index: usize,
-        results: Arc<Vec<OnceLock<ScalarValue>>>,
+        results: ScalarSubqueryResults,
     ) -> Self {
         Self {
             data_type,
@@ -78,14 +79,14 @@ impl ScalarSubqueryExpr {
         self.index
     }
 
-    pub fn results(&self) -> &Arc<Vec<OnceLock<ScalarValue>>> {
+    pub fn results(&self) -> &ScalarSubqueryResults {
         &self.results
     }
 }
 
 impl fmt::Display for ScalarSubqueryExpr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.results.get(self.index).and_then(|slot| slot.get()) {
+        match self.results.get(self.index) {
             Some(v) => write!(f, "scalar_subquery({v})"),
             None => write!(f, "scalar_subquery(<pending>)"),
         }
@@ -96,14 +97,14 @@ impl fmt::Display for ScalarSubqueryExpr {
 // container and have the same index.
 impl Hash for ScalarSubqueryExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        Arc::as_ptr(&self.results).hash(state);
+        self.results.hash(state);
         self.index.hash(state);
     }
 }
 
 impl PartialEq for ScalarSubqueryExpr {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.results, &other.results) && self.index == other.index
+        self.results == other.results && self.index == other.index
     }
 }
 
@@ -123,15 +124,11 @@ impl PhysicalExpr for ScalarSubqueryExpr {
     }
 
     fn evaluate(&self, _batch: &RecordBatch) -> Result<ColumnarValue> {
-        let value = self
-            .results
-            .get(self.index)
-            .and_then(|slot| slot.get())
-            .ok_or_else(|| {
-                internal_datafusion_err!(
-                    "ScalarSubqueryExpr evaluated before the subquery was executed"
-                )
-            })?;
+        let value = self.results.get(self.index).ok_or_else(|| {
+            internal_datafusion_err!(
+                "ScalarSubqueryExpr evaluated before the subquery was executed"
+            )
+        })?;
         Ok(ColumnarValue::Scalar(value.clone()))
     }
 
@@ -161,20 +158,16 @@ mod tests {
 
     use arrow::array::Int32Array;
     use arrow::datatypes::Field;
+    use datafusion_common::ScalarValue;
 
-    fn make_results(values: Vec<Option<ScalarValue>>) -> Arc<Vec<OnceLock<ScalarValue>>> {
-        Arc::new(
-            values
-                .into_iter()
-                .map(|v| {
-                    let lock = OnceLock::new();
-                    if let Some(val) = v {
-                        lock.set(val).unwrap();
-                    }
-                    lock
-                })
-                .collect(),
-        )
+    fn make_results(values: Vec<Option<ScalarValue>>) -> ScalarSubqueryResults {
+        let results = ScalarSubqueryResults::new(values.len());
+        for (index, value) in values.into_iter().enumerate() {
+            if let Some(value) = value {
+                results.set(index, value).unwrap();
+            }
+        }
+        results
     }
 
     #[test]
@@ -200,7 +193,7 @@ mod tests {
         let a = Int32Array::from(vec![1]);
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
 
-        let results = Arc::new(vec![OnceLock::new()]);
+        let results = ScalarSubqueryResults::new(1);
         let expr = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results);
 
         let result = expr.evaluate(&batch);
@@ -211,11 +204,9 @@ mod tests {
     fn test_identity_equality() {
         let results = make_results(vec![None, None]);
 
-        let e1a =
-            ScalarSubqueryExpr::new(DataType::Int32, false, 0, Arc::clone(&results));
-        let e1b =
-            ScalarSubqueryExpr::new(DataType::Int32, false, 0, Arc::clone(&results));
-        let e2 = ScalarSubqueryExpr::new(DataType::Int32, false, 1, Arc::clone(&results));
+        let e1a = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results.clone());
+        let e1b = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results.clone());
+        let e2 = ScalarSubqueryExpr::new(DataType::Int32, false, 1, results.clone());
 
         // Same container + same index → equal
         assert_eq!(e1a, e1b);

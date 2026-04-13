@@ -18,7 +18,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::vec;
 
 use arrow::array::RecordBatch;
@@ -105,7 +105,7 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue,
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF,
-    WindowFrame, WindowFrameBound, WindowUDF,
+    WindowFrame, WindowFrameBound, WindowUDF, execution_props::ScalarSubqueryResults,
 };
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
@@ -3196,9 +3196,7 @@ fn roundtrip_lead_with_default_value() -> Result<()> {
 #[test]
 fn roundtrip_scalar_subquery_exec() -> Result<()> {
     let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-
-    // Create a shared results container with one slot.
-    let results = Arc::new(vec![OnceLock::new()]);
+    let results = ScalarSubqueryResults::new(1);
 
     // Build the input plan: a filter whose predicate references the
     // scalar subquery result via ScalarSubqueryExpr.
@@ -3206,7 +3204,7 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         DataType::Int64,
         true,
         0,
-        Arc::clone(&results),
+        results.clone(),
     ));
     let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
     let filter =
@@ -3272,7 +3270,7 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         .expect("expected ScalarSubqueryExpr");
 
     assert!(
-        Arc::ptr_eq(exec_results, deserialized_sq_expr.results()),
+        ScalarSubqueryResults::ptr_eq(exec_results, deserialized_sq_expr.results()),
         "ScalarSubqueryExpr should share the same results container as ScalarSubqueryExec"
     );
     Ok(())

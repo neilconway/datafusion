@@ -129,7 +129,7 @@ impl PhysicalExpr for ScalarSubqueryExpr {
                 "ScalarSubqueryExpr evaluated before the subquery was executed"
             )
         })?;
-        Ok(ColumnarValue::Scalar(value.clone()))
+        Ok(ColumnarValue::Scalar(value))
     }
 
     fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {

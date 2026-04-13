@@ -24,29 +24,31 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::{Result, internal_err};
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// Shared results container for uncorrelated scalar subqueries.
 ///
 /// Each entry corresponds to one scalar subquery, identified by its index.
-/// The `OnceLock` is populated at execution time by `ScalarSubqueryExec` and
-/// read by `ScalarSubqueryExpr` instances that share this container.
+/// Each slot is populated at execution time by `ScalarSubqueryExec`, read by
+/// `ScalarSubqueryExpr` instances that share this container, and cleared when
+/// the plan is reset for re-execution.
 #[derive(Clone, Default)]
 pub struct ScalarSubqueryResults {
-    slots: Arc<Vec<OnceLock<ScalarValue>>>,
+    slots: Arc<Vec<Mutex<Option<ScalarValue>>>>,
 }
 
 impl ScalarSubqueryResults {
     /// Creates a new shared results container with `n` empty slots.
     pub fn new(n: usize) -> Self {
         Self {
-            slots: Arc::new((0..n).map(|_| OnceLock::new()).collect()),
+            slots: Arc::new((0..n).map(|_| Mutex::new(None)).collect()),
         }
     }
 
     /// Returns the scalar value stored at `index`, if it has been populated.
-    pub fn get(&self, index: usize) -> Option<&ScalarValue> {
-        self.slots.get(index).and_then(OnceLock::get)
+    pub fn get(&self, index: usize) -> Option<ScalarValue> {
+        let slot = self.slots.get(index)?;
+        slot.lock().unwrap().clone()
     }
 
     /// Stores `value` in the slot at `index`.
@@ -57,13 +59,22 @@ impl ScalarSubqueryResults {
             );
         };
 
-        if slot.set(value).is_err() {
+        let mut slot = slot.lock().unwrap();
+        if slot.is_some() {
             return internal_err!(
                 "ScalarSubqueryResults: result for index {index} was already populated"
             );
         }
+        *slot = Some(value);
 
         Ok(())
+    }
+
+    /// Clears all populated results so the container can be reused.
+    pub fn clear(&self) {
+        for slot in self.slots.iter() {
+            *slot.lock().unwrap() = None;
+        }
     }
 
     /// Returns true if `this` and `other` point to the same shared container.
@@ -74,7 +85,9 @@ impl ScalarSubqueryResults {
 
 impl fmt::Debug for ScalarSubqueryResults {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.slots.fmt(f)
+        f.debug_list()
+            .entries(self.slots.iter().map(|slot| slot.lock().unwrap().clone()))
+            .finish()
     }
 }
 
@@ -216,8 +229,22 @@ mod test {
         assert_eq!(results.get(0), None);
 
         results.set(0, ScalarValue::Int32(Some(42)))?;
-        assert_eq!(results.get(0), Some(&ScalarValue::Int32(Some(42))));
+        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
         assert!(results.set(0, ScalarValue::Int32(Some(7))).is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_subquery_results_clear() -> Result<()> {
+        let results = ScalarSubqueryResults::new(1);
+        results.set(0, ScalarValue::Int32(Some(42)))?;
+
+        results.clear();
+
+        assert_eq!(results.get(0), None);
+        results.set(0, ScalarValue::Int32(Some(7)))?;
+        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(7))));
 
         Ok(())
     }

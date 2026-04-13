@@ -323,9 +323,7 @@ mod tests {
     use super::*;
     use crate::test::{self, TestMemoryExec};
     use crate::{
-        Partitioning,
-        execution_plan::{Boundedness, EmissionType, SchedulingType, reset_plan_states},
-        memory::MemoryStream,
+        execution_plan::reset_plan_states,
         projection::{ProjectionExec, ProjectionExpr},
     };
 
@@ -333,11 +331,9 @@ mod tests {
 
     use crate::test::exec::ErrorExec;
     use arrow::array::{Int32Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
-    use datafusion_physical_expr::{
-        EquivalenceProperties, scalar_subquery::ScalarSubqueryExpr,
-    };
+    use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 
     #[derive(Debug)]
     struct CountingExec {
@@ -412,98 +408,6 @@ mod tests {
 
     fn make_results(n: usize) -> ScalarSubqueryResults {
         ScalarSubqueryResults::new(n)
-    }
-
-    #[derive(Debug)]
-    struct IncrementingScalarExec {
-        schema: SchemaRef,
-        execute_calls: Arc<AtomicUsize>,
-        cache: Arc<PlanProperties>,
-    }
-
-    impl IncrementingScalarExec {
-        fn new(execute_calls: Arc<AtomicUsize>) -> Self {
-            let schema =
-                Arc::new(Schema::new(vec![Field::new("sq", DataType::Int32, false)]));
-            let cache = PlanProperties::new(
-                EquivalenceProperties::new(Arc::clone(&schema)),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Incremental,
-                Boundedness::Bounded,
-            )
-            .with_scheduling_type(SchedulingType::Cooperative);
-            Self {
-                schema,
-                execute_calls,
-                cache: Arc::new(cache),
-            }
-        }
-    }
-
-    impl DisplayAs for IncrementingScalarExec {
-        fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
-            match t {
-                DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                    write!(f, "IncrementingScalarExec")
-                }
-                DisplayFormatType::TreeRender => write!(f, ""),
-            }
-        }
-    }
-
-    impl ExecutionPlan for IncrementingScalarExec {
-        fn name(&self) -> &'static str {
-            "IncrementingScalarExec"
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            &self.cache
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            children: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            if !children.is_empty() {
-                return internal_err!(
-                    "IncrementingScalarExec expected no children, got {}",
-                    children.len()
-                );
-            }
-            Ok(self)
-        }
-
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&dyn PhysicalExpr) -> Result<TreeNodeRecursion>,
-        ) -> Result<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
-        fn execute(
-            &self,
-            partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            if partition != 0 {
-                return internal_err!(
-                    "IncrementingScalarExec invalid partition {partition}"
-                );
-            }
-
-            let value = self.execute_calls.fetch_add(1, Ordering::SeqCst) as i32 + 1;
-            let batch = RecordBatch::try_new(
-                Arc::clone(&self.schema),
-                vec![Arc::new(Int32Array::from(vec![value]))],
-            )?;
-            let stream =
-                MemoryStream::try_new(vec![batch], Arc::clone(&self.schema), None)?;
-            Ok(Box::pin(crate::coop::cooperative(stream)))
-        }
     }
 
     fn extract_single_int32_value(batches: &[RecordBatch]) -> i32 {
@@ -639,8 +543,16 @@ mod tests {
     async fn test_reset_state_clears_results_and_reexecutes_subqueries() -> Result<()> {
         let execute_calls = Arc::new(AtomicUsize::new(0));
         let results = make_results(1);
-        let subquery_plan =
-            Arc::new(IncrementingScalarExec::new(Arc::clone(&execute_calls)));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("sq", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![42]))],
+        )?;
+        let subquery_plan = Arc::new(CountingExec::new(
+            make_subquery_plan(vec![batch]),
+            Arc::clone(&execute_calls),
+        ));
         let sq = ScalarSubqueryLink {
             plan: subquery_plan,
             index: 0,
@@ -669,8 +581,8 @@ mod tests {
         let batches =
             crate::common::collect(exec.execute(0, Arc::new(TaskContext::default()))?)
                 .await?;
-        assert_eq!(extract_single_int32_value(&batches), 1);
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(1))));
+        assert_eq!(extract_single_int32_value(&batches), 42);
+        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
 
         let reset_exec = reset_plan_states(Arc::clone(&exec))?;
         assert_eq!(results.get(0), None);
@@ -679,8 +591,8 @@ mod tests {
             reset_exec.execute(0, Arc::new(TaskContext::default()))?,
         )
         .await?;
-        assert_eq!(extract_single_int32_value(&reset_batches), 2);
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(2))));
+        assert_eq!(extract_single_int32_value(&reset_batches), 42);
+        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
         assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
 
         Ok(())

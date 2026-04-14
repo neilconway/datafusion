@@ -110,6 +110,7 @@ use datafusion_physical_plan::unnest::ListUnnest;
 use async_trait::async_trait;
 use datafusion_physical_plan::async_func::{AsyncFuncExec, AsyncMapper};
 use futures::{StreamExt, TryStreamExt};
+use indexmap::IndexSet;
 use itertools::{Itertools, multiunzip};
 use log::debug;
 use tokio::sync::Mutex;
@@ -388,16 +389,14 @@ impl DefaultPhysicalPlanner {
     /// at its level and then recurses in order to handle nested subqueries.
     #[allow(clippy::allow_attributes, clippy::mutable_key_type)] // Subquery contains Arc with interior mutability but is intentionally used as hash key
     fn collect_scalar_subqueries(plan: &LogicalPlan) -> Vec<Subquery> {
-        let mut subqueries = Vec::new();
-        let mut seen = HashSet::new();
+        let mut subqueries = IndexSet::new();
         plan.apply(|node| {
             for expr in node.expressions() {
                 expr.apply(|e| {
                     if let Expr::ScalarSubquery(sq) = e
                         && sq.outer_ref_columns.is_empty()
-                        && seen.insert(sq.clone())
                     {
-                        subqueries.push(sq.clone());
+                        subqueries.insert(sq.clone());
                     }
                     Ok(TreeNodeRecursion::Continue)
                 })
@@ -406,7 +405,7 @@ impl DefaultPhysicalPlanner {
             Ok(TreeNodeRecursion::Continue)
         })
         .expect("infallible");
-        subqueries
+        subqueries.into_iter().collect()
     }
 
     /// Create a physical plan from a logical plan.

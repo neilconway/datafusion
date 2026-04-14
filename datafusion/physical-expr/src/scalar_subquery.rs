@@ -87,8 +87,8 @@ impl fmt::Display for ScalarSubqueryExpr {
     }
 }
 
-// Two ScalarSubqueryExprs are the "same" if they share the same results
-// container and have the same index.
+// Two ScalarSubqueryExprs are considered the "same" if they refer to the
+// same underlying shared results container and the same index within it.
 impl Hash for ScalarSubqueryExpr {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.results.hash(state);

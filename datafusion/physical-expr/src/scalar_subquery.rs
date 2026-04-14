@@ -16,9 +16,6 @@
 // under the License.
 
 //! Physical expression for uncorrelated scalar subqueries.
-//!
-//! [`ScalarSubqueryExpr`] reads a cached [`ScalarValue`] that is populated
-//! at execution time by `ScalarSubqueryExec`.
 
 use std::any::Any;
 use std::fmt;
@@ -36,8 +33,8 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 /// A physical expression whose value is provided by a scalar subquery.
 ///
 /// Subquery execution is handled by `ScalarSubqueryExec`, which stores the
-/// result in a shared results container. This expression simply reads from the
-/// shared results container at the appropriate index.
+/// result in a shared [`ScalarSubqueryResults`] container. This expression
+/// simply reads from that container at the appropriate index.
 ///
 /// If the same subquery appears multiple times in a query, there will be
 /// multiple `ScalarSubqueryExpr` with the same result index.

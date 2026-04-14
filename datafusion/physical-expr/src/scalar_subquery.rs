@@ -35,9 +35,6 @@ use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 /// Subquery execution is handled by `ScalarSubqueryExec`, which stores the
 /// result in a shared [`ScalarSubqueryResults`] container. This expression
 /// simply reads from that container at the appropriate index.
-///
-/// If the same subquery appears multiple times in a query, there will be
-/// multiple `ScalarSubqueryExpr` with the same result index.
 #[derive(Debug)]
 pub struct ScalarSubqueryExpr {
     data_type: DataType,

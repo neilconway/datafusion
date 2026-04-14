@@ -441,8 +441,8 @@ impl DefaultPhysicalPlanner {
                 .plan_scalar_subqueries(&all_sq_refs, session_state)
                 .await?;
 
-            // Create the shared results container and register it in
-            // ExecutionProps so that `create_physical_expr` can resolve
+            // Create the shared `ScalarSubqueryResults` container and register
+            // it in ExecutionProps so that `create_physical_expr` can resolve
             // `Expr::ScalarSubquery` into `ScalarSubqueryExpr` nodes. We clone
             // the SessionState so these are available throughout physical
             // planning without mutating the caller's state.

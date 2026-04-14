@@ -335,6 +335,11 @@ mod tests {
     use arrow::record_batch::RecordBatch;
     use datafusion_physical_expr::scalar_subquery::ScalarSubqueryExpr;
 
+    enum ExpectedSubqueryResult {
+        Value(ScalarValue),
+        Error(&'static str),
+    }
+
     #[derive(Debug)]
     struct CountingExec {
         inner: Arc<dyn ExecutionPlan>,
@@ -406,8 +411,53 @@ mod tests {
         TestMemoryExec::try_new_exec(&[batches], schema, None).unwrap()
     }
 
-    fn make_results(n: usize) -> ScalarSubqueryResults {
-        ScalarSubqueryResults::new(n)
+    fn int32_batch(values: Vec<i32>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values))]).unwrap()
+    }
+
+    fn empty_int64_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![] as Vec<i64>))])
+            .unwrap()
+    }
+
+    fn placeholder_input() -> Arc<dyn ExecutionPlan> {
+        Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
+            test::aggr_test_schema(),
+        ))
+    }
+
+    fn single_subquery_exec(
+        input: Arc<dyn ExecutionPlan>,
+        subquery_plan: Arc<dyn ExecutionPlan>,
+        results: ScalarSubqueryResults,
+    ) -> ScalarSubqueryExec {
+        ScalarSubqueryExec::new(
+            input,
+            vec![ScalarSubqueryLink {
+                plan: subquery_plan,
+                index: 0,
+            }],
+            results,
+        )
+    }
+
+    fn scalar_subquery_projection_input(
+        results: ScalarSubqueryResults,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(ProjectionExec::try_new(
+            vec![ProjectionExpr {
+                expr: Arc::new(ScalarSubqueryExpr::new(
+                    DataType::Int32,
+                    false,
+                    0,
+                    results,
+                )),
+                alias: "sq".to_string(),
+            }],
+            placeholder_input(),
+        )?))
     }
 
     fn extract_single_int32_value(batches: &[RecordBatch]) -> i32 {
@@ -422,91 +472,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_single_row_subquery() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![42]))],
-        )?;
+    async fn test_execute_scalar_subquery_row_count_semantics() -> Result<()> {
+        for (name, plan, expected) in [
+            (
+                "single_row",
+                make_subquery_plan(vec![int32_batch(vec![42])]),
+                ExpectedSubqueryResult::Value(ScalarValue::Int32(Some(42))),
+            ),
+            (
+                "zero_rows",
+                make_subquery_plan(vec![empty_int64_batch()]),
+                ExpectedSubqueryResult::Value(ScalarValue::Int64(None)),
+            ),
+            (
+                "multiple_rows",
+                make_subquery_plan(vec![int32_batch(vec![1, 2, 3])]),
+                ExpectedSubqueryResult::Error("more than one row"),
+            ),
+        ] {
+            let actual =
+                execute_scalar_subquery(plan, Arc::new(TaskContext::default())).await;
+            match expected {
+                ExpectedSubqueryResult::Value(expected) => {
+                    assert_eq!(actual?, expected, "{name}");
+                }
+                ExpectedSubqueryResult::Error(expected) => {
+                    let err = actual.expect_err(name);
+                    assert!(
+                        err.to_string().contains(expected),
+                        "{name}: expected error containing '{expected}', got {err}"
+                    );
+                }
+            }
+        }
 
-        let results = make_results(1);
-        let subquery_plan = make_subquery_plan(vec![batch]);
-        let sq = ScalarSubqueryLink {
-            plan: subquery_plan,
-            index: 0,
-        };
-
-        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-            test::aggr_test_schema(),
-        ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
-
-        let ctx = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, ctx)?;
-        let _batches = crate::common::collect(stream).await?;
-
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_zero_row_subquery_returns_null() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int64Array::from(vec![] as Vec<i64>))],
-        )?;
-
-        let results = make_results(1);
-        let subquery_plan = make_subquery_plan(vec![batch]);
-        let sq = ScalarSubqueryLink {
-            plan: subquery_plan,
-            index: 0,
-        };
-
-        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-            test::aggr_test_schema(),
-        ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
-
-        let ctx = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, ctx)?;
-        let _batches = crate::common::collect(stream).await?;
-
-        assert_eq!(results.get(0), Some(ScalarValue::Int64(None)));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_multi_row_subquery_errors() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )?;
-
-        let results = make_results(1);
-        let subquery_plan = make_subquery_plan(vec![batch]);
-        let sq = ScalarSubqueryLink {
-            plan: subquery_plan,
-            index: 0,
-        };
-
-        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-            test::aggr_test_schema(),
-        ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results.clone());
-
-        let ctx = Arc::new(TaskContext::default());
-        let stream = exec.execute(0, ctx)?;
-        let result = crate::common::collect(stream).await;
-
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("more than one row"),
-            "Expected 'more than one row' error, got: {err_msg}"
-        );
         Ok(())
     }
 
@@ -517,16 +516,11 @@ mod tests {
             Arc::new(ErrorExec::new()),
             Arc::clone(&execute_calls),
         ));
-        let results = make_results(1);
-        let sq = ScalarSubqueryLink {
-            plan: subquery_plan,
-            index: 0,
-        };
-
-        let main_input = Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-            test::aggr_test_schema(),
-        ));
-        let exec = ScalarSubqueryExec::new(main_input, vec![sq], results);
+        let exec = single_subquery_exec(
+            placeholder_input(),
+            subquery_plan,
+            ScalarSubqueryResults::new(1),
+        );
 
         let ctx = Arc::new(TaskContext::default());
         let stream = exec.execute(0, Arc::clone(&ctx))?;
@@ -542,39 +536,14 @@ mod tests {
     #[tokio::test]
     async fn test_reset_state_clears_results_and_reexecutes_subqueries() -> Result<()> {
         let execute_calls = Arc::new(AtomicUsize::new(0));
-        let results = make_results(1);
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("sq", DataType::Int32, false)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&schema),
-            vec![Arc::new(Int32Array::from(vec![42]))],
-        )?;
+        let results = ScalarSubqueryResults::new(1);
         let subquery_plan = Arc::new(CountingExec::new(
-            make_subquery_plan(vec![batch]),
+            make_subquery_plan(vec![int32_batch(vec![42])]),
             Arc::clone(&execute_calls),
         ));
-        let sq = ScalarSubqueryLink {
-            plan: subquery_plan,
-            index: 0,
-        };
-
-        let main_input = Arc::new(ProjectionExec::try_new(
-            vec![ProjectionExpr {
-                expr: Arc::new(ScalarSubqueryExpr::new(
-                    DataType::Int32,
-                    false,
-                    0,
-                    results.clone(),
-                )),
-                alias: "sq".to_string(),
-            }],
-            Arc::new(crate::placeholder_row::PlaceholderRowExec::new(
-                test::aggr_test_schema(),
-            )),
-        )?);
-        let exec: Arc<dyn ExecutionPlan> = Arc::new(ScalarSubqueryExec::new(
-            main_input,
-            vec![sq],
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(single_subquery_exec(
+            scalar_subquery_projection_input(results.clone())?,
+            subquery_plan,
             results.clone(),
         ));
 

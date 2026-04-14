@@ -512,7 +512,7 @@ pub fn serialize_physical_expr_with_converter(
                 protobuf::PhysicalScalarSubqueryExprNode {
                     data_type: Some(expr.data_type().try_into()?),
                     nullable: expr.nullable(),
-                    index: expr.index() as u32,
+                    index: expr.index().as_usize() as u32,
                 },
             )),
         })

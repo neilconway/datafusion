@@ -26,6 +26,22 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
+/// Index of a scalar subquery within a [`ScalarSubqueryResults`] container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SubqueryIndex(usize);
+
+impl SubqueryIndex {
+    /// Creates a new subquery index.
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    /// Returns the underlying slot index.
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
 /// Shared results container for uncorrelated scalar subqueries.
 ///
 /// Each entry corresponds to one scalar subquery, identified by its index.
@@ -46,23 +62,25 @@ impl ScalarSubqueryResults {
     }
 
     /// Returns the scalar value stored at `index`, if it has been populated.
-    pub fn get(&self, index: usize) -> Option<ScalarValue> {
-        let slot = self.slots.get(index)?;
+    pub fn get(&self, index: SubqueryIndex) -> Option<ScalarValue> {
+        let slot = self.slots.get(index.as_usize())?;
         slot.lock().unwrap().clone()
     }
 
     /// Stores `value` in the slot at `index`.
-    pub fn set(&self, index: usize, value: ScalarValue) -> Result<()> {
-        let Some(slot) = self.slots.get(index) else {
+    pub fn set(&self, index: SubqueryIndex, value: ScalarValue) -> Result<()> {
+        let Some(slot) = self.slots.get(index.as_usize()) else {
             return internal_err!(
-                "ScalarSubqueryResults: result index {index} is out of bounds"
+                "ScalarSubqueryResults: result index {} is out of bounds",
+                index.as_usize()
             );
         };
 
         let mut slot = slot.lock().unwrap();
         if slot.is_some() {
             return internal_err!(
-                "ScalarSubqueryResults: result for index {index} was already populated"
+                "ScalarSubqueryResults: result for index {} was already populated",
+                index.as_usize()
             );
         }
         *slot = Some(value);
@@ -127,7 +145,7 @@ pub struct ExecutionProps {
     pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
     /// Maps each logical `Subquery` to its index in `subquery_results`.
     /// Populated by the physical planner before calling `create_physical_expr`.
-    pub subquery_indexes: HashMap<crate::logical_plan::Subquery, usize>,
+    pub subquery_indexes: HashMap<crate::logical_plan::Subquery, SubqueryIndex>,
     /// Shared results container for uncorrelated scalar subquery values.
     /// Populated at execution time by `ScalarSubqueryExec`.
     pub subquery_results: ScalarSubqueryResults,
@@ -226,11 +244,18 @@ mod test {
     #[test]
     fn scalar_subquery_results_set_and_get() -> Result<()> {
         let results = ScalarSubqueryResults::new(1);
-        assert_eq!(results.get(0), None);
+        assert_eq!(results.get(SubqueryIndex::new(0)), None);
 
-        results.set(0, ScalarValue::Int32(Some(42)))?;
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
-        assert!(results.set(0, ScalarValue::Int32(Some(7))).is_err());
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(42)))?;
+        assert_eq!(
+            results.get(SubqueryIndex::new(0)),
+            Some(ScalarValue::Int32(Some(42)))
+        );
+        assert!(
+            results
+                .set(SubqueryIndex::new(0), ScalarValue::Int32(Some(7)))
+                .is_err()
+        );
 
         Ok(())
     }
@@ -238,13 +263,16 @@ mod test {
     #[test]
     fn scalar_subquery_results_clear() -> Result<()> {
         let results = ScalarSubqueryResults::new(1);
-        results.set(0, ScalarValue::Int32(Some(42)))?;
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(42)))?;
 
         results.clear();
 
-        assert_eq!(results.get(0), None);
-        results.set(0, ScalarValue::Int32(Some(7)))?;
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(7))));
+        assert_eq!(results.get(SubqueryIndex::new(0)), None);
+        results.set(SubqueryIndex::new(0), ScalarValue::Int32(Some(7)))?;
+        assert_eq!(
+            results.get(SubqueryIndex::new(0)),
+            Some(ScalarValue::Int32(Some(7)))
+        );
 
         Ok(())
     }

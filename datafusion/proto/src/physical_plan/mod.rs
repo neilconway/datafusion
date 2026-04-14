@@ -51,7 +51,7 @@ use datafusion_datasource_parquet::source::ParquetSource;
 #[cfg(feature = "parquet")]
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
-use datafusion_expr::execution_props::ScalarSubqueryResults;
+use datafusion_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 use datafusion_functions_table::generate_series::{
     Empty, GenSeriesArgs, GenerateSeriesTable, GenericSeriesState, TimestampValue,
@@ -2290,7 +2290,10 @@ impl protobuf::PhysicalPlanNode {
                     codec,
                     proto_converter,
                 )?;
-                Ok(ScalarSubqueryLink { plan, index })
+                Ok(ScalarSubqueryLink {
+                    plan,
+                    index: SubqueryIndex::new(index),
+                })
             })
             .collect::<Result<Vec<_>>>()?;
 

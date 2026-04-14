@@ -30,7 +30,7 @@ use std::sync::Arc;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{Result, ScalarValue, Statistics, exec_err, internal_err};
 use datafusion_execution::TaskContext;
-use datafusion_expr::execution_props::ScalarSubqueryResults;
+use datafusion_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_physical_expr::PhysicalExpr;
 
 use crate::execution_plan::{CardinalityEffect, ExecutionPlan, PlanProperties};
@@ -52,7 +52,7 @@ pub struct ScalarSubqueryLink {
     /// The physical plan for the subquery.
     pub plan: Arc<dyn ExecutionPlan>,
     /// Index into the shared results container.
-    pub index: usize,
+    pub index: SubqueryIndex,
 }
 
 /// Manages execution of uncorrelated scalar subqueries for a single plan
@@ -437,7 +437,7 @@ mod tests {
             input,
             vec![ScalarSubqueryLink {
                 plan: subquery_plan,
-                index: 0,
+                index: SubqueryIndex::new(0),
             }],
             results,
         )
@@ -451,7 +451,7 @@ mod tests {
                 expr: Arc::new(ScalarSubqueryExpr::new(
                     DataType::Int32,
                     false,
-                    0,
+                    SubqueryIndex::new(0),
                     results,
                 )),
                 alias: "sq".to_string(),
@@ -551,17 +551,23 @@ mod tests {
             crate::common::collect(exec.execute(0, Arc::new(TaskContext::default()))?)
                 .await?;
         assert_eq!(extract_single_int32_value(&batches), 42);
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
+        assert_eq!(
+            results.get(SubqueryIndex::new(0)),
+            Some(ScalarValue::Int32(Some(42)))
+        );
 
         let reset_exec = reset_plan_states(Arc::clone(&exec))?;
-        assert_eq!(results.get(0), None);
+        assert_eq!(results.get(SubqueryIndex::new(0)), None);
 
         let reset_batches = crate::common::collect(
             reset_exec.execute(0, Arc::new(TaskContext::default()))?,
         )
         .await?;
         assert_eq!(extract_single_int32_value(&reset_batches), 42);
-        assert_eq!(results.get(0), Some(ScalarValue::Int32(Some(42))));
+        assert_eq!(
+            results.get(SubqueryIndex::new(0)),
+            Some(ScalarValue::Int32(Some(42)))
+        );
         assert_eq!(execute_calls.load(Ordering::SeqCst), 2);
 
         Ok(())

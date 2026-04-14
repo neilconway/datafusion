@@ -25,7 +25,7 @@ use std::sync::Arc;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, internal_datafusion_err};
-use datafusion_expr::execution_props::ScalarSubqueryResults;
+use datafusion_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 use datafusion_expr_common::sort_properties::{ExprProperties, SortProperties};
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -40,7 +40,7 @@ pub struct ScalarSubqueryExpr {
     data_type: DataType,
     nullable: bool,
     /// Index of this subquery in the shared results container.
-    index: usize,
+    index: SubqueryIndex,
     /// Shared results container populated by `ScalarSubqueryExec`.
     results: ScalarSubqueryResults,
 }
@@ -49,7 +49,7 @@ impl ScalarSubqueryExpr {
     pub fn new(
         data_type: DataType,
         nullable: bool,
-        index: usize,
+        index: SubqueryIndex,
         results: ScalarSubqueryResults,
     ) -> Self {
         Self {
@@ -69,7 +69,7 @@ impl ScalarSubqueryExpr {
     }
 
     /// Returns the index of this subquery in the shared results container.
-    pub fn index(&self) -> usize {
+    pub fn index(&self) -> SubqueryIndex {
         self.index
     }
 
@@ -158,7 +158,7 @@ mod tests {
         let results = ScalarSubqueryResults::new(values.len());
         for (index, value) in values.into_iter().enumerate() {
             if let Some(value) = value {
-                results.set(index, value).unwrap();
+                results.set(SubqueryIndex::new(index), value).unwrap();
             }
         }
         results
@@ -171,7 +171,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)])?;
 
         let results = make_results(vec![Some(ScalarValue::Int32(Some(42)))]);
-        let expr = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results);
+        let expr = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            results,
+        );
 
         let result = expr.evaluate(&batch)?;
         match result {
@@ -188,7 +193,12 @@ mod tests {
         let batch = RecordBatch::try_new(Arc::new(schema), vec![Arc::new(a)]).unwrap();
 
         let results = ScalarSubqueryResults::new(1);
-        let expr = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results);
+        let expr = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            results,
+        );
 
         let result = expr.evaluate(&batch);
         assert!(result.is_err());
@@ -198,9 +208,24 @@ mod tests {
     fn test_identity_equality() {
         let results = make_results(vec![None, None]);
 
-        let e1a = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results.clone());
-        let e1b = ScalarSubqueryExpr::new(DataType::Int32, false, 0, results.clone());
-        let e2 = ScalarSubqueryExpr::new(DataType::Int32, false, 1, results.clone());
+        let e1a = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            results.clone(),
+        );
+        let e1b = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            results.clone(),
+        );
+        let e2 = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(1),
+            results.clone(),
+        );
 
         // Same container + same index → equal
         assert_eq!(e1a, e1b);
@@ -209,7 +234,12 @@ mod tests {
 
         // Different container, same index → not equal
         let other_results = make_results(vec![None]);
-        let e3 = ScalarSubqueryExpr::new(DataType::Int32, false, 0, other_results);
+        let e3 = ScalarSubqueryExpr::new(
+            DataType::Int32,
+            false,
+            SubqueryIndex::new(0),
+            other_results,
+        );
         assert_ne!(e1a, e3);
     }
 }

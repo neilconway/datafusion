@@ -79,7 +79,7 @@ use datafusion_common::{
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_expr::dml::{CopyTo, InsertOp};
-use datafusion_expr::execution_props::ScalarSubqueryResults;
+use datafusion_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
 use datafusion_expr::expr::{
     AggregateFunction, AggregateFunctionParams, Alias, GroupingSet, NullTreatment,
     WindowFunction, WindowFunctionParams, physical_name,
@@ -2944,7 +2944,7 @@ impl DefaultPhysicalPlanner {
         &self,
         subqueries: Vec<Subquery>,
         session_state: &SessionState,
-    ) -> Result<(Vec<ScalarSubqueryLink>, DFHashMap<Subquery, usize>)> {
+    ) -> Result<(Vec<ScalarSubqueryLink>, DFHashMap<Subquery, SubqueryIndex>)> {
         let mut links = Vec::with_capacity(subqueries.len());
         let mut index_map = DFHashMap::with_capacity(subqueries.len());
         for sq in subqueries {
@@ -2955,7 +2955,7 @@ impl DefaultPhysicalPlanner {
             let physical_plan = self
                 .create_initial_plan(&sq.subquery, session_state)
                 .await?;
-            let index = links.len();
+            let index = SubqueryIndex::new(links.len());
             links.push(ScalarSubqueryLink {
                 plan: physical_plan,
                 index,

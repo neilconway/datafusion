@@ -105,7 +105,8 @@ use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{
     Accumulator, AccumulatorFactoryFunction, AggregateUDF, ColumnarValue,
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, SimpleAggregateUDF,
-    WindowFrame, WindowFrameBound, WindowUDF, execution_props::ScalarSubqueryResults,
+    WindowFrame, WindowFrameBound, WindowUDF,
+    execution_props::{ScalarSubqueryResults, SubqueryIndex},
 };
 use datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf;
 use datafusion_functions_aggregate::array_agg::array_agg_udaf;
@@ -3203,7 +3204,7 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
     let sq_expr = Arc::new(ScalarSubqueryExpr::new(
         DataType::Int64,
         true,
-        0,
+        SubqueryIndex::new(0),
         results.clone(),
     ));
     let predicate = binary(col("a", &schema)?, Operator::Eq, sq_expr, &schema)?;
@@ -3222,7 +3223,7 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         Arc::new(filter),
         vec![ScalarSubqueryLink {
             plan: subquery_plan,
-            index: 0,
+            index: SubqueryIndex::new(0),
         }],
         results,
     ));

@@ -508,7 +508,7 @@ pub fn parse_physical_expr_with_converter(
             Arc::new(ScalarSubqueryExpr::new(
                 data_type,
                 sq.nullable,
-                sq.index as usize,
+                datafusion_expr::execution_props::SubqueryIndex::new(sq.index as usize),
                 results,
             ))
         }

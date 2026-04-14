@@ -85,7 +85,7 @@ pub struct ScalarSubqueryExec {
     subqueries: Vec<ScalarSubqueryLink>,
     /// Shared one-time async computation of subquery results.
     subquery_future: Arc<OnceAsync<()>>,
-    /// Shared results container; the corresponding [`ScalarSubqueryExpr`]
+    /// Shared results container; the corresponding `ScalarSubqueryExpr`
     /// nodes in the input plan hold the same underlying container.
     results: ScalarSubqueryResults,
     /// Cached plan properties (copied from input).

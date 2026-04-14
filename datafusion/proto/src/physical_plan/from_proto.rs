@@ -36,6 +36,7 @@ use datafusion_datasource_json::file_format::JsonSink;
 use datafusion_datasource_parquet::file_format::ParquetSink;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_execution::{FunctionRegistry, TaskContext};
+use datafusion_expr::execution_props::SubqueryIndex;
 use datafusion_expr::WindowFunctionDefinition;
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_expr::projection::{ProjectionExpr, ProjectionExprs};
@@ -508,7 +509,7 @@ pub fn parse_physical_expr_with_converter(
             Arc::new(ScalarSubqueryExpr::new(
                 data_type,
                 sq.nullable,
-                datafusion_expr::execution_props::SubqueryIndex::new(sq.index as usize),
+                SubqueryIndex::new(sq.index as usize),
                 results,
             ))
         }

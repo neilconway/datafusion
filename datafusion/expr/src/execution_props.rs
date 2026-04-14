@@ -26,6 +26,110 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 
+/// Holds per-query execution properties and data (such as statement
+/// starting timestamps).
+///
+/// An [`ExecutionProps`] is created each time a `LogicalPlan` is
+/// prepared for execution (optimized). If the same plan is optimized
+/// multiple times, a new `ExecutionProps` is created each time.
+///
+/// It is important that this structure be cheap to create as it is
+/// done so during predicate pruning and expression simplification
+#[derive(Clone, Debug)]
+pub struct ExecutionProps {
+    /// The time at which the query execution started. If `None`,
+    /// functions like `now()` will not be simplified during optimization.
+    pub query_execution_start_time: Option<DateTime<Utc>>,
+    /// Alias generator used by subquery optimizer rules
+    pub alias_generator: Arc<AliasGenerator>,
+    /// Snapshot of config options when the query started
+    pub config_options: Option<Arc<ConfigOptions>>,
+    /// Providers for scalar variables
+    pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
+    /// Maps each logical `Subquery` to its index in `subquery_results`.
+    /// Populated by the physical planner before calling `create_physical_expr`.
+    pub subquery_indexes: HashMap<crate::logical_plan::Subquery, SubqueryIndex>,
+    /// Shared results container for uncorrelated scalar subquery values.
+    /// Populated at execution time by `ScalarSubqueryExec`.
+    pub subquery_results: ScalarSubqueryResults,
+}
+
+impl Default for ExecutionProps {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExecutionProps {
+    /// Creates a new execution props
+    pub fn new() -> Self {
+        ExecutionProps {
+            query_execution_start_time: None,
+            alias_generator: Arc::new(AliasGenerator::new()),
+            config_options: None,
+            var_providers: None,
+            subquery_indexes: HashMap::new(),
+            subquery_results: ScalarSubqueryResults::default(),
+        }
+    }
+
+    /// Set the query execution start time to use
+    pub fn with_query_execution_start_time(
+        mut self,
+        query_execution_start_time: DateTime<Utc>,
+    ) -> Self {
+        self.query_execution_start_time = Some(query_execution_start_time);
+        self
+    }
+
+    #[deprecated(since = "50.0.0", note = "Use mark_start_execution instead")]
+    pub fn start_execution(&mut self) -> &Self {
+        let default_config = Arc::new(ConfigOptions::default());
+        self.mark_start_execution(default_config)
+    }
+
+    /// Marks the execution of query started timestamp.
+    /// This also instantiates a new alias generator.
+    pub fn mark_start_execution(&mut self, config_options: Arc<ConfigOptions>) -> &Self {
+        self.query_execution_start_time = Some(Utc::now());
+        self.alias_generator = Arc::new(AliasGenerator::new());
+        self.config_options = Some(config_options);
+        &*self
+    }
+
+    /// Registers a variable provider, returning the existing provider, if any
+    pub fn add_var_provider(
+        &mut self,
+        var_type: VarType,
+        provider: Arc<dyn VarProvider + Send + Sync>,
+    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
+        let mut var_providers = self.var_providers.take().unwrap_or_default();
+
+        let old_provider = var_providers.insert(var_type, provider);
+
+        self.var_providers = Some(var_providers);
+
+        old_provider
+    }
+
+    /// Returns the provider for the `var_type`, if any
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn get_var_provider(
+        &self,
+        var_type: VarType,
+    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
+        self.var_providers
+            .as_ref()
+            .and_then(|var_providers| var_providers.get(&var_type).cloned())
+    }
+
+    /// Returns the configuration properties for this execution
+    /// if the execution has started
+    pub fn config_options(&self) -> Option<&Arc<ConfigOptions>> {
+        self.config_options.as_ref()
+    }
+}
+
 /// Index of a scalar subquery within a [`ScalarSubqueryResults`] container.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SubqueryIndex(usize);
@@ -120,111 +224,6 @@ impl Eq for ScalarSubqueryResults {}
 impl Hash for ScalarSubqueryResults {
     fn hash<H: Hasher>(&self, state: &mut H) {
         Arc::as_ptr(&self.slots).hash(state);
-    }
-}
-
-/// Holds per-query execution properties and data (such as statement
-/// starting timestamps).
-///
-/// An [`ExecutionProps`] is created each time a `LogicalPlan` is
-/// prepared for execution (optimized). If the same plan is optimized
-/// multiple times, a new `ExecutionProps` is created each time.
-///
-/// It is important that this structure be cheap to create as it is
-/// done so during predicate pruning and expression simplification
-#[derive(Clone, Debug)]
-pub struct ExecutionProps {
-    /// The time at which the query execution started. If `None`,
-    /// functions like `now()` will not be simplified during optimization.
-    pub query_execution_start_time: Option<DateTime<Utc>>,
-    /// Alias generator used by subquery optimizer rules
-    pub alias_generator: Arc<AliasGenerator>,
-    /// Snapshot of config options when the query started
-    pub config_options: Option<Arc<ConfigOptions>>,
-    /// Providers for scalar variables
-    pub var_providers: Option<HashMap<VarType, Arc<dyn VarProvider + Send + Sync>>>,
-    /// Maps each logical `Subquery` to its index in `subquery_results`.
-    /// Populated by the physical planner before calling `create_physical_expr`.
-    pub subquery_indexes: HashMap<crate::logical_plan::Subquery, SubqueryIndex>,
-    /// Shared results container for uncorrelated scalar subquery values.
-    /// Populated at execution time by `ScalarSubqueryExec`.
-    pub subquery_results: ScalarSubqueryResults,
-}
-
-impl Default for ExecutionProps {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ExecutionProps {
-    /// Creates a new execution props
-    pub fn new() -> Self {
-        ExecutionProps {
-            query_execution_start_time: None,
-            alias_generator: Arc::new(AliasGenerator::new()),
-            config_options: None,
-            var_providers: None,
-            subquery_indexes: HashMap::new(),
-            subquery_results: ScalarSubqueryResults::default(),
-        }
-    }
-
-    /// Set the query execution start time to use
-    pub fn with_query_execution_start_time(
-        mut self,
-        query_execution_start_time: DateTime<Utc>,
-    ) -> Self {
-        self.query_execution_start_time = Some(query_execution_start_time);
-        self
-    }
-
-    #[deprecated(since = "50.0.0", note = "Use mark_start_execution instead")]
-    pub fn start_execution(&mut self) -> &Self {
-        let default_config = Arc::new(ConfigOptions::default());
-        self.mark_start_execution(default_config)
-    }
-
-    /// Marks the execution of query started timestamp.
-    /// This also instantiates a new alias generator.
-    pub fn mark_start_execution(&mut self, config_options: Arc<ConfigOptions>) -> &Self {
-        self.query_execution_start_time = Some(Utc::now());
-        self.alias_generator = Arc::new(AliasGenerator::new());
-        self.config_options = Some(config_options);
-        &*self
-    }
-
-    /// Registers a variable provider, returning the existing
-    /// provider, if any
-    pub fn add_var_provider(
-        &mut self,
-        var_type: VarType,
-        provider: Arc<dyn VarProvider + Send + Sync>,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        let mut var_providers = self.var_providers.take().unwrap_or_default();
-
-        let old_provider = var_providers.insert(var_type, provider);
-
-        self.var_providers = Some(var_providers);
-
-        old_provider
-    }
-
-    /// Returns the provider for the `var_type`, if any
-    #[expect(clippy::needless_pass_by_value)]
-    pub fn get_var_provider(
-        &self,
-        var_type: VarType,
-    ) -> Option<Arc<dyn VarProvider + Send + Sync>> {
-        self.var_providers
-            .as_ref()
-            .and_then(|var_providers| var_providers.get(&var_type).cloned())
-    }
-
-    /// Returns the configuration properties for this execution
-    /// if the execution has started
-    pub fn config_options(&self) -> Option<&Arc<ConfigOptions>> {
-        self.config_options.as_ref()
     }
 }
 

@@ -436,9 +436,8 @@ impl DefaultPhysicalPlanner {
     ) -> futures::future::BoxFuture<'a, Result<Arc<dyn ExecutionPlan>>> {
         Box::pin(async move {
             let all_subqueries = Self::collect_scalar_subqueries(logical_plan);
-            let all_sq_refs: Vec<&_> = all_subqueries.iter().collect();
             let (links, index_map) = self
-                .plan_scalar_subqueries(&all_sq_refs, session_state)
+                .plan_scalar_subqueries(all_subqueries, session_state)
                 .await?;
 
             // Create the shared `ScalarSubqueryResults` container and register
@@ -2943,14 +2942,14 @@ impl DefaultPhysicalPlanner {
     /// `Subquery` to its index.
     async fn plan_scalar_subqueries(
         &self,
-        subqueries: &[&Subquery],
+        subqueries: Vec<Subquery>,
         session_state: &SessionState,
     ) -> Result<(Vec<ScalarSubqueryLink>, DFHashMap<Subquery, usize>)> {
         let mut links = Vec::with_capacity(subqueries.len());
         let mut index_map = DFHashMap::with_capacity(subqueries.len());
-        for &sq in subqueries {
+        for sq in subqueries {
             // Callers deduplicate, but guard against accidental double-planning.
-            if index_map.contains_key(sq) {
+            if index_map.contains_key(&sq) {
                 continue;
             }
             let physical_plan = self
@@ -2961,7 +2960,7 @@ impl DefaultPhysicalPlanner {
                 plan: physical_plan,
                 index,
             });
-            index_map.insert(sq.clone(), index);
+            index_map.insert(sq, index);
         }
         Ok((links, index_map))
     }

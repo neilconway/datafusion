@@ -233,14 +233,14 @@ impl ExecutionPlan for ScalarSubqueryExec {
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
-        // Only the main input (first child); subquery children don't
-        // contribute to ordering.
+        // Only the main input (first child); subquery children don't contribute
+        // to ordering.
         self.true_for_input_only()
     }
 
     fn benefits_from_input_partitioning(&self) -> Vec<bool> {
-        // Only the main input; subquery children produce at most one
-        // row, so repartitioning them adds overhead with no benefit.
+        // Only the main input; subquery children produce at most one row, so
+        // repartitioning them has no benefit.
         self.true_for_input_only()
     }
 

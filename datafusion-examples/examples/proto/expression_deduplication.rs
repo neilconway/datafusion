@@ -201,12 +201,12 @@ impl PhysicalExtensionCodec for CachingCodec {
 }
 
 impl PhysicalProtoConverterExtension for CachingCodec {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        self.default_proto_to_execution_plan_with_context(proto, ctx)
+        self.default_proto_to_execution_plan(proto, ctx)
     }
 
     fn execution_plan_to_proto(
@@ -222,7 +222,7 @@ impl PhysicalProtoConverterExtension for CachingCodec {
     }
 
     // CACHING IMPLEMENTATION: Intercept expression deserialization
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &PhysicalExprNode,
         input_schema: &Schema,

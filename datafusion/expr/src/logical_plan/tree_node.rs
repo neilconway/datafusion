@@ -888,7 +888,7 @@ impl LogicalPlan {
     }
 
     /// Similar to [`Self::map_subqueries`], but only applies `f` to
-    /// uncorrelated subqueries (those with no outer reference columns).
+    /// uncorrelated subqueries (those with no outer column references).
     pub fn map_uncorrelated_subqueries<F: FnMut(Self) -> Result<Transformed<Self>>>(
         self,
         mut f: F,

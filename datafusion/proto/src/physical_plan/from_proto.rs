@@ -83,11 +83,8 @@ pub fn parse_physical_sort_expr(
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<PhysicalSortExpr> {
     if let Some(expr) = &proto.expr {
-        let expr = proto_converter.proto_to_physical_expr_with_context(
-            expr.as_ref(),
-            input_schema,
-            ctx,
-        )?;
+        let expr =
+            proto_converter.proto_to_physical_expr(expr.as_ref(), input_schema, ctx)?;
         let options = SortOptions {
             descending: !proto.asc,
             nulls_first: proto.nulls_first,
@@ -209,9 +206,7 @@ where
 {
     protos
         .into_iter()
-        .map(|p| {
-            proto_converter.proto_to_physical_expr_with_context(p, input_schema, ctx)
-        })
+        .map(|p| proto_converter.proto_to_physical_expr(p, input_schema, ctx))
         .collect::<Result<Vec<_>>>()
 }
 
@@ -235,7 +230,7 @@ pub fn parse_physical_expr(
         proto,
         input_schema,
         &decode_ctx,
-        &DefaultPhysicalProtoConverter,
+        &DefaultPhysicalProtoConverter {},
     )
 }
 
@@ -347,11 +342,7 @@ pub fn parse_physical_expr_with_converter(
             e.expr
                 .as_ref()
                 .map(|e| {
-                    proto_converter.proto_to_physical_expr_with_context(
-                        e.as_ref(),
-                        input_schema,
-                        ctx,
-                    )
+                    proto_converter.proto_to_physical_expr(e.as_ref(), input_schema, ctx)
                 })
                 .transpose()?,
             e.when_then_expr
@@ -378,11 +369,7 @@ pub fn parse_physical_expr_with_converter(
             e.else_expr
                 .as_ref()
                 .map(|e| {
-                    proto_converter.proto_to_physical_expr_with_context(
-                        e.as_ref(),
-                        input_schema,
-                        ctx,
-                    )
+                    proto_converter.proto_to_physical_expr(e.as_ref(), input_schema, ctx)
                 })
                 .transpose()?,
         )?),
@@ -493,13 +480,7 @@ pub fn parse_physical_expr_with_converter(
             let inputs: Vec<Arc<dyn PhysicalExpr>> = extension
                 .inputs
                 .iter()
-                .map(|e| {
-                    proto_converter.proto_to_physical_expr_with_context(
-                        e,
-                        input_schema,
-                        ctx,
-                    )
-                })
+                .map(|e| proto_converter.proto_to_physical_expr(e, input_schema, ctx))
                 .collect::<Result<_>>()?;
             ctx.codec()
                 .try_decode_expr(extension.expr.as_slice(), &inputs)? as _
@@ -516,11 +497,9 @@ fn parse_required_physical_expr(
     input_schema: &Schema,
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<Arc<dyn PhysicalExpr>> {
-    expr.map(|e| {
-        proto_converter.proto_to_physical_expr_with_context(e, input_schema, ctx)
-    })
-    .transpose()?
-    .ok_or_else(|| internal_datafusion_err!("Missing required field {field:?}"))
+    expr.map(|e| proto_converter.proto_to_physical_expr(e, input_schema, ctx))
+        .transpose()?
+        .ok_or_else(|| internal_datafusion_err!("Missing required field {field:?}"))
 }
 
 pub fn parse_protobuf_hash_partitioning(
@@ -655,7 +634,7 @@ pub fn parse_protobuf_file_scan_config(
             .projections
             .iter()
             .map(|proto_expr| {
-                let expr = proto_converter.proto_to_physical_expr_with_context(
+                let expr = proto_converter.proto_to_physical_expr(
                     proto_expr.expr.as_ref().ok_or_else(|| {
                         internal_datafusion_err!("ProjectionExpr missing expr field")
                     })?,

@@ -370,7 +370,7 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
     }
 
     // Interception point: override deserialization to unwrap adapters
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
@@ -395,8 +395,7 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
             let inner_proto = &extension.inputs[0];
 
             // Deserialize the inner plan
-            let inner_plan =
-                self.default_proto_to_execution_plan_with_context(inner_proto, ctx)?;
+            let inner_plan = self.default_proto_to_execution_plan(inner_proto, ctx)?;
 
             // Recreate the adapter factory
             let adapter_factory = create_adapter_factory(&payload.adapter_metadata.tag);
@@ -406,10 +405,10 @@ impl PhysicalProtoConverterExtension for AdapterPreservingCodec {
         }
 
         // Not our extension - use default deserialization
-        self.default_proto_to_execution_plan_with_context(proto, ctx)
+        self.default_proto_to_execution_plan(proto, ctx)
     }
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &PhysicalExprNode,
         input_schema: &Schema,

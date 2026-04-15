@@ -37,8 +37,8 @@ use datafusion_expr::utils::conjunction;
 use datafusion_expr::{EmptyRelation, Expr, LogicalPlan, LogicalPlanBuilder, expr};
 
 /// Optimizer rule that rewrites correlated scalar subquery filters to joins and
-/// places an additional projection on top of the filter, to preserve original
-/// schema.
+/// places an additional projection on top of the filter, to preserve the
+/// original schema.
 #[derive(Default, Debug)]
 pub struct ScalarSubqueryToJoin {}
 
@@ -49,7 +49,7 @@ impl ScalarSubqueryToJoin {
     }
 
     /// Finds expressions that contain correlated scalar subqueries (and
-    /// recurses when found)
+    /// recurses when found).
     ///
     /// # Arguments
     /// * `predicate` - A conjunction to split and search.

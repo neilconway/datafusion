@@ -2938,7 +2938,7 @@ impl DefaultPhysicalPlanner {
     }
 
     /// Build physical plans for scalar subqueries and assign each an ordinal
-    /// index. Returns the links (plan + index) and a map from logical
+    /// `SubqueryIndex`. Returns the links (plan + index) and a map from logical
     /// `Subquery` to its index.
     async fn plan_scalar_subqueries(
         &self,

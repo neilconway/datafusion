@@ -199,7 +199,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
         self.try_into_physical_plan_with_converter(
             ctx,
             codec,
-            &DefaultPhysicalProtoConverter,
+            &DefaultPhysicalProtoConverter {},
         )
     }
 
@@ -213,7 +213,7 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
         Self::try_from_physical_plan_with_converter(
             plan,
             codec,
-            &DefaultPhysicalProtoConverter,
+            &DefaultPhysicalProtoConverter {},
         )
     }
 }
@@ -677,7 +677,7 @@ impl protobuf::PhysicalPlanNode {
             .zip(projection.expr_name.iter())
             .map(|(expr, name)| {
                 Ok((
-                    proto_converter.proto_to_physical_expr_with_context(
+                    proto_converter.proto_to_physical_expr(
                         expr,
                         input.schema().as_ref(),
                         ctx,
@@ -706,11 +706,7 @@ impl protobuf::PhysicalPlanNode {
             .expr
             .as_ref()
             .map(|expr| {
-                proto_converter.proto_to_physical_expr_with_context(
-                    expr,
-                    input.schema().as_ref(),
-                    ctx,
-                )
+                proto_converter.proto_to_physical_expr(expr, input.schema().as_ref(), ctx)
             })
             .transpose()?
             .ok_or_else(|| {
@@ -867,7 +863,7 @@ impl protobuf::PhysicalPlanNode {
                 .predicate
                 .as_ref()
                 .map(|expr| {
-                    proto_converter.proto_to_physical_expr_with_context(
+                    proto_converter.proto_to_physical_expr(
                         expr,
                         predicate_schema.as_ref(),
                         ctx,
@@ -1100,11 +1096,7 @@ impl protobuf::PhysicalPlanNode {
             .partition_keys
             .iter()
             .map(|expr| {
-                proto_converter.proto_to_physical_expr_with_context(
-                    expr,
-                    input.schema().as_ref(),
-                    ctx,
-                )
+                proto_converter.proto_to_physical_expr(expr, input.schema().as_ref(), ctx)
             })
             .collect::<Result<Vec<Arc<dyn PhysicalExpr>>>>()?;
 
@@ -1167,11 +1159,7 @@ impl protobuf::PhysicalPlanNode {
             .zip(hash_agg.group_expr_name.iter())
             .map(|(expr, name)| {
                 proto_converter
-                    .proto_to_physical_expr_with_context(
-                        expr,
-                        input.schema().as_ref(),
-                        ctx,
-                    )
+                    .proto_to_physical_expr(expr, input.schema().as_ref(), ctx)
                     .map(|expr| (expr, name.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1182,11 +1170,7 @@ impl protobuf::PhysicalPlanNode {
             .zip(hash_agg.group_expr_name.iter())
             .map(|(expr, name)| {
                 proto_converter
-                    .proto_to_physical_expr_with_context(
-                        expr,
-                        input.schema().as_ref(),
-                        ctx,
-                    )
+                    .proto_to_physical_expr(expr, input.schema().as_ref(), ctx)
                     .map(|expr| (expr, name.to_string()))
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -1215,11 +1199,7 @@ impl protobuf::PhysicalPlanNode {
                 expr.expr
                     .as_ref()
                     .map(|e| {
-                        proto_converter.proto_to_physical_expr_with_context(
-                            e,
-                            &physical_schema,
-                            ctx,
-                        )
+                        proto_converter.proto_to_physical_expr(e, &physical_schema, ctx)
                     })
                     .transpose()
             })
@@ -1240,7 +1220,7 @@ impl protobuf::PhysicalPlanNode {
                             .expr
                             .iter()
                             .map(|e| {
-                                proto_converter.proto_to_physical_expr_with_context(
+                                proto_converter.proto_to_physical_expr(
                                     e,
                                     &physical_schema,
                                     ctx,
@@ -1338,12 +1318,12 @@ impl protobuf::PhysicalPlanNode {
             .on
             .iter()
             .map(|col| {
-                let left = proto_converter.proto_to_physical_expr_with_context(
+                let left = proto_converter.proto_to_physical_expr(
                     &col.left.clone().unwrap(),
                     left_schema.as_ref(),
                     ctx,
                 )?;
-                let right = proto_converter.proto_to_physical_expr_with_context(
+                let right = proto_converter.proto_to_physical_expr(
                     &col.right.clone().unwrap(),
                     right_schema.as_ref(),
                     ctx,
@@ -1375,7 +1355,7 @@ impl protobuf::PhysicalPlanNode {
                     .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
                     .try_into()?;
 
-                let expression = proto_converter.proto_to_physical_expr_with_context(
+                let expression = proto_converter.proto_to_physical_expr(
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
@@ -1452,12 +1432,12 @@ impl protobuf::PhysicalPlanNode {
             .on
             .iter()
             .map(|col| {
-                let left = proto_converter.proto_to_physical_expr_with_context(
+                let left = proto_converter.proto_to_physical_expr(
                     &col.left.clone().unwrap(),
                     left_schema.as_ref(),
                     ctx,
                 )?;
-                let right = proto_converter.proto_to_physical_expr_with_context(
+                let right = proto_converter.proto_to_physical_expr(
                     &col.right.clone().unwrap(),
                     right_schema.as_ref(),
                     ctx,
@@ -1489,7 +1469,7 @@ impl protobuf::PhysicalPlanNode {
                     .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
                     .try_into()?;
 
-                let expression = proto_converter.proto_to_physical_expr_with_context(
+                let expression = proto_converter.proto_to_physical_expr(
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
@@ -1571,8 +1551,7 @@ impl protobuf::PhysicalPlanNode {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = vec![];
         for input in &union.inputs {
-            inputs
-                .push(proto_converter.proto_to_execution_plan_with_context(input, ctx)?);
+            inputs.push(proto_converter.proto_to_execution_plan(input, ctx)?);
         }
         UnionExec::try_new(inputs)
     }
@@ -1585,8 +1564,7 @@ impl protobuf::PhysicalPlanNode {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut inputs: Vec<Arc<dyn ExecutionPlan>> = vec![];
         for input in &interleave.inputs {
-            inputs
-                .push(proto_converter.proto_to_execution_plan_with_context(input, ctx)?);
+            inputs.push(proto_converter.proto_to_execution_plan(input, ctx)?);
         }
         Ok(Arc::new(InterleaveExec::try_new(inputs)?))
     }
@@ -1650,7 +1628,7 @@ impl protobuf::PhysicalPlanNode {
                         })?
                         .as_ref();
                     Ok(PhysicalSortExpr {
-                        expr: proto_converter.proto_to_physical_expr_with_context(
+                        expr: proto_converter.proto_to_physical_expr(
                             expr,
                             input.schema().as_ref(),
                             ctx,
@@ -1705,7 +1683,7 @@ impl protobuf::PhysicalPlanNode {
                         })?
                         .as_ref();
                     Ok(PhysicalSortExpr {
-                        expr: proto_converter.proto_to_physical_expr_with_context(
+                        expr: proto_converter.proto_to_physical_expr(
                             expr,
                             input.schema().as_ref(),
                             ctx,
@@ -1738,7 +1716,7 @@ impl protobuf::PhysicalPlanNode {
         let inputs: Vec<Arc<dyn ExecutionPlan>> = extension
             .inputs
             .iter()
-            .map(|i| proto_converter.proto_to_execution_plan_with_context(i, ctx))
+            .map(|i| proto_converter.proto_to_execution_plan(i, ctx))
             .collect::<Result<_>>()?;
 
         let extension_node =
@@ -1775,7 +1753,7 @@ impl protobuf::PhysicalPlanNode {
                             .try_into()?;
 
                         let expression = proto_converter
-                            .proto_to_physical_expr_with_context(
+                            .proto_to_physical_expr(
                             f.expression.as_ref().ok_or_else(|| {
                                 proto_error("Unexpected empty filter expression")
                             })?,
@@ -2018,7 +1996,7 @@ impl protobuf::PhysicalPlanNode {
                     .ok_or_else(|| proto_error("Missing JoinFilter schema"))?
                     .try_into()?;
 
-                let expression = proto_converter.proto_to_physical_expr_with_context(
+                let expression = proto_converter.proto_to_physical_expr(
                     f.expression.as_ref().ok_or_else(|| {
                         proto_error("Unexpected empty filter expression")
                     })?,
@@ -2080,12 +2058,12 @@ impl protobuf::PhysicalPlanNode {
             .on
             .iter()
             .map(|col| {
-                let left = proto_converter.proto_to_physical_expr_with_context(
+                let left = proto_converter.proto_to_physical_expr(
                     &col.left.clone().unwrap(),
                     left_schema.as_ref(),
                     ctx,
                 )?;
-                let right = proto_converter.proto_to_physical_expr_with_context(
+                let right = proto_converter.proto_to_physical_expr(
                     &col.right.clone().unwrap(),
                     right_schema.as_ref(),
                     ctx,
@@ -2200,7 +2178,7 @@ impl protobuf::PhysicalPlanNode {
             .iter()
             .zip(async_func.async_expr_names.iter())
             .map(|(expr, name)| {
-                let physical_expr = proto_converter.proto_to_physical_expr_with_context(
+                let physical_expr = proto_converter.proto_to_physical_expr(
                     expr,
                     input.schema().as_ref(),
                     ctx,
@@ -3795,13 +3773,13 @@ impl PhysicalExtensionCodec for DefaultPhysicalExtensionCodec {
 /// Protobuf variants. Using this trait, users can perform optimizations on the
 /// conversion process or collect performance metrics.
 pub trait PhysicalProtoConverterExtension {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &protobuf::PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
-    fn default_proto_to_execution_plan_with_context(
+    fn default_proto_to_execution_plan(
         &self,
         proto: &protobuf::PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
@@ -3812,30 +3790,20 @@ pub trait PhysicalProtoConverterExtension {
         proto.try_into_physical_plan_with_context(ctx, self)
     }
 
-    fn proto_to_execution_plan(
-        &self,
-        ctx: &TaskContext,
-        codec: &dyn PhysicalExtensionCodec,
-        proto: &protobuf::PhysicalPlanNode,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let decode_ctx = PhysicalPlanDecodeContext::new(ctx, codec);
-        self.proto_to_execution_plan_with_context(proto, &decode_ctx)
-    }
-
     fn execution_plan_to_proto(
         &self,
         plan: &Arc<dyn ExecutionPlan>,
         codec: &dyn PhysicalExtensionCodec,
     ) -> Result<protobuf::PhysicalPlanNode>;
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &protobuf::PhysicalExprNode,
         input_schema: &Schema,
         ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn PhysicalExpr>>;
 
-    fn default_proto_to_physical_expr_with_context(
+    fn default_proto_to_physical_expr(
         &self,
         proto: &protobuf::PhysicalExprNode,
         input_schema: &Schema,
@@ -3845,17 +3813,6 @@ pub trait PhysicalProtoConverterExtension {
         Self: Sized,
     {
         parse_physical_expr_with_converter(proto, input_schema, ctx, self)
-    }
-
-    fn proto_to_physical_expr(
-        &self,
-        proto: &protobuf::PhysicalExprNode,
-        ctx: &TaskContext,
-        input_schema: &Schema,
-        codec: &dyn PhysicalExtensionCodec,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        let decode_ctx = PhysicalPlanDecodeContext::new(ctx, codec);
-        self.proto_to_physical_expr_with_context(proto, input_schema, &decode_ctx)
     }
 
     fn physical_expr_to_proto(
@@ -3879,10 +3836,10 @@ struct DataEncoderTuple {
 }
 
 #[derive(Default)]
-pub struct DefaultPhysicalProtoConverter;
+pub struct DefaultPhysicalProtoConverter {}
 
 impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &protobuf::PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
@@ -3905,7 +3862,7 @@ impl PhysicalProtoConverterExtension for DefaultPhysicalProtoConverter {
         )
     }
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &protobuf::PhysicalExprNode,
         input_schema: &Schema,
@@ -3943,7 +3900,7 @@ impl DeduplicatingSerializer {
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         _proto: &protobuf::PhysicalPlanNode,
         _ctx: &PhysicalPlanDecodeContext<'_>,
@@ -3966,7 +3923,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingSerializer {
         )
     }
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         _proto: &protobuf::PhysicalExprNode,
         _input_schema: &Schema,
@@ -4008,7 +3965,7 @@ struct DeduplicatingDeserializer {
 }
 
 impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &protobuf::PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
@@ -4027,7 +3984,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
         internal_err!("DeduplicatingDeserializer cannot serialize execution plans")
     }
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &protobuf::PhysicalExprNode,
         input_schema: &Schema,
@@ -4079,7 +4036,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingDeserializer {
 pub struct DeduplicatingProtoConverter {}
 
 impl PhysicalProtoConverterExtension for DeduplicatingProtoConverter {
-    fn proto_to_execution_plan_with_context(
+    fn proto_to_execution_plan(
         &self,
         proto: &protobuf::PhysicalPlanNode,
         ctx: &PhysicalPlanDecodeContext<'_>,
@@ -4104,7 +4061,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingProtoConverter {
         )
     }
 
-    fn proto_to_physical_expr_with_context(
+    fn proto_to_physical_expr(
         &self,
         proto: &protobuf::PhysicalExprNode,
         input_schema: &Schema,
@@ -4114,7 +4071,7 @@ impl PhysicalProtoConverterExtension for DeduplicatingProtoConverter {
         Self: Sized,
     {
         let deserializer = DeduplicatingDeserializer::default();
-        deserializer.proto_to_physical_expr_with_context(proto, input_schema, ctx)
+        deserializer.proto_to_physical_expr(proto, input_schema, ctx)
     }
 
     fn physical_expr_to_proto(
@@ -4232,7 +4189,7 @@ fn into_physical_plan(
     proto_converter: &dyn PhysicalProtoConverterExtension,
 ) -> Result<Arc<dyn ExecutionPlan>> {
     if let Some(field) = node {
-        proto_converter.proto_to_execution_plan_with_context(field, ctx)
+        proto_converter.proto_to_execution_plan(field, ctx)
     } else {
         Err(proto_error("Missing required field in protobuf"))
     }

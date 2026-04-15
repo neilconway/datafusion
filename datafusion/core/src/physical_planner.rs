@@ -450,14 +450,14 @@ impl DefaultPhysicalPlanner {
             // context rather than on ExecutionProps. It's here because
             // `create_physical_expr` only receives `&ExecutionProps`, and
             // changing that signature would be a breaking public API change.
-            let results = ScalarSubqueryResults::new(links.len());
-            let session_state = if links.is_empty() {
-                Cow::Borrowed(session_state)
+            let (session_state, results) = if links.is_empty() {
+                (Cow::Borrowed(session_state), ScalarSubqueryResults::new(0))
             } else {
+                let results = ScalarSubqueryResults::new(links.len());
                 let mut owned = session_state.clone();
                 owned.execution_props_mut().subquery_indexes = index_map;
                 owned.execution_props_mut().subquery_results = results.clone();
-                Cow::Owned(owned)
+                (Cow::Owned(owned), results)
             };
 
             let plan = self

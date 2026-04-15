@@ -131,7 +131,7 @@ impl ExecutionProps {
 }
 
 /// Index of a scalar subquery within a [`ScalarSubqueryResults`] container.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct SubqueryIndex(usize);
 
 impl SubqueryIndex {

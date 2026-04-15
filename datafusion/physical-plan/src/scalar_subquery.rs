@@ -253,8 +253,7 @@ impl ExecutionPlan for ScalarSubqueryExec {
     }
 }
 
-/// Execute all subquery plans, extract their scalar results, and populate
-/// the shared results container.
+/// Wait for the subquery execution future to complete.
 async fn wait_for_subqueries(fut: &mut OnceFut<()>) -> Result<()> {
     std::future::poll_fn(|cx| fut.get_shared(cx)).await?;
     Ok(())

@@ -479,8 +479,6 @@ fn optimize_projections(
     }
 }
 
-/// Merges consecutive projections.
-///
 /// Optimizes uncorrelated subquery plans embedded in expressions of the given
 /// plan node (e.g., `Expr::ScalarSubquery`). `map_children` only visits direct
 /// plan inputs, so subqueries must be handled separately.

@@ -260,18 +260,18 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
                 if !subquery.outer_ref_columns.is_empty() =>
             {
                 let subquery = subquery.clone();
-                let subqry_alias = self.alias_gen.next("__scalar_sq");
-                self.sub_query_info
-                    .push((subquery.clone(), subqry_alias.clone()));
                 let scalar_expr = subquery
                     .subquery
                     .head_output_expr()?
                     .map_or(plan_err!("single expression required."), Ok)?;
+                let subqry_alias = self.alias_gen.next("__scalar_sq");
+                let col = create_col_from_scalar_expr(
+                    &scalar_expr,
+                    subqry_alias.clone(),
+                )?;
+                self.sub_query_info.push((subquery, subqry_alias));
                 Ok(Transformed::new(
-                    Expr::Column(create_col_from_scalar_expr(
-                        &scalar_expr,
-                        subqry_alias,
-                    )?),
+                    Expr::Column(col),
                     true,
                     TreeNodeRecursion::Jump,
                 ))

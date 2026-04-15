@@ -161,12 +161,12 @@ impl<'a> PhysicalPlanDecodeContext<'a> {
     /// container.
     pub fn with_scalar_subquery_results(
         &self,
-        scalar_subquery_results: Option<ScalarSubqueryResults>,
+        scalar_subquery_results: ScalarSubqueryResults,
     ) -> Self {
         Self {
             task_ctx: self.task_ctx,
             codec: self.codec,
-            scalar_subquery_results,
+            scalar_subquery_results: Some(scalar_subquery_results),
         }
     }
 }
@@ -2216,7 +2216,7 @@ impl protobuf::PhysicalPlanNode {
         // First, deserialize the main input plan. We set up the subquery results
         // container first, so that ScalarSubqueryExpr nodes can reference it.
         let subquery_results = ScalarSubqueryResults::new(sq.subqueries.len());
-        let input_ctx = ctx.with_scalar_subquery_results(Some(subquery_results.clone()));
+        let input_ctx = ctx.with_scalar_subquery_results(subquery_results.clone());
         let input = into_physical_plan(&sq.input, &input_ctx, proto_converter)?;
 
         // Now deserialize the subquery children.

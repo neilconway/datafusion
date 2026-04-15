@@ -17,10 +17,9 @@
 
 //! See `main.rs` for how to run it.
 //!
-//! This example demonstrates how to use the
-//! `PhysicalProtoConverterExtension` trait's interception methods
-//! (`execution_plan_to_proto` and `proto_to_execution_plan`) to implement
-//! custom serialization logic.
+//! This example demonstrates how to use the `PhysicalProtoConverterExtension`
+//! trait's interception methods (`execution_plan_to_proto` and
+//! `proto_to_execution_plan`) to implement custom serialization logic.
 //!
 //! The key insight is that `FileScanConfig::expr_adapter_factory` is NOT serialized by
 //! default. This example shows how to:
@@ -29,10 +28,10 @@
 //! 3. Store the inner DataSourceExec (without adapter) as a child in the extension's inputs field
 //! 4. Unwrap and restore the adapter during deserialization
 //!
-//! This demonstrates nested serialization (protobuf outer, JSON inner) and the power
-//! of `PhysicalProtoConverterExtension`. Both plan and expression
-//! serialization route through converter hooks, enabling interception at
-//! every node in the tree.
+//! This demonstrates nested serialization (protobuf outer, JSON inner) and the
+//! power of `PhysicalProtoConverterExtension`. Both plan and expression
+//! serialization route through converter hooks, enabling interception at every
+//! node in the tree.
 
 use std::fmt::Debug;
 use std::sync::Arc;

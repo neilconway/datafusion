@@ -3409,6 +3409,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scalar_subquery_mixed_correlated_and_uncorrelated_executes() -> Result<()> {
+        let query = "SELECT t.x, \
+                     (SELECT max(y) FROM (VALUES (10), (20)) AS u(y)) + \
+                     (SELECT count(*) FROM (VALUES (1), (1), (2)) AS v(z) WHERE v.z = t.x) AS total \
+                     FROM (VALUES (1), (2), (3)) AS t(x) \
+                     ORDER BY x";
+        let plan = plan_sql(query).await?;
+
+        let formatted = format!("{plan:?}");
+        assert_eq!(formatted.matches("ScalarSubqueryExec").count(), 1);
+        assert!(
+            formatted.contains("HashJoinExec")
+                || formatted.contains("SortMergeJoinExec")
+                || formatted.contains("NestedLoopJoinExec")
+        );
+
+        let batches = collect_sql(query).await?;
+        assert_batches_eq!(
+            &[
+                "+---+-------+",
+                "| x | total |",
+                "+---+-------+",
+                "| 1 | 22    |",
+                "| 2 | 21    |",
+                "| 3 | 20    |",
+                "+---+-------+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn scalar_subquery_in_projection_and_filter_plans() -> Result<()> {
         let plan = plan_sql(
             "SELECT x + (SELECT max(y) FROM (VALUES (10), (20)) AS u(y)) \

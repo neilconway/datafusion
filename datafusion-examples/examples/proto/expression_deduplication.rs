@@ -49,7 +49,7 @@ use datafusion::prelude::SessionContext;
 use datafusion_proto::physical_plan::from_proto::parse_physical_expr_with_converter;
 use datafusion_proto::physical_plan::to_proto::serialize_physical_expr_with_converter;
 use datafusion_proto::physical_plan::{
-    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec,
+    DefaultPhysicalExtensionCodec, PhysicalExtensionCodec, PhysicalPlanDecodeContext,
     PhysicalProtoConverterExtension,
 };
 use datafusion_proto::protobuf::{PhysicalExprNode, PhysicalPlanNode};
@@ -201,13 +201,12 @@ impl PhysicalExtensionCodec for CachingCodec {
 }
 
 impl PhysicalProtoConverterExtension for CachingCodec {
-    fn proto_to_execution_plan(
+    fn proto_to_execution_plan_with_context(
         &self,
-        ctx: &TaskContext,
-        extension_codec: &dyn PhysicalExtensionCodec,
         proto: &PhysicalPlanNode,
+        ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        proto.try_into_physical_plan_with_converter(ctx, extension_codec, self)
+        self.default_proto_to_execution_plan_with_context(proto, ctx)
     }
 
     fn execution_plan_to_proto(
@@ -223,12 +222,11 @@ impl PhysicalProtoConverterExtension for CachingCodec {
     }
 
     // CACHING IMPLEMENTATION: Intercept expression deserialization
-    fn proto_to_physical_expr(
+    fn proto_to_physical_expr_with_context(
         &self,
         proto: &PhysicalExprNode,
-        ctx: &TaskContext,
         input_schema: &Schema,
-        codec: &dyn PhysicalExtensionCodec,
+        ctx: &PhysicalPlanDecodeContext<'_>,
     ) -> Result<Arc<dyn PhysicalExpr>> {
         // Create cache key from protobuf bytes
         let mut key = Vec::new();
@@ -250,8 +248,7 @@ impl PhysicalProtoConverterExtension for CachingCodec {
         }
 
         // Cache miss - deserialize and store
-        let expr =
-            parse_physical_expr_with_converter(proto, ctx, input_schema, codec, self)?;
+        let expr = parse_physical_expr_with_converter(proto, input_schema, ctx, self)?;
 
         // Store in cache
         {

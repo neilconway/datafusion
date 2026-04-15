@@ -72,10 +72,12 @@ impl From<&protobuf::PhysicalColumn> for Column {
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical sort expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
-/// * `codec` - An extension codec used to decode custom UDFs.
+/// * `ctx` - Decode context carrying the task context, extension codec, and
+///   any scoped state needed during recursive deserialization.
+/// * `proto_converter` - Converter hooks used for recursive physical plan and
+///   expression deserialization.
 pub fn parse_physical_sort_expr(
     proto: &protobuf::PhysicalSortExprNode,
     ctx: &PhysicalPlanDecodeContext<'_>,
@@ -100,10 +102,12 @@ pub fn parse_physical_sort_expr(
 /// # Arguments
 ///
 /// * `proto` - Input proto with vector of physical sort expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
 /// * `input_schema` - The Arrow schema for the input, used for determining expression data types
 ///   when performing type coercion.
-/// * `codec` - An extension codec used to decode custom UDFs.
+/// * `ctx` - Decode context carrying the task context, extension codec, and
+///   any scoped state needed during recursive deserialization.
+/// * `proto_converter` - Converter hooks used for recursive physical plan and
+///   expression deserialization.
 pub fn parse_physical_sort_exprs(
     proto: &[protobuf::PhysicalSortExprNode],
     ctx: &PhysicalPlanDecodeContext<'_>,
@@ -124,10 +128,12 @@ pub fn parse_physical_sort_exprs(
 ///
 /// * `proto` - Input proto with physical window expression node.
 /// * `name` - Name of the window expression.
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
-/// * `input_schema` - The Arrow schema for the input, used for determining expression data types
-///   when performing type coercion.
-/// * `codec` - An extension codec used to decode custom UDFs.
+/// * `input_schema` - The Arrow schema for the input, used for determining
+///   expression data types when performing type coercion.
+/// * `ctx` - Decode context carrying the task context, extension codec, and
+///   any scoped state needed during recursive deserialization.
+/// * `proto_converter` - Converter hooks used for recursive physical plan and
+///   expression deserialization.
 pub fn parse_physical_window_expr(
     proto: &protobuf::PhysicalWindowExprNode,
     ctx: &PhysicalPlanDecodeContext<'_>,
@@ -215,10 +221,11 @@ where
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
-/// * `input_schema` - The Arrow schema for the input, used for determining expression data types
-///   when performing type coercion.
-/// * `codec` - An extension codec used to decode custom UDFs.
+/// * `ctx` - Task context used to resolve registered functions.
+/// * `input_schema` - The Arrow schema for the input, used for determining
+///   expression data types when performing type coercion.
+/// * `codec` - Physical extension codec used to construct the root decode
+///   context for deserialization.
 pub fn parse_physical_expr(
     proto: &protobuf::PhysicalExprNode,
     ctx: &TaskContext,
@@ -239,11 +246,12 @@ pub fn parse_physical_expr(
 /// # Arguments
 ///
 /// * `proto` - Input proto with physical expression node
-/// * `registry` - A registry knows how to build logical expressions out of user-defined function names
-/// * `input_schema` - The Arrow schema for the input, used for determining expression data types
-///   when performing type coercion.
-/// * `codec` - An extension codec used to decode custom UDFs.
-/// * `proto_converter` - Conversion functions for physical plans and expressions
+/// * `input_schema` - The Arrow schema for the input, used for determining
+///   expression data types when performing type coercion.
+/// * `ctx` - Decode context carrying the task context, extension codec, and
+///   any scoped state needed during recursive deserialization.
+/// * `proto_converter` - Converter hooks used for recursive physical plan and
+///   expression deserialization.
 pub fn parse_physical_expr_with_converter(
     proto: &protobuf::PhysicalExprNode,
     input_schema: &Schema,

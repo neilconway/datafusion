@@ -17,9 +17,10 @@
 
 //! See `main.rs` for how to run it.
 //!
-//! This example demonstrates how to use the `PhysicalExtensionCodec` trait's
-//! interception methods (`serialize_physical_plan` and `deserialize_physical_plan`)
-//! to implement custom serialization logic.
+//! This example demonstrates how to use the
+//! `PhysicalProtoConverterExtension` trait's interception methods
+//! (`execution_plan_to_proto` and `proto_to_execution_plan`) to implement
+//! custom serialization logic.
 //!
 //! The key insight is that `FileScanConfig::expr_adapter_factory` is NOT serialized by
 //! default. This example shows how to:
@@ -29,8 +30,9 @@
 //! 4. Unwrap and restore the adapter during deserialization
 //!
 //! This demonstrates nested serialization (protobuf outer, JSON inner) and the power
-//! of the `PhysicalExtensionCodec` interception pattern. Both plan and expression
-//! serialization route through the codec, enabling interception at every node in the tree.
+//! of `PhysicalProtoConverterExtension`. Both plan and expression
+//! serialization route through converter hooks, enabling interception at
+//! every node in the tree.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -177,7 +179,7 @@ pub async fn adapter_serialization() -> Result<()> {
     println!("\n=== Example Complete! ===");
     println!("Key takeaways:");
     println!(
-        "  1. PhysicalExtensionCodec provides serialize_physical_plan/deserialize_physical_plan hooks"
+        "  1. PhysicalProtoConverterExtension provides execution_plan_to_proto/proto_to_execution_plan hooks"
     );
     println!("  2. Custom metadata can be wrapped as PhysicalExtensionNode");
     println!("  3. Nested serialization (protobuf + JSON) works seamlessly");
@@ -303,9 +305,10 @@ impl PhysicalExtensionCodec for AdapterPreservingCodec {
         _node: Arc<dyn ExecutionPlan>,
         _buf: &mut Vec<u8>,
     ) -> Result<()> {
-        // We don't need this for the example - we use serialize_physical_plan instead
+        // We don't need this for the example - adapter wrapping happens in
+        // `execution_plan_to_proto` instead.
         not_impl_err!(
-            "try_encode not used - adapter wrapping happens in serialize_physical_plan"
+            "try_encode not used - adapter wrapping happens in execution_plan_to_proto"
         )
     }
 }

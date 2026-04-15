@@ -240,7 +240,11 @@ pub fn serialize_physical_expr(
     value: &Arc<dyn PhysicalExpr>,
     codec: &dyn PhysicalExtensionCodec,
 ) -> Result<protobuf::PhysicalExprNode> {
-    serialize_physical_expr_with_converter(value, codec, &DefaultPhysicalProtoConverter {})
+    serialize_physical_expr_with_converter(
+        value,
+        codec,
+        &DefaultPhysicalProtoConverter {},
+    )
 }
 
 /// Serialize a `PhysicalExpr` to default protobuf representation.

@@ -17,8 +17,9 @@
 
 //! See `main.rs` for how to run it.
 //!
-//! This example demonstrates how to use the `PhysicalExtensionCodec` trait's
-//! interception methods to implement expression deduplication during deserialization.
+//! This example demonstrates how to use the
+//! `PhysicalProtoConverterExtension` trait's interception methods to
+//! implement expression deduplication during deserialization.
 //!
 //! This pattern is inspired by PR #18192, which introduces expression caching
 //! to reduce memory usage when deserializing plans with duplicate expressions.
@@ -29,8 +30,9 @@
 //! 2. Reduce memory allocation during deserialization
 //! 3. Enable downstream optimizations that rely on Arc pointer equality
 //!
-//! This demonstrates the decorator pattern enabled by the `PhysicalExtensionCodec` trait,
-//! where all expression serialization/deserialization routes through the codec methods.
+//! This demonstrates the decorator pattern enabled by
+//! `PhysicalProtoConverterExtension`, where physical-expression
+//! serialization and deserialization route through converter hooks.
 
 use std::collections::HashMap;
 use std::fmt::Debug;

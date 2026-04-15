@@ -265,10 +265,8 @@ impl TreeNodeRewriter for ExtractScalarSubQuery<'_> {
                     .head_output_expr()?
                     .map_or(plan_err!("single expression required."), Ok)?;
                 let subqry_alias = self.alias_gen.next("__scalar_sq");
-                let col = create_col_from_scalar_expr(
-                    &scalar_expr,
-                    subqry_alias.clone(),
-                )?;
+                let col =
+                    create_col_from_scalar_expr(&scalar_expr, subqry_alias.clone())?;
                 self.sub_query_info.push((subquery, subqry_alias));
                 Ok(Transformed::new(
                     Expr::Column(col),

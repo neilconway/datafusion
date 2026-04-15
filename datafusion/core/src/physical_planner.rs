@@ -440,32 +440,31 @@ impl DefaultPhysicalPlanner {
                 .plan_scalar_subqueries(all_subqueries, session_state)
                 .await?;
 
+            if links.is_empty() {
+                return self
+                    .create_initial_plan_inner(logical_plan, session_state)
+                    .await;
+            }
+
             // Create the shared `ScalarSubqueryResults` container and register
-            // it in ExecutionProps so that `create_physical_expr` can resolve
+            // it in `ExecutionProps` so that `create_physical_expr` can resolve
             // `Expr::ScalarSubquery` into `ScalarSubqueryExpr` nodes. We clone
-            // the SessionState so these are available throughout physical
+            // the `SessionState` so these are available throughout physical
             // planning without mutating the caller's state.
             //
             // Ideally, the subquery state would live in a dedicated planning
-            // context rather than on ExecutionProps. It's here because
-            // `create_physical_expr` only receives `&ExecutionProps`, and
-            // changing that signature would be a breaking public API change.
-            let (session_state, results) = if links.is_empty() {
-                (Cow::Borrowed(session_state), ScalarSubqueryResults::new(0))
-            } else {
-                let results = ScalarSubqueryResults::new(links.len());
-                let mut owned = session_state.clone();
-                owned.execution_props_mut().subquery_indexes = index_map;
-                owned.execution_props_mut().subquery_results = results.clone();
-                (Cow::Owned(owned), results)
-            };
+            // context rather than in `ExecutionProps`. It's here because
+            // `create_physical_expr` only receives `&ExecutionProps`.
+            let results = ScalarSubqueryResults::new(links.len());
+            let mut owned = session_state.clone();
+            owned.execution_props_mut().subquery_indexes = index_map;
+            owned.execution_props_mut().subquery_results = results.clone();
+            let session_state = Cow::Owned(owned);
 
             let plan = self
                 .create_initial_plan_inner(logical_plan, &session_state)
                 .await?;
-            Ok(Self::wrap_scalar_subquery_exec_if_needed(
-                plan, links, results,
-            ))
+            Ok(Arc::new(ScalarSubqueryExec::new(plan, links, results)))
         })
     }
 
@@ -2963,18 +2962,6 @@ impl DefaultPhysicalPlanner {
             index_map.insert(sq, index);
         }
         Ok((links, index_map))
-    }
-
-    fn wrap_scalar_subquery_exec_if_needed(
-        input: Arc<dyn ExecutionPlan>,
-        subqueries: Vec<ScalarSubqueryLink>,
-        results: ScalarSubqueryResults,
-    ) -> Arc<dyn ExecutionPlan> {
-        if subqueries.is_empty() {
-            input
-        } else {
-            Arc::new(ScalarSubqueryExec::new(input, subqueries, results))
-        }
     }
 
     fn create_project_physical_exec_with_props(

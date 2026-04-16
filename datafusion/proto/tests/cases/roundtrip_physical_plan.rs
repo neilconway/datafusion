@@ -3233,12 +3233,10 @@ fn roundtrip_scalar_subquery_exec() -> Result<()> {
         .expect("expected FilterExec");
     let binary_expr = filter_exec
         .predicate()
-        .as_any()
         .downcast_ref::<BinaryExpr>()
         .expect("expected BinaryExpr");
     let deserialized_sq_expr = binary_expr
         .right()
-        .as_any()
         .downcast_ref::<ScalarSubqueryExpr>()
         .expect("expected ScalarSubqueryExpr");
 
@@ -3316,12 +3314,10 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
         .expect("expected outer FilterExec");
     let outer_binary = outer_filter
         .predicate()
-        .as_any()
         .downcast_ref::<BinaryExpr>()
         .expect("expected outer BinaryExpr");
     let outer_sq_expr = outer_binary
         .right()
-        .as_any()
         .downcast_ref::<ScalarSubqueryExpr>()
         .expect("expected outer ScalarSubqueryExpr");
 
@@ -3336,12 +3332,10 @@ fn roundtrip_nested_scalar_subquery_exec_scopes_results() -> Result<()> {
         .expect("expected inner FilterExec");
     let inner_binary = inner_filter
         .predicate()
-        .as_any()
         .downcast_ref::<BinaryExpr>()
         .expect("expected inner BinaryExpr");
     let inner_sq_expr = inner_binary
         .right()
-        .as_any()
         .downcast_ref::<ScalarSubqueryExpr>()
         .expect("expected inner ScalarSubqueryExpr");
 

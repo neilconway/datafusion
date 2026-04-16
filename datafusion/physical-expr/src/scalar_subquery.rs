@@ -17,7 +17,6 @@
 
 //! Physical expression for uncorrelated scalar subqueries.
 
-use std::any::Any;
 use std::fmt;
 use std::hash::Hash;
 use std::sync::Arc;
@@ -105,10 +104,6 @@ impl PartialEq for ScalarSubqueryExpr {
 impl Eq for ScalarSubqueryExpr {}
 
 impl PhysicalExpr for ScalarSubqueryExpr {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn return_field(&self, _input_schema: &Schema) -> Result<FieldRef> {
         Ok(Arc::new(Field::new(
             "scalar_subquery",

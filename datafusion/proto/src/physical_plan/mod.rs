@@ -929,7 +929,6 @@ impl protobuf::PhysicalPlanNode {
             let conf = parse_protobuf_file_scan_config(
                 scan.base_conf.as_ref().unwrap(),
                 ctx,
-                codec,
                 proto_converter,
                 Arc::new(AvroSource::new(table_schema)),
             )?;

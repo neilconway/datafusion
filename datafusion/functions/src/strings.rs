@@ -30,8 +30,8 @@ use arrow::datatypes::DataType;
 /// at a time from multiple input columns.
 ///
 /// Each row is written via repeated `write` calls, followed by a single
-/// `append_offset` to commit the row. The output null buffer is computed in
-/// bulk by the caller and supplied to `finish`.
+/// `append_offset` call to commit the row. The output null buffer is supplied
+/// by the caller at `finish` time.
 pub(crate) struct ConcatStringBuilder {
     offsets_buffer: MutableBuffer,
     value_buffer: MutableBuffer,
@@ -158,10 +158,8 @@ impl ConcatStringBuilder {
 /// row at a time from multiple input columns.
 ///
 /// Each row is written via repeated `write` calls, followed by a single
-/// `append_offset` to commit the row as a single string view. The output null
-/// buffer is supplied by the caller at `finish` time.
-///
-/// [`StringViewArray`]: arrow::array::StringViewArray
+/// `append_offset` call to commit the row as a single string view. The output
+/// null buffer is supplied by the caller at `finish` time.
 pub(crate) struct ConcatStringViewBuilder {
     views: Vec<u128>,
     data: Vec<u8>,

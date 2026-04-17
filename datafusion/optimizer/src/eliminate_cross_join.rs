@@ -85,9 +85,12 @@ impl OptimizerRule for EliminateCrossJoin {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        // Skip plan shapes the rule cannot rewrite. This avoids the schema
-        // clone and JoinKeySet allocation below on the ~95% of TPC-DS plan
-        // nodes that never trigger a transformation.
+        // Dispatch before moving `plan` into the body below. On the ~95% of
+        // TPC-DS plan nodes that can never match, this skips repeated
+        // by-value destructures of the `plan` enum plus the surrounding
+        // stack setup — small per-node savings that compound over the
+        // recursive walk. It also lets the body assume plan is either
+        // Filter(InnerJoin) or a flattenable Inner Join.
         match &plan {
             LogicalPlan::Filter(f) if is_inner_join(f.input.as_ref()) => {}
             LogicalPlan::Join(_) if is_flattenable_inner_join(&plan) => {}

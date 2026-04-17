@@ -269,15 +269,10 @@ fn union_orderby_query(n: usize) -> String {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    // verify that we can load the clickbench data prior to running the benchmark
-    if !PathBuf::from(format!("{BENCHMARKS_PATH_1}{CLICKBENCH_DATA_PATH}")).exists()
-        && !PathBuf::from(format!("{BENCHMARKS_PATH_2}{CLICKBENCH_DATA_PATH}")).exists()
-    {
-        panic!(
-            "benchmarks/data/hits_partitioned/ could not be loaded. Please run \
-         'benchmarks/bench.sh data clickbench_partitioned' prior to running this benchmark"
-        )
-    }
+    let clickbench_data_present =
+        PathBuf::from(format!("{BENCHMARKS_PATH_1}{CLICKBENCH_DATA_PATH}")).exists()
+            || PathBuf::from(format!("{BENCHMARKS_PATH_2}{CLICKBENCH_DATA_PATH}"))
+                .exists();
 
     let ctx = create_context();
     let rt = Runtime::new().unwrap();
@@ -554,14 +549,6 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
 
-    // c.bench_function("logical_plan_tpch_all", |b| {
-    //     b.iter(|| {
-    //         for sql in &all_tpch_sql_queries {
-    //             logical_plan(&tpch_ctx, sql)
-    //         }
-    //     })
-    // });
-
     // --- TPC-DS ---
 
     let tpcds_ctx = register_defs(SessionContext::new(), tpcds_schemas());
@@ -589,63 +576,155 @@ fn criterion_benchmark(c: &mut Criterion) {
         })
     });
 
-    // c.bench_function("logical_plan_tpcds_all", |b| {
-    //     b.iter(|| {
-    //         for sql in &all_tpcds_sql_queries {
-    //             logical_plan(&tpcds_ctx, sql)
-    //         }
-    //     })
-    // });
-
     // -- clickbench --
-    let clickbench_queries = (0..=42)
-        .map(|q| {
-            std::fs::read_to_string(format!(
-                "{benchmarks_path}queries/clickbench/queries/q{q}.sql"
-            ))
-            .unwrap()
-        })
-        .chain((0..=7).map(|q| {
-            std::fs::read_to_string(format!(
-                "{benchmarks_path}queries/clickbench/extended/q{q}.sql"
-            ))
-            .unwrap()
-        }))
-        .collect::<Vec<_>>();
+    // ClickBench requires a ~14 GB partitioned parquet dataset to be present;
+    // we gracefully skip registering these benches when the data is absent so
+    // that planner perf work on TPC-H / TPC-DS isn't blocked on the download.
+    let (clickbench_queries, clickbench_ctx) = if clickbench_data_present {
+        let queries = (0..=42)
+            .map(|q| {
+                std::fs::read_to_string(format!(
+                    "{benchmarks_path}queries/clickbench/queries/q{q}.sql"
+                ))
+                .unwrap()
+            })
+            .chain((0..=7).map(|q| {
+                std::fs::read_to_string(format!(
+                    "{benchmarks_path}queries/clickbench/extended/q{q}.sql"
+                ))
+                .unwrap()
+            }))
+            .collect::<Vec<_>>();
+        let ctx = register_clickbench_hits_table(&rt);
 
-    let clickbench_ctx = register_clickbench_hits_table(&rt);
+        for (i, sql) in queries.iter().enumerate() {
+            c.bench_function(&format!("physical_plan_clickbench_q{}", i + 1), |b| {
+                b.iter(|| physical_plan(&ctx, &rt, sql))
+            });
+        }
 
-    // for (i, sql) in clickbench_queries.iter().enumerate() {
-    //     c.bench_function(&format!("logical_plan_clickbench_q{}", i + 1), |b| {
-    //         b.iter(|| logical_plan(&clickbench_ctx, sql))
-    //     });
-    // }
-
-    for (i, sql) in clickbench_queries.iter().enumerate() {
-        c.bench_function(&format!("physical_plan_clickbench_q{}", i + 1), |b| {
-            b.iter(|| physical_plan(&clickbench_ctx, &rt, sql))
+        c.bench_function("physical_plan_clickbench_all", |b| {
+            b.iter(|| {
+                for sql in &queries {
+                    physical_plan(&ctx, &rt, sql)
+                }
+            })
         });
-    }
 
-    // c.bench_function("logical_plan_clickbench_all", |b| {
-    //     b.iter(|| {
-    //         for sql in &clickbench_queries {
-    //             logical_plan(&clickbench_ctx, sql)
-    //         }
-    //     })
-    // });
-
-    c.bench_function("physical_plan_clickbench_all", |b| {
-        b.iter(|| {
-            for sql in &clickbench_queries {
-                physical_plan(&clickbench_ctx, &rt, sql)
-            }
-        })
-    });
+        (Some(queries), Some(ctx))
+    } else {
+        eprintln!(
+            "Skipping ClickBench benches: {BENCHMARKS_PATH_1}{CLICKBENCH_DATA_PATH} \
+             not found. Run 'benchmarks/bench.sh data clickbench_partitioned' to \
+             enable them."
+        );
+        (None, None)
+    };
 
     c.bench_function("with_param_values_many_columns", |b| {
         benchmark_with_param_values_many_columns(&ctx, &rt, b);
     });
+
+    // =========================================================================
+    // Phase-isolated planner benches.
+    //
+    // Opt-in via `DF_BENCH_PLANNER_PHASES=1 cargo bench --bench sql_planner`.
+    // Gated to keep the default bench wall time unchanged. These are the
+    // preferred surface for planner-performance investigation: they isolate
+    // individual pipeline phases so a regression can be attributed to parse,
+    // SqlToRel, the analyzer + logical optimizer, or the physical planner +
+    // physical optimizer rather than only being visible as a shift in the
+    // whole-pipeline `physical_plan_*_all` numbers.
+    // =========================================================================
+    if std::env::var("DF_BENCH_PLANNER_PHASES").is_ok() {
+        // ----- end-to-end logical-side benches (parse + SqlToRel only) -----
+        // ctx.sql() does not invoke the analyzer or optimizer, so these
+        // measure parse + SqlToRel. Use logical_optimize_tpcds_all below for
+        // analyzer + logical optimizer cost.
+        c.bench_function("logical_plan_tpch_all", |b| {
+            b.iter(|| {
+                for sql in &all_tpch_sql_queries {
+                    logical_plan(&tpch_ctx, &rt, sql)
+                }
+            })
+        });
+
+        c.bench_function("logical_plan_tpcds_all", |b| {
+            b.iter(|| {
+                for sql in &all_tpcds_sql_queries {
+                    logical_plan(&tpcds_ctx, &rt, sql)
+                }
+            })
+        });
+
+        if let (Some(queries), Some(ctx)) =
+            (clickbench_queries.as_ref(), clickbench_ctx.as_ref())
+        {
+            c.bench_function("logical_plan_clickbench_all", |b| {
+                b.iter(|| {
+                    for sql in queries {
+                        logical_plan(ctx, &rt, sql)
+                    }
+                })
+            });
+        }
+
+        // ----- phase-isolated TPC-DS benches (richest rule coverage) -----
+
+        // Parse only: sqlparser-rs + DataFusion statement parsing.
+        let parser_dialect = Dialect::Generic;
+        c.bench_function("parse_tpcds_all", |b| {
+            b.iter(|| {
+                for sql in &all_tpcds_sql_queries {
+                    black_box(
+                        tpcds_ctx
+                            .state()
+                            .sql_to_statement(sql, &parser_dialect)
+                            .unwrap(),
+                    );
+                }
+            })
+        });
+
+        // Analyzer + logical optimizer, given pre-resolved logical plans.
+        // Strips parse + SqlToRel cost so the measurement is purely the
+        // optimizer wall time.
+        let tpcds_logical_plans: Vec<_> = all_tpcds_sql_queries
+            .iter()
+            .map(|sql| {
+                rt.block_on(tpcds_ctx.state().create_logical_plan(sql))
+                    .unwrap()
+            })
+            .collect();
+        c.bench_function("logical_optimize_tpcds_all", |b| {
+            b.iter(|| {
+                for plan in &tpcds_logical_plans {
+                    black_box(tpcds_ctx.state().optimize(plan).unwrap());
+                }
+            })
+        });
+
+        // DefaultPhysicalPlanner + PhysicalOptimizer, given pre-optimized
+        // logical plans. Bypasses SessionState::create_physical_plan to avoid
+        // re-running the logical optimizer on each iteration.
+        let tpcds_optimized_plans: Vec<_> = tpcds_logical_plans
+            .iter()
+            .map(|plan| tpcds_ctx.state().optimize(plan).unwrap())
+            .collect();
+        c.bench_function("physical_plan_tpcds_all_from_logical", |b| {
+            b.iter(|| {
+                for plan in &tpcds_optimized_plans {
+                    let state = tpcds_ctx.state();
+                    black_box(
+                        rt.block_on(
+                            state.query_planner().create_physical_plan(plan, &state),
+                        )
+                        .unwrap(),
+                    );
+                }
+            })
+        });
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);

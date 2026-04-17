@@ -85,6 +85,15 @@ impl OptimizerRule for EliminateCrossJoin {
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
+        // Skip plan shapes the rule cannot rewrite. This avoids the schema
+        // clone and JoinKeySet allocation below on the ~95% of TPC-DS plan
+        // nodes that never trigger a transformation.
+        match &plan {
+            LogicalPlan::Filter(f) if is_inner_join(f.input.as_ref()) => {}
+            LogicalPlan::Join(_) if is_flattenable_inner_join(&plan) => {}
+            _ => return rewrite_children(self, plan, config),
+        }
+
         let plan_schema = Arc::clone(plan.schema());
         let mut possible_join_keys = JoinKeySet::new();
         let mut all_inputs: Vec<LogicalPlan> = vec![];
@@ -92,25 +101,6 @@ impl OptimizerRule for EliminateCrossJoin {
         let mut null_equality = NullEquality::NullEqualsNothing;
 
         let parent_predicate = if let LogicalPlan::Filter(filter) = plan {
-            // if input isn't a join that can potentially be rewritten
-            // avoid unwrapping the input
-            let rewritable = matches!(
-                filter.input.as_ref(),
-                LogicalPlan::Join(Join {
-                    join_type: JoinType::Inner,
-                    ..
-                })
-            );
-
-            if !rewritable {
-                // recursively try to rewrite children
-                return rewrite_children(self, LogicalPlan::Filter(filter), config);
-            }
-
-            if !can_flatten_join_inputs(&filter.input) {
-                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
-            }
-
             let Filter {
                 input, predicate, ..
             } = filter;
@@ -130,29 +120,22 @@ impl OptimizerRule for EliminateCrossJoin {
             extract_possible_join_keys(&predicate, &mut possible_join_keys);
             Some(predicate)
         } else {
-            match plan {
-                LogicalPlan::Join(Join {
-                    join_type: JoinType::Inner,
-                    null_equality: original_null_equality,
-                    ..
-                }) => {
-                    if !can_flatten_join_inputs(&plan) {
-                        return Ok(Transformed::no(plan));
-                    }
-                    flatten_join_inputs(
-                        plan,
-                        &mut possible_join_keys,
-                        &mut all_inputs,
-                        &mut all_filters,
-                    )?;
-                    null_equality = original_null_equality;
-                    None
-                }
-                _ => {
-                    // recursively try to rewrite children
-                    return rewrite_children(self, plan, config);
-                }
-            }
+            let LogicalPlan::Join(Join {
+                join_type: JoinType::Inner,
+                null_equality: original_null_equality,
+                ..
+            }) = plan
+            else {
+                unreachable!("guarded by fast-path above")
+            };
+            flatten_join_inputs(
+                plan,
+                &mut possible_join_keys,
+                &mut all_inputs,
+                &mut all_filters,
+            )?;
+            null_equality = original_null_equality;
+            None
         };
 
         // Join keys are handled locally:
@@ -222,12 +205,38 @@ fn rewrite_children(
     }
 }
 
+fn is_inner_join(plan: &LogicalPlan) -> bool {
+    matches!(
+        plan,
+        LogicalPlan::Join(Join {
+            join_type: JoinType::Inner,
+            ..
+        })
+    )
+}
+
+/// Returns true if `plan` is an inner join the rule may need to rewrite —
+/// either because one of its inputs is itself an inner join (so the chain
+/// might flatten into a wider join) or because it carries a non-equi
+/// `filter` that the rule lifts to a wrapping `Filter` for `PushDownFilter`
+/// to re-place. An inner join with non-inner-join inputs and no filter is
+/// already canonical and is left alone.
+fn is_flattenable_inner_join(plan: &LogicalPlan) -> bool {
+    let LogicalPlan::Join(Join {
+        left,
+        right,
+        filter,
+        join_type: JoinType::Inner,
+        ..
+    }) = plan
+    else {
+        return false;
+    };
+    filter.is_some() || is_inner_join(left.as_ref()) || is_inner_join(right.as_ref())
+}
+
 /// Recursively accumulate possible_join_keys and inputs from inner joins
 /// (including cross joins).
-///
-/// Assumes can_flatten_join_inputs has returned true and thus the plan can be
-/// flattened. Adds all leaf inputs to `all_inputs` and join_keys to
-/// possible_join_keys
 fn flatten_join_inputs(
     plan: LogicalPlan,
     possible_join_keys: &mut JoinKeySet,
@@ -258,30 +267,6 @@ fn flatten_join_inputs(
         }
     };
     Ok(())
-}
-
-/// Returns true if the plan is a Join or Cross join could be flattened with
-/// `flatten_join_inputs`
-///
-/// Must stay in sync with `flatten_join_inputs`
-fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
-    // can only flatten inner / cross joins
-    match plan {
-        LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {}
-        _ => return false,
-    };
-
-    for child in plan.inputs() {
-        if let LogicalPlan::Join(Join {
-            join_type: JoinType::Inner,
-            ..
-        }) = child
-            && !can_flatten_join_inputs(child)
-        {
-            return false;
-        }
-    }
-    true
 }
 
 /// Finds the next to join with the left input plan,

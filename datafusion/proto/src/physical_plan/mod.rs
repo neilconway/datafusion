@@ -2857,9 +2857,9 @@ impl protobuf::PhysicalPlanNode {
         proto_converter: &dyn PhysicalProtoConverterExtension,
     ) -> Result<Option<Self>> {
         let data_source = data_source_exec.data_source();
-        if let Some(maybe_csv) = data_source.as_any().downcast_ref::<FileScanConfig>() {
+        if let Some(maybe_csv) = data_source.downcast_ref::<FileScanConfig>() {
             let source = maybe_csv.file_source();
-            if let Some(csv_config) = source.as_any().downcast_ref::<CsvSource>() {
+            if let Some(csv_config) = source.downcast_ref::<CsvSource>() {
                 return Ok(Some(protobuf::PhysicalPlanNode {
                     physical_plan_type: Some(PhysicalPlanType::CsvScan(
                         protobuf::CsvScanExecNode {
@@ -2899,9 +2899,9 @@ impl protobuf::PhysicalPlanNode {
             }
         }
 
-        if let Some(scan_conf) = data_source.as_any().downcast_ref::<FileScanConfig>() {
+        if let Some(scan_conf) = data_source.downcast_ref::<FileScanConfig>() {
             let source = scan_conf.file_source();
-            if let Some(_json_source) = source.as_any().downcast_ref::<JsonSource>() {
+            if let Some(_json_source) = source.downcast_ref::<JsonSource>() {
                 return Ok(Some(protobuf::PhysicalPlanNode {
                     physical_plan_type: Some(PhysicalPlanType::JsonScan(
                         protobuf::JsonScanExecNode {
@@ -2916,9 +2916,9 @@ impl protobuf::PhysicalPlanNode {
             }
         }
 
-        if let Some(scan_conf) = data_source.as_any().downcast_ref::<FileScanConfig>() {
+        if let Some(scan_conf) = data_source.downcast_ref::<FileScanConfig>() {
             let source = scan_conf.file_source();
-            if let Some(_arrow_source) = source.as_any().downcast_ref::<ArrowSource>() {
+            if let Some(_arrow_source) = source.downcast_ref::<ArrowSource>() {
                 return Ok(Some(protobuf::PhysicalPlanNode {
                     physical_plan_type: Some(PhysicalPlanType::ArrowScan(
                         protobuf::ArrowScanExecNode {
@@ -2957,9 +2957,9 @@ impl protobuf::PhysicalPlanNode {
         }
 
         #[cfg(feature = "avro")]
-        if let Some(maybe_avro) = data_source.as_any().downcast_ref::<FileScanConfig>() {
+        if let Some(maybe_avro) = data_source.downcast_ref::<FileScanConfig>() {
             let source = maybe_avro.file_source();
-            if source.as_any().downcast_ref::<AvroSource>().is_some() {
+            if source.downcast_ref::<AvroSource>().is_some() {
                 return Ok(Some(protobuf::PhysicalPlanNode {
                     physical_plan_type: Some(PhysicalPlanType::AvroScan(
                         protobuf::AvroScanExecNode {
@@ -2974,9 +2974,7 @@ impl protobuf::PhysicalPlanNode {
             }
         }
 
-        if let Some(source_conf) =
-            data_source.as_any().downcast_ref::<MemorySourceConfig>()
-        {
+        if let Some(source_conf) = data_source.downcast_ref::<MemorySourceConfig>() {
             let proto_partitions = source_conf
                 .partitions()
                 .iter()
@@ -3369,7 +3367,7 @@ impl protobuf::PhysicalPlanNode {
             None => None,
         };
 
-        if let Some(sink) = exec.sink().as_any().downcast_ref::<JsonSink>() {
+        if let Some(sink) = exec.sink().downcast_ref::<JsonSink>() {
             return Ok(Some(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::JsonSink(Box::new(
                     protobuf::JsonSinkExecNode {
@@ -3382,7 +3380,7 @@ impl protobuf::PhysicalPlanNode {
             }));
         }
 
-        if let Some(sink) = exec.sink().as_any().downcast_ref::<CsvSink>() {
+        if let Some(sink) = exec.sink().downcast_ref::<CsvSink>() {
             return Ok(Some(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::CsvSink(Box::new(
                     protobuf::CsvSinkExecNode {
@@ -3396,7 +3394,7 @@ impl protobuf::PhysicalPlanNode {
         }
 
         #[cfg(feature = "parquet")]
-        if let Some(sink) = exec.sink().as_any().downcast_ref::<ParquetSink>() {
+        if let Some(sink) = exec.sink().downcast_ref::<ParquetSink>() {
             return Ok(Some(protobuf::PhysicalPlanNode {
                 physical_plan_type: Some(PhysicalPlanType::ParquetSink(Box::new(
                     protobuf::ParquetSinkExecNode {

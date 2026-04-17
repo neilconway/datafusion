@@ -1476,7 +1476,6 @@ fn contain(e: &Expr, check_map: &HashMap<String, Expr>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::cmp::Ordering;
     use std::fmt::{Debug, Formatter};
 
@@ -3149,10 +3148,6 @@ mod tests {
             Ok((0..filters.len())
                 .map(|_| self.filter_support.clone())
                 .collect())
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
         }
     }
 

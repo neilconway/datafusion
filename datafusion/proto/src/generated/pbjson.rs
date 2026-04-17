@@ -15949,6 +15949,9 @@ impl serde::Serialize for PhysicalBinaryExprNode {
         if !self.op.is_empty() {
             len += 1;
         }
+        if !self.operands.is_empty() {
+            len += 1;
+        }
         let mut struct_ser = serializer.serialize_struct("datafusion.PhysicalBinaryExprNode", len)?;
         if let Some(v) = self.l.as_ref() {
             struct_ser.serialize_field("l", v)?;
@@ -15958,6 +15961,9 @@ impl serde::Serialize for PhysicalBinaryExprNode {
         }
         if !self.op.is_empty() {
             struct_ser.serialize_field("op", &self.op)?;
+        }
+        if !self.operands.is_empty() {
+            struct_ser.serialize_field("operands", &self.operands)?;
         }
         struct_ser.end()
     }
@@ -15972,6 +15978,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalBinaryExprNode {
             "l",
             "r",
             "op",
+            "operands",
         ];
 
         #[allow(clippy::enum_variant_names)]
@@ -15979,6 +15986,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalBinaryExprNode {
             L,
             R,
             Op,
+            Operands,
         }
         impl<'de> serde::Deserialize<'de> for GeneratedField {
             fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
@@ -16003,6 +16011,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalBinaryExprNode {
                             "l" => Ok(GeneratedField::L),
                             "r" => Ok(GeneratedField::R),
                             "op" => Ok(GeneratedField::Op),
+                            "operands" => Ok(GeneratedField::Operands),
                             _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
                         }
                     }
@@ -16025,6 +16034,7 @@ impl<'de> serde::Deserialize<'de> for PhysicalBinaryExprNode {
                 let mut l__ = None;
                 let mut r__ = None;
                 let mut op__ = None;
+                let mut operands__ = None;
                 while let Some(k) = map_.next_key()? {
                     match k {
                         GeneratedField::L => {
@@ -16045,12 +16055,19 @@ impl<'de> serde::Deserialize<'de> for PhysicalBinaryExprNode {
                             }
                             op__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::Operands => {
+                            if operands__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("operands"));
+                            }
+                            operands__ = Some(map_.next_value()?);
+                        }
                     }
                 }
                 Ok(PhysicalBinaryExprNode {
                     l: l__,
                     r: r__,
                     op: op__.unwrap_or_default(),
+                    operands: operands__.unwrap_or_default(),
                 })
             }
         }

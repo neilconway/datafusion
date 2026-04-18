@@ -21,12 +21,12 @@ use std::sync::Arc;
 
 use crate::join_key_set::JoinKeySet;
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{NullEquality, Result};
+use datafusion_common::{DFSchemaRef, NullEquality, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
 use datafusion_expr::logical_plan::{
     Filter, Join, JoinConstraint, JoinType, LogicalPlan, Projection,
 };
-use datafusion_expr::utils::{can_hash, find_valid_equijoin_key_pair};
+use datafusion_expr::utils::can_hash;
 use datafusion_expr::{ExprSchemable, Operator, and, build_join_schema};
 
 #[derive(Default, Debug)]
@@ -36,6 +36,98 @@ impl EliminateCrossJoin {
     #[expect(missing_docs)]
     pub fn new() -> Self {
         Self {}
+    }
+}
+
+#[derive(Debug)]
+struct JoinGroup {
+    plan: LogicalPlan,
+    leaf_members: Vec<bool>,
+}
+
+impl JoinGroup {
+    fn new(plan: LogicalPlan, input_count: usize, leaf_index: usize) -> Self {
+        let mut leaf_members = vec![false; input_count];
+        leaf_members[leaf_index] = true;
+        Self { plan, leaf_members }
+    }
+}
+
+#[derive(Debug)]
+struct JoinInput {
+    plan: LogicalPlan,
+    leaf_index: usize,
+}
+
+#[derive(Debug)]
+struct CandidateJoinKey {
+    left: Expr,
+    right: Expr,
+    left_inputs: Vec<usize>,
+    right_inputs: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RightJoinKeySide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RightIndexedJoinKey {
+    candidate_index: usize,
+    right_side: RightJoinKeySide,
+}
+
+#[derive(Debug)]
+struct IndexedJoinKeys {
+    candidates: Vec<CandidateJoinKey>,
+    by_right_input: Vec<Vec<RightIndexedJoinKey>>,
+}
+
+impl IndexedJoinKeys {
+    fn new(input_count: usize) -> Self {
+        Self {
+            candidates: vec![],
+            by_right_input: vec![vec![]; input_count],
+        }
+    }
+
+    fn push(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        left_inputs: Vec<usize>,
+        right_inputs: Vec<usize>,
+    ) {
+        let left_single_input = (left_inputs.len() == 1).then_some(left_inputs[0]);
+        let right_single_input = (right_inputs.len() == 1).then_some(right_inputs[0]);
+
+        let candidate_index = self.candidates.len();
+        self.candidates.push(CandidateJoinKey {
+            left: left.clone(),
+            right: right.clone(),
+            left_inputs,
+            right_inputs,
+        });
+
+        if let Some(input_idx) = left_single_input {
+            self.by_right_input[input_idx].push(RightIndexedJoinKey {
+                candidate_index,
+                right_side: RightJoinKeySide::Left,
+            });
+        }
+
+        if let Some(input_idx) = right_single_input {
+            self.by_right_input[input_idx].push(RightIndexedJoinKey {
+                candidate_index,
+                right_side: RightJoinKeySide::Right,
+            });
+        }
+    }
+
+    fn for_right_input(&self, right_input: usize) -> &[RightIndexedJoinKey] {
+        &self.by_right_input[right_input]
     }
 }
 
@@ -155,20 +247,32 @@ impl OptimizerRule for EliminateCrossJoin {
             }
         };
 
+        let indexed_join_keys = index_join_keys(&possible_join_keys, &all_inputs);
+
         // Join keys are handled locally:
         let mut all_join_keys = JoinKeySet::new();
-        let mut left = all_inputs.remove(0);
-        while !all_inputs.is_empty() {
+        let input_count = all_inputs.len();
+        let mut inputs = all_inputs
+            .into_iter()
+            .enumerate()
+            .map(|(leaf_index, plan)| JoinInput { plan, leaf_index });
+        let first_input = inputs
+            .next()
+            .expect("inner join plans should have at least one leaf input");
+        let mut left =
+            JoinGroup::new(first_input.plan, input_count, first_input.leaf_index);
+        let mut rights = inputs.collect::<Vec<_>>();
+        while !rights.is_empty() {
             left = find_inner_join(
                 left,
-                &mut all_inputs,
-                &possible_join_keys,
+                &mut rights,
+                &indexed_join_keys,
                 &mut all_join_keys,
                 null_equality,
             )?;
         }
 
-        left = rewrite_children(self, left, config)?.data;
+        let mut left = rewrite_children(self, left.plan, config)?.data;
 
         if &plan_schema != left.schema() {
             left = LogicalPlan::Projection(Projection::new_from_schema(
@@ -297,28 +401,41 @@ fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
 /// 1. Removes the first plan from `rights`
 /// 2. Returns `left_input CROSS JOIN right`.
 fn find_inner_join(
-    left_input: LogicalPlan,
-    rights: &mut Vec<LogicalPlan>,
-    possible_join_keys: &JoinKeySet,
+    left_input: JoinGroup,
+    rights: &mut Vec<JoinInput>,
+    possible_join_keys: &IndexedJoinKeys,
     all_join_keys: &mut JoinKeySet,
     null_equality: NullEquality,
-) -> Result<LogicalPlan> {
+) -> Result<JoinGroup> {
+    let JoinGroup {
+        plan: left_plan,
+        leaf_members,
+    } = left_input;
+
     for (i, right_input) in rights.iter().enumerate() {
         let mut join_keys = vec![];
 
-        for (l, r) in possible_join_keys.iter() {
-            let key_pair = find_valid_equijoin_key_pair(
-                l,
-                r,
-                left_input.schema(),
-                right_input.schema(),
-            )?;
+        for indexed_join_key in possible_join_keys.for_right_input(right_input.leaf_index)
+        {
+            let candidate =
+                &possible_join_keys.candidates[indexed_join_key.candidate_index];
 
-            // Save join keys
-            if let Some((valid_l, valid_r)) = key_pair
-                && can_hash(&valid_l.get_type(left_input.schema())?)
-            {
-                join_keys.push((valid_l, valid_r));
+            let (left_expr, right_expr, left_expr_inputs) =
+                match indexed_join_key.right_side {
+                    RightJoinKeySide::Left => {
+                        (&candidate.right, &candidate.left, &candidate.right_inputs)
+                    }
+                    RightJoinKeySide::Right => {
+                        (&candidate.left, &candidate.right, &candidate.left_inputs)
+                    }
+                };
+
+            if !contains_all_inputs(&leaf_members, left_expr_inputs) {
+                continue;
+            }
+
+            if can_hash(&left_expr.get_type(left_plan.schema())?) {
+                join_keys.push((left_expr.clone(), right_expr.clone()));
             }
         }
 
@@ -327,22 +444,27 @@ fn find_inner_join(
             all_join_keys.insert_all(join_keys.iter());
             let right_input = rights.remove(i);
             let join_schema = Arc::new(build_join_schema(
-                left_input.schema(),
-                right_input.schema(),
+                left_plan.schema(),
+                right_input.plan.schema(),
                 &JoinType::Inner,
             )?);
+            let mut next_leaf_members = leaf_members;
+            next_leaf_members[right_input.leaf_index] = true;
 
-            return Ok(LogicalPlan::Join(Join {
-                left: Arc::new(left_input),
-                right: Arc::new(right_input),
-                join_type: JoinType::Inner,
-                join_constraint: JoinConstraint::On,
-                on: join_keys,
-                filter: None,
-                schema: join_schema,
-                null_equality,
-                null_aware: false,
-            }));
+            return Ok(JoinGroup {
+                plan: LogicalPlan::Join(Join {
+                    left: Arc::new(left_plan),
+                    right: Arc::new(right_input.plan),
+                    join_type: JoinType::Inner,
+                    join_constraint: JoinConstraint::On,
+                    on: join_keys,
+                    filter: None,
+                    schema: join_schema,
+                    null_equality,
+                    null_aware: false,
+                }),
+                leaf_members: next_leaf_members,
+            });
         }
     }
 
@@ -350,22 +472,76 @@ fn find_inner_join(
     // plan
     let right = rights.remove(0);
     let join_schema = Arc::new(build_join_schema(
-        left_input.schema(),
-        right.schema(),
+        left_plan.schema(),
+        right.plan.schema(),
         &JoinType::Inner,
     )?);
+    let mut next_leaf_members = leaf_members;
+    next_leaf_members[right.leaf_index] = true;
 
-    Ok(LogicalPlan::Join(Join {
-        left: Arc::new(left_input),
-        right: Arc::new(right),
-        schema: join_schema,
-        on: vec![],
-        filter: None,
-        join_type: JoinType::Inner,
-        join_constraint: JoinConstraint::On,
-        null_equality,
-        null_aware: false,
-    }))
+    Ok(JoinGroup {
+        plan: LogicalPlan::Join(Join {
+            left: Arc::new(left_plan),
+            right: Arc::new(right.plan),
+            schema: join_schema,
+            on: vec![],
+            filter: None,
+            join_type: JoinType::Inner,
+            join_constraint: JoinConstraint::On,
+            null_equality,
+            null_aware: false,
+        }),
+        leaf_members: next_leaf_members,
+    })
+}
+
+fn index_join_keys(
+    possible_join_keys: &JoinKeySet,
+    all_inputs: &[LogicalPlan],
+) -> IndexedJoinKeys {
+    let input_schemas = all_inputs
+        .iter()
+        .map(|plan| Arc::clone(plan.schema()))
+        .collect::<Vec<_>>();
+    let mut indexed_join_keys = IndexedJoinKeys::new(all_inputs.len());
+
+    for (left, right) in possible_join_keys.iter() {
+        let left_inputs = referenced_input_indexes(left, &input_schemas);
+        let right_inputs = referenced_input_indexes(right, &input_schemas);
+
+        if left_inputs.is_empty() || right_inputs.is_empty() {
+            continue;
+        }
+
+        indexed_join_keys.push(left, right, left_inputs, right_inputs);
+    }
+
+    indexed_join_keys
+}
+
+fn referenced_input_indexes(expr: &Expr, input_schemas: &[DFSchemaRef]) -> Vec<usize> {
+    let columns = expr.column_refs();
+    let mut referenced_inputs = vec![false; input_schemas.len()];
+
+    for column in columns {
+        for (input_idx, schema) in input_schemas.iter().enumerate() {
+            if schema.is_column_from_schema(column) {
+                referenced_inputs[input_idx] = true;
+            }
+        }
+    }
+
+    referenced_inputs
+        .into_iter()
+        .enumerate()
+        .filter_map(|(input_idx, is_referenced)| is_referenced.then_some(input_idx))
+        .collect()
+}
+
+fn contains_all_inputs(leaf_members: &[bool], input_indexes: &[usize]) -> bool {
+    input_indexes
+        .iter()
+        .all(|input_idx| leaf_members[*input_idx])
 }
 
 /// Extract join keys from a WHERE clause
@@ -1305,6 +1481,35 @@ mod tests {
           Inner Join: t1.a + UInt32(100) = t2.a * UInt32(2) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
             TableScan: t1 [a:UInt32, b:UInt32, c:UInt32]
             TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
+    }
+
+    #[test]
+    fn eliminate_cross_with_multi_input_expr_key() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+        let t3 = test_table_scan_with_name("t3")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .cross_join(t2)?
+            .cross_join(t3)?
+            .filter(binary_expr(
+                (col("t1.a") + col("t2.a")).eq(col("t3.a")),
+                And,
+                col("t3.c").lt(lit(15u32)),
+            ))?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @ r"
+        Filter: t3.c < UInt32(15) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
+          Inner Join: t1.a + t2.a = t3.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
+            Cross Join: [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
+              TableScan: t1 [a:UInt32, b:UInt32, c:UInt32]
+              TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
+            TableScan: t3 [a:UInt32, b:UInt32, c:UInt32]
         "
         )
     }

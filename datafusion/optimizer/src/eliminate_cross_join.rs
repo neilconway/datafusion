@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use crate::join_key_set::JoinKeySet;
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_common::{DFSchemaRef, NullEquality, Result};
+use datafusion_common::{Column, DFSchema, NullEquality, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
 use datafusion_expr::logical_plan::{
     Filter, Join, JoinConstraint, JoinType, LogicalPlan, Projection,
@@ -39,95 +39,50 @@ impl EliminateCrossJoin {
     }
 }
 
-#[derive(Debug)]
-struct JoinGroup {
-    plan: LogicalPlan,
-    leaf_members: Vec<bool>,
-}
-
-impl JoinGroup {
-    fn new(plan: LogicalPlan, input_count: usize, leaf_index: usize) -> Self {
-        let mut leaf_members = vec![false; input_count];
-        leaf_members[leaf_index] = true;
-        Self { plan, leaf_members }
-    }
-}
-
-#[derive(Debug)]
-struct JoinInput {
-    plan: LogicalPlan,
-    leaf_index: usize,
-}
-
+/// A join predicate candidate plus the column references needed to decide
+/// whether it can be applied to a specific `(left, right)` pair.
+///
+/// The optimizer checks the same candidate against multiple right inputs while
+/// building a left-deep join tree, so cache the referenced columns once rather
+/// than recomputing them in the hot loop.
 #[derive(Debug)]
 struct CandidateJoinKey {
     left: Expr,
     right: Expr,
-    left_inputs: Vec<usize>,
-    right_inputs: Vec<usize>,
+    left_columns: Vec<Column>,
+    right_columns: Vec<Column>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum RightJoinKeySide {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RightIndexedJoinKey {
-    candidate_index: usize,
-    right_side: RightJoinKeySide,
-}
-
-#[derive(Debug)]
-struct IndexedJoinKeys {
-    candidates: Vec<CandidateJoinKey>,
-    by_right_input: Vec<Vec<RightIndexedJoinKey>>,
-}
-
-impl IndexedJoinKeys {
-    fn new(input_count: usize) -> Self {
+impl CandidateJoinKey {
+    fn new(left: &Expr, right: &Expr) -> Self {
         Self {
-            candidates: vec![],
-            by_right_input: vec![vec![]; input_count],
-        }
-    }
-
-    fn push(
-        &mut self,
-        left: &Expr,
-        right: &Expr,
-        left_inputs: Vec<usize>,
-        right_inputs: Vec<usize>,
-    ) {
-        let left_single_input = (left_inputs.len() == 1).then_some(left_inputs[0]);
-        let right_single_input = (right_inputs.len() == 1).then_some(right_inputs[0]);
-
-        let candidate_index = self.candidates.len();
-        self.candidates.push(CandidateJoinKey {
             left: left.clone(),
             right: right.clone(),
-            left_inputs,
-            right_inputs,
-        });
-
-        if let Some(input_idx) = left_single_input {
-            self.by_right_input[input_idx].push(RightIndexedJoinKey {
-                candidate_index,
-                right_side: RightJoinKeySide::Left,
-            });
-        }
-
-        if let Some(input_idx) = right_single_input {
-            self.by_right_input[input_idx].push(RightIndexedJoinKey {
-                candidate_index,
-                right_side: RightJoinKeySide::Right,
-            });
+            left_columns: left.column_refs().into_iter().cloned().collect(),
+            right_columns: right.column_refs().into_iter().cloned().collect(),
         }
     }
 
-    fn for_right_input(&self, right_input: usize) -> &[RightIndexedJoinKey] {
-        &self.by_right_input[right_input]
+    fn find_valid_join_key_pair<'a>(
+        &'a self,
+        left_schema: &DFSchema,
+        right_schema: &DFSchema,
+    ) -> Option<(&'a Expr, &'a Expr)> {
+        if self.left_columns.is_empty() || self.right_columns.is_empty() {
+            return None;
+        }
+
+        if all_columns_in_schema(&self.left_columns, left_schema)
+            && all_columns_in_schema(&self.right_columns, right_schema)
+        {
+            Some((&self.left, &self.right))
+        } else if all_columns_in_schema(&self.right_columns, left_schema)
+            && all_columns_in_schema(&self.left_columns, right_schema)
+        {
+            Some((&self.right, &self.left))
+        } else {
+            None
+        }
     }
 }
 
@@ -199,6 +154,20 @@ impl OptimizerRule for EliminateCrossJoin {
                 return rewrite_children(self, LogicalPlan::Filter(filter), config);
             }
 
+            // Pull equality predicates out of the parent filter first so we can
+            // recognize the common no-op case below before flattening the join.
+            let mut parent_join_keys = JoinKeySet::new();
+            extract_possible_join_keys(&filter.predicate, &mut parent_join_keys);
+
+            if let LogicalPlan::Join(join) = filter.input.as_ref()
+                && is_simple_inner_join_no_filter(join)
+                && parent_join_keys.is_empty()
+            {
+                // `Filter(InnerJoin)` is already in final form when the filter
+                // contributes no additional join keys.
+                return rewrite_children(self, LogicalPlan::Filter(filter), config);
+            }
+
             if !can_flatten_join_inputs(&filter.input) {
                 return Ok(Transformed::no(LogicalPlan::Filter(filter)));
             }
@@ -207,7 +176,8 @@ impl OptimizerRule for EliminateCrossJoin {
                 input, predicate, ..
             } = filter;
 
-            // Extract null_equality setting from the input join
+            // Rebuilding the join tree should preserve the original null
+            // comparison semantics from the existing join node.
             if let LogicalPlan::Join(join) = input.as_ref() {
                 null_equality = join.null_equality;
             }
@@ -219,15 +189,20 @@ impl OptimizerRule for EliminateCrossJoin {
                 &mut all_filters,
             )?;
 
-            extract_possible_join_keys(&predicate, &mut possible_join_keys);
+            for (left, right) in parent_join_keys.iter() {
+                possible_join_keys.insert(left, right);
+            }
             Some(predicate)
         } else {
             match plan {
-                LogicalPlan::Join(Join {
-                    join_type: JoinType::Inner,
-                    null_equality: original_null_equality,
-                    ..
-                }) => {
+                LogicalPlan::Join(join) if join.join_type == JoinType::Inner => {
+                    if is_simple_inner_join_no_filter(&join) {
+                        return rewrite_children(self, LogicalPlan::Join(join), config);
+                    }
+
+                    let original_null_equality = join.null_equality;
+
+                    let plan = LogicalPlan::Join(join);
                     if !can_flatten_join_inputs(&plan) {
                         return Ok(Transformed::no(plan));
                     }
@@ -247,32 +222,23 @@ impl OptimizerRule for EliminateCrossJoin {
             }
         };
 
-        let indexed_join_keys = index_join_keys(&possible_join_keys, &all_inputs);
+        // Freeze the candidate metadata once before the greedy join rebuild.
+        let candidate_join_keys = build_candidate_join_keys(&possible_join_keys);
 
         // Join keys are handled locally:
         let mut all_join_keys = JoinKeySet::new();
-        let input_count = all_inputs.len();
-        let mut inputs = all_inputs
-            .into_iter()
-            .enumerate()
-            .map(|(leaf_index, plan)| JoinInput { plan, leaf_index });
-        let first_input = inputs
-            .next()
-            .expect("inner join plans should have at least one leaf input");
-        let mut left =
-            JoinGroup::new(first_input.plan, input_count, first_input.leaf_index);
-        let mut rights = inputs.collect::<Vec<_>>();
-        while !rights.is_empty() {
+        let mut left = all_inputs.remove(0);
+        while !all_inputs.is_empty() {
             left = find_inner_join(
                 left,
-                &mut rights,
-                &indexed_join_keys,
+                &mut all_inputs,
+                &candidate_join_keys,
                 &mut all_join_keys,
                 null_equality,
             )?;
         }
 
-        let mut left = rewrite_children(self, left.plan, config)?.data;
+        let mut left = rewrite_children(self, left, config)?.data;
 
         if &plan_schema != left.schema() {
             left = LogicalPlan::Projection(Projection::new_from_schema(
@@ -388,6 +354,27 @@ fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
     true
 }
 
+fn is_simple_inner_join_no_filter(join: &Join) -> bool {
+    // A leaf-level inner join with no filter cannot be improved by this rule:
+    // there is nothing to flatten, and rebuilding it would produce the same
+    // plan shape.
+    join.filter.is_none()
+        && !matches!(
+            join.left.as_ref(),
+            LogicalPlan::Join(Join {
+                join_type: JoinType::Inner,
+                ..
+            })
+        )
+        && !matches!(
+            join.right.as_ref(),
+            LogicalPlan::Join(Join {
+                join_type: JoinType::Inner,
+                ..
+            })
+        )
+}
+
 /// Finds the next to join with the left input plan,
 ///
 /// Finds the next `right` from `rights` that can be joined with `left_input`
@@ -401,40 +388,25 @@ fn can_flatten_join_inputs(plan: &LogicalPlan) -> bool {
 /// 1. Removes the first plan from `rights`
 /// 2. Returns `left_input CROSS JOIN right`.
 fn find_inner_join(
-    left_input: JoinGroup,
-    rights: &mut Vec<JoinInput>,
-    possible_join_keys: &IndexedJoinKeys,
+    left_input: LogicalPlan,
+    rights: &mut Vec<LogicalPlan>,
+    possible_join_keys: &[CandidateJoinKey],
     all_join_keys: &mut JoinKeySet,
     null_equality: NullEquality,
-) -> Result<JoinGroup> {
-    let JoinGroup {
-        plan: left_plan,
-        leaf_members,
-    } = left_input;
-
+) -> Result<LogicalPlan> {
+    let left_schema = Arc::clone(left_input.schema());
     for (i, right_input) in rights.iter().enumerate() {
+        let right_schema = Arc::clone(right_input.schema());
         let mut join_keys = vec![];
 
-        for indexed_join_key in possible_join_keys.for_right_input(right_input.leaf_index)
-        {
-            let candidate =
-                &possible_join_keys.candidates[indexed_join_key.candidate_index];
-
-            let (left_expr, right_expr, left_expr_inputs) =
-                match indexed_join_key.right_side {
-                    RightJoinKeySide::Left => {
-                        (&candidate.right, &candidate.left, &candidate.right_inputs)
-                    }
-                    RightJoinKeySide::Right => {
-                        (&candidate.left, &candidate.right, &candidate.left_inputs)
-                    }
-                };
-
-            if !contains_all_inputs(&leaf_members, left_expr_inputs) {
-                continue;
-            }
-
-            if can_hash(&left_expr.get_type(left_plan.schema())?) {
+        for candidate in possible_join_keys {
+            // A candidate applies when one side's columns are entirely provided
+            // by the accumulated left schema and the other side's columns are
+            // entirely provided by this right input.
+            if let Some((left_expr, right_expr)) = candidate
+                .find_valid_join_key_pair(left_schema.as_ref(), right_schema.as_ref())
+                && can_hash(&left_expr.get_type(left_schema.as_ref())?)
+            {
                 join_keys.push((left_expr.clone(), right_expr.clone()));
             }
         }
@@ -444,27 +416,22 @@ fn find_inner_join(
             all_join_keys.insert_all(join_keys.iter());
             let right_input = rights.remove(i);
             let join_schema = Arc::new(build_join_schema(
-                left_plan.schema(),
-                right_input.plan.schema(),
+                left_schema.as_ref(),
+                right_schema.as_ref(),
                 &JoinType::Inner,
             )?);
-            let mut next_leaf_members = leaf_members;
-            next_leaf_members[right_input.leaf_index] = true;
 
-            return Ok(JoinGroup {
-                plan: LogicalPlan::Join(Join {
-                    left: Arc::new(left_plan),
-                    right: Arc::new(right_input.plan),
-                    join_type: JoinType::Inner,
-                    join_constraint: JoinConstraint::On,
-                    on: join_keys,
-                    filter: None,
-                    schema: join_schema,
-                    null_equality,
-                    null_aware: false,
-                }),
-                leaf_members: next_leaf_members,
-            });
+            return Ok(LogicalPlan::Join(Join {
+                left: Arc::new(left_input),
+                right: Arc::new(right_input),
+                join_type: JoinType::Inner,
+                join_constraint: JoinConstraint::On,
+                on: join_keys,
+                filter: None,
+                schema: join_schema,
+                null_equality,
+                null_aware: false,
+            }));
         }
     }
 
@@ -472,76 +439,38 @@ fn find_inner_join(
     // plan
     let right = rights.remove(0);
     let join_schema = Arc::new(build_join_schema(
-        left_plan.schema(),
-        right.plan.schema(),
+        left_schema.as_ref(),
+        right.schema(),
         &JoinType::Inner,
     )?);
-    let mut next_leaf_members = leaf_members;
-    next_leaf_members[right.leaf_index] = true;
 
-    Ok(JoinGroup {
-        plan: LogicalPlan::Join(Join {
-            left: Arc::new(left_plan),
-            right: Arc::new(right.plan),
-            schema: join_schema,
-            on: vec![],
-            filter: None,
-            join_type: JoinType::Inner,
-            join_constraint: JoinConstraint::On,
-            null_equality,
-            null_aware: false,
-        }),
-        leaf_members: next_leaf_members,
-    })
+    Ok(LogicalPlan::Join(Join {
+        left: Arc::new(left_input),
+        right: Arc::new(right),
+        schema: join_schema,
+        on: vec![],
+        filter: None,
+        join_type: JoinType::Inner,
+        join_constraint: JoinConstraint::On,
+        null_equality,
+        null_aware: false,
+    }))
 }
 
-fn index_join_keys(
-    possible_join_keys: &JoinKeySet,
-    all_inputs: &[LogicalPlan],
-) -> IndexedJoinKeys {
-    let input_schemas = all_inputs
+fn build_candidate_join_keys(possible_join_keys: &JoinKeySet) -> Vec<CandidateJoinKey> {
+    possible_join_keys
         .iter()
-        .map(|plan| Arc::clone(plan.schema()))
-        .collect::<Vec<_>>();
-    let mut indexed_join_keys = IndexedJoinKeys::new(all_inputs.len());
-
-    for (left, right) in possible_join_keys.iter() {
-        let left_inputs = referenced_input_indexes(left, &input_schemas);
-        let right_inputs = referenced_input_indexes(right, &input_schemas);
-
-        if left_inputs.is_empty() || right_inputs.is_empty() {
-            continue;
-        }
-
-        indexed_join_keys.push(left, right, left_inputs, right_inputs);
-    }
-
-    indexed_join_keys
-}
-
-fn referenced_input_indexes(expr: &Expr, input_schemas: &[DFSchemaRef]) -> Vec<usize> {
-    let columns = expr.column_refs();
-    let mut referenced_inputs = vec![false; input_schemas.len()];
-
-    for column in columns {
-        for (input_idx, schema) in input_schemas.iter().enumerate() {
-            if schema.is_column_from_schema(column) {
-                referenced_inputs[input_idx] = true;
-            }
-        }
-    }
-
-    referenced_inputs
-        .into_iter()
-        .enumerate()
-        .filter_map(|(input_idx, is_referenced)| is_referenced.then_some(input_idx))
+        .map(|(left, right)| CandidateJoinKey::new(left, right))
         .collect()
 }
 
-fn contains_all_inputs(leaf_members: &[bool], input_indexes: &[usize]) -> bool {
-    input_indexes
+/// Returns true when every column referenced by an expression belongs to the
+/// provided schema. `CandidateJoinKey` uses this to orient a predicate onto the
+/// current `(left, right)` pair during join reconstruction.
+fn all_columns_in_schema(columns: &[Column], schema: &DFSchema) -> bool {
+    columns
         .iter()
-        .all(|input_idx| leaf_members[*input_idx])
+        .all(|column| schema.is_column_from_schema(column))
 }
 
 /// Extract join keys from a WHERE clause
@@ -556,7 +485,9 @@ fn extract_possible_join_keys(expr: &Expr, join_keys: &mut JoinKeySet) {
                 extract_possible_join_keys(left, join_keys);
                 extract_possible_join_keys(right, join_keys)
             }
-            // Fix for issue#78 join predicates from inside of OR expr also pulled up properly.
+            // A predicate can be hoisted out of `OR` only if it appears in both
+            // branches; otherwise moving it into the join would strengthen the
+            // filter.
             Operator::Or => {
                 let mut left_join_keys = JoinKeySet::new();
                 let mut right_join_keys = JoinKeySet::new();
@@ -586,7 +517,7 @@ fn remove_join_expressions(expr: Expr, join_keys: &JoinKeySet) -> Option<Expr> {
             // was a join key, so remove it
             None
         }
-        // Fix for issue#78 join predicates from inside of OR expr also pulled up properly.
+        // Under `AND`, removing a join predicate leaves the other side intact.
         Expr::BinaryExpr(BinaryExpr { left, op, right }) if op == Operator::And => {
             let l = remove_join_expressions(*left, join_keys);
             let r = remove_join_expressions(*right, join_keys);
@@ -610,8 +541,9 @@ fn remove_join_expressions(expr: Expr, join_keys: &JoinKeySet) -> Option<Expr> {
                     op,
                     Box::new(rr),
                 ))),
-                // When either `left` or `right` is empty, it means they are `true`
-                // so OR'ing anything with them will also be true
+                // If either branch loses all of its predicates, that branch
+                // effectively becomes `true`, so the whole `OR` simplifies to
+                // `true` and there is no residual filter to keep.
                 _ => None,
             }
         }
@@ -632,17 +564,21 @@ mod tests {
     };
     use insta::assert_snapshot;
 
-    macro_rules! assert_optimized_plan_equal {
+    macro_rules! assert_plan_equal_with_status {
         (
             $plan:expr,
+            transformed = $expected_transformed:expr,
             @ $expected:literal $(,)?
         ) => {{
             let starting_schema = Arc::clone($plan.schema());
             let rule = EliminateCrossJoin::new();
             let Transformed {transformed: is_plan_transformed, data: optimized_plan, ..} = rule.rewrite($plan, &OptimizerContext::new()).unwrap();
             let formatted_plan = optimized_plan.display_indent_schema();
-            // Ensure the rule was actually applied
-            assert!(is_plan_transformed, "failed to optimize plan");
+            assert_eq!(
+                is_plan_transformed,
+                $expected_transformed,
+                "unexpected rewrite status"
+            );
             // Verify the schema remains unchanged
             assert_eq!(&starting_schema, optimized_plan.schema());
             assert_snapshot!(
@@ -651,6 +587,32 @@ mod tests {
             );
 
             Ok(())
+        }};
+    }
+
+    macro_rules! assert_optimized_plan_equal {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            assert_plan_equal_with_status!(
+                $plan,
+                transformed = true,
+                @ $expected,
+            )
+        }};
+    }
+
+    macro_rules! assert_unoptimized_plan_equal {
+        (
+            $plan:expr,
+            @ $expected:literal $(,)?
+        ) => {{
+            assert_plan_equal_with_status!(
+                $plan,
+                transformed = false,
+                @ $expected,
+            )
         }};
     }
 
@@ -696,7 +658,7 @@ mod tests {
             ))?
             .build()?;
 
-        assert_optimized_plan_equal!(
+        assert_unoptimized_plan_equal!(
             plan,
             @ r"
         Filter: t1.a = t2.a OR t2.b = t1.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
@@ -782,7 +744,7 @@ mod tests {
             ))?
             .build()?;
 
-        assert_optimized_plan_equal!(
+        assert_unoptimized_plan_equal!(
             plan,
             @ r"
         Filter: t1.a = t2.a AND t2.c < UInt32(15) OR t1.b = t2.b AND t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
@@ -808,7 +770,7 @@ mod tests {
             ))?
             .build()?;
 
-        assert_optimized_plan_equal!(
+        assert_unoptimized_plan_equal!(
             plan,
             @ r"
         Filter: t1.a = t2.a AND t2.c < UInt32(15) OR t1.a = t2.a OR t2.c = UInt32(688) [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
@@ -1420,7 +1382,7 @@ mod tests {
             ))?
             .build()?;
 
-        assert_optimized_plan_equal!(
+        assert_unoptimized_plan_equal!(
             plan,
             @ r"
         Filter: t1.a + UInt32(100) = t2.a * UInt32(2) OR t2.b = t1.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
@@ -1617,5 +1579,24 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn simple_inner_join_without_filter_is_noop() -> Result<()> {
+        let t1 = test_table_scan_with_name("t1")?;
+        let t2 = test_table_scan_with_name("t2")?;
+
+        let plan = LogicalPlanBuilder::from(t1)
+            .join(t2, JoinType::Inner, (vec!["t1.a"], vec!["t2.a"]), None)?
+            .build()?;
+
+        assert_unoptimized_plan_equal!(
+            plan,
+            @ r"
+        Inner Join: t1.a = t2.a [a:UInt32, b:UInt32, c:UInt32, a:UInt32, b:UInt32, c:UInt32]
+          TableScan: t1 [a:UInt32, b:UInt32, c:UInt32]
+          TableScan: t2 [a:UInt32, b:UInt32, c:UInt32]
+        "
+        )
     }
 }

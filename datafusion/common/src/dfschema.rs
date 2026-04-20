@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
 use crate::error::{_plan_err, _schema_err, DataFusionError, Result};
 use crate::{
@@ -127,6 +127,17 @@ impl DFSchema {
             field_qualifiers: vec![],
             functional_dependencies: FunctionalDependencies::empty(),
         }
+    }
+
+    /// Returns a reference to a shared empty [`DFSchema`].
+    ///
+    /// Callers that need a cheap no-information schema (for example as a
+    /// placeholder) should prefer this over `Arc::new(DFSchema::empty())`
+    /// to avoid allocating a fresh schema per call.
+    pub fn empty_ref() -> &'static DFSchemaRef {
+        static EMPTY: LazyLock<DFSchemaRef> =
+            LazyLock::new(|| Arc::new(DFSchema::empty()));
+        &EMPTY
     }
 
     /// Return a reference to the inner Arrow [`Schema`]

@@ -29,19 +29,16 @@ use std::sync::Arc;
 use datafusion_common::Result;
 use datafusion_common::tree_node::{Transformed, TreeNodeArc, TreeNodeRecursion};
 
-use crate::logical_plan::{
-    Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement, Distinct, DistinctOn,
-    DmlStatement, Explain, Filter, Join, Limit, LogicalPlan, Prepare, Projection,
-    RecursiveQuery, Repartition, Sort, Statement, Subquery, SubqueryAlias, Union, Unnest,
-    Window,
-};
 use crate::logical_plan::dml::CopyTo;
+use crate::logical_plan::{
+    Aggregate, Analyze, CreateMemoryTable, CreateView, DdlStatement, Distinct,
+    DistinctOn, DmlStatement, Explain, Filter, Join, Limit, LogicalPlan, Prepare,
+    Projection, RecursiveQuery, Repartition, Sort, Statement, Subquery, SubqueryAlias,
+    Union, Unnest, Window,
+};
 
 impl TreeNodeArc for LogicalPlan {
-    fn map_children_arc<F>(
-        self: &Arc<Self>,
-        mut f: F,
-    ) -> Result<Transformed<Arc<Self>>>
+    fn map_children_arc<F>(self: &Arc<Self>, mut f: F) -> Result<Transformed<Arc<Self>>>
     where
         F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>,
     {
@@ -283,12 +280,11 @@ impl TreeNodeArc for LogicalPlan {
 
             // Nested enum variants.
             LogicalPlan::Distinct(distinct) => match distinct {
-                Distinct::All(input) => map_single_input_arc(
-                    self,
-                    input,
-                    &mut f,
-                    |input| LogicalPlan::Distinct(Distinct::All(input)),
-                ),
+                Distinct::All(input) => {
+                    map_single_input_arc(self, input, &mut f, |input| {
+                        LogicalPlan::Distinct(Distinct::All(input))
+                    })
+                }
                 Distinct::On(DistinctOn {
                     on_expr,
                     select_expr,
@@ -315,17 +311,15 @@ impl TreeNodeArc for LogicalPlan {
                     column_defaults,
                     temporary,
                 }) => map_single_input_arc(self, input, &mut f, |input| {
-                    LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
-                        CreateMemoryTable {
-                            name: name.clone(),
-                            constraints: constraints.clone(),
-                            input,
-                            if_not_exists: *if_not_exists,
-                            or_replace: *or_replace,
-                            column_defaults: column_defaults.clone(),
-                            temporary: *temporary,
-                        },
-                    ))
+                    LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(CreateMemoryTable {
+                        name: name.clone(),
+                        constraints: constraints.clone(),
+                        input,
+                        if_not_exists: *if_not_exists,
+                        or_replace: *or_replace,
+                        column_defaults: column_defaults.clone(),
+                        temporary: *temporary,
+                    }))
                 }),
                 DdlStatement::CreateView(CreateView {
                     name,
@@ -354,18 +348,15 @@ impl TreeNodeArc for LogicalPlan {
                 | DdlStatement::DropFunction(_) => Ok(Transformed::no(Arc::clone(self))),
             },
             LogicalPlan::Statement(stmt) => match stmt {
-                Statement::Prepare(prepare) => map_single_input_arc(
-                    self,
-                    &prepare.input,
-                    &mut f,
-                    |input| {
+                Statement::Prepare(prepare) => {
+                    map_single_input_arc(self, &prepare.input, &mut f, |input| {
                         LogicalPlan::Statement(Statement::Prepare(Prepare {
                             name: prepare.name.clone(),
                             fields: prepare.fields.clone(),
                             input,
                         }))
-                    },
-                ),
+                    })
+                }
                 // Statement variants without inputs.
                 Statement::TransactionStart(_)
                 | Statement::TransactionEnd(_)
@@ -378,9 +369,7 @@ impl TreeNodeArc for LogicalPlan {
             // `Extension` nodes go through a `dyn` trait that still takes
             // owned plans. Fall back to full clone + old-path rebuild;
             // this is acceptable because Extension is rare.
-            LogicalPlan::Extension(_) => {
-                fallback_via_owned_map_children(self, f)
-            }
+            LogicalPlan::Extension(_) => fallback_via_owned_map_children(self, f),
 
             // Leaf variants with no children.
             LogicalPlan::TableScan(_)
@@ -390,10 +379,7 @@ impl TreeNodeArc for LogicalPlan {
         }
     }
 
-    fn apply_children_arc<F>(
-        self: &Arc<Self>,
-        mut f: F,
-    ) -> Result<TreeNodeRecursion>
+    fn apply_children_arc<F>(self: &Arc<Self>, mut f: F) -> Result<TreeNodeRecursion>
     where
         F: FnMut(&Arc<Self>) -> Result<TreeNodeRecursion>,
     {

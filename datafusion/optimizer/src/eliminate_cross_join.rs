@@ -20,7 +20,7 @@ use crate::{OptimizerConfig, OptimizerRule};
 use std::sync::Arc;
 
 use crate::join_key_set::JoinKeySet;
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNodeArc};
 use datafusion_common::{NullEquality, Result};
 use datafusion_expr::expr::{BinaryExpr, Expr};
 use datafusion_expr::logical_plan::{
@@ -79,8 +79,84 @@ impl OptimizerRule for EliminateCrossJoin {
         true
     }
 
-    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn rewrite(
+        &self,
+        plan: LogicalPlan,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<LogicalPlan>> {
+        // Delegate to `rewrite_arc` to share the identity-fast path with
+        // other callers. The extra Arc wrap/unwrap here is paid once per
+        // outer `rule.rewrite` call (on the plan root), which is amortized
+        // across the identity savings on descendant nodes.
+        let arc = Arc::new(plan);
+        let transformed = self.rewrite_arc(arc, config)?;
+        Ok(Transformed::new(
+            Arc::unwrap_or_clone(transformed.data),
+            transformed.transformed,
+            transformed.tnr,
+        ))
+    }
+
+    fn name(&self) -> &str {
+        "eliminate_cross_join"
+    }
+}
+
+impl EliminateCrossJoin {
+    /// Walk the plan via the Arc-aware path. Unchanged subtrees are
+    /// preserved as `Arc::clone` of the input — no heap allocation — so
+    /// the common case of this rule walking a plan that contains no
+    /// cross joins or inner-join-within-filter patterns is nearly free.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn rewrite_arc(
+        &self,
+        plan: Arc<LogicalPlan>,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<Arc<LogicalPlan>>> {
+        // Detect whether this node matches the rule's pattern *without*
+        // destructuring. Most plan nodes do not match, and this check
+        // keeps the non-match path allocation-free all the way down to
+        // `map_children_arc`.
+        let is_match = match &*plan {
+            LogicalPlan::Filter(Filter { input, .. }) => {
+                matches!(
+                    input.as_ref(),
+                    LogicalPlan::Join(Join {
+                        join_type: JoinType::Inner,
+                        ..
+                    })
+                ) && can_flatten_join_inputs(input)
+            }
+            LogicalPlan::Join(Join {
+                join_type: JoinType::Inner,
+                ..
+            }) => can_flatten_join_inputs(&plan),
+            _ => false,
+        };
+
+        if !is_match {
+            // Common case: recurse into children via the Arc-aware walk.
+            // Unchanged subtrees are returned as `Arc::clone` without any
+            // heap allocation.
+            return self.rewrite_children_arc(&plan, config);
+        }
+
+        // Matched path: take ownership of the plan and run the flatten
+        // logic in the owned `rewrite_matched` helper.
+        let owned = Arc::unwrap_or_clone(plan);
+        let transformed = self.rewrite_matched(owned, config)?;
+        Ok(Transformed::new(
+            Arc::new(transformed.data),
+            transformed.transformed,
+            transformed.tnr,
+        ))
+    }
+
+    /// Carry out the flatten-and-rebuild logic on a plan that has already
+    /// been identified as matching the rule's pattern (a `Filter` over an
+    /// `Inner` `Join`, or a bare `Inner` `Join`).
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn rewrite_matched(
         &self,
         plan: LogicalPlan,
         config: &dyn OptimizerConfig,
@@ -92,25 +168,6 @@ impl OptimizerRule for EliminateCrossJoin {
         let mut null_equality = NullEquality::NullEqualsNothing;
 
         let parent_predicate = if let LogicalPlan::Filter(filter) = plan {
-            // if input isn't a join that can potentially be rewritten
-            // avoid unwrapping the input
-            let rewritable = matches!(
-                filter.input.as_ref(),
-                LogicalPlan::Join(Join {
-                    join_type: JoinType::Inner,
-                    ..
-                })
-            );
-
-            if !rewritable {
-                // recursively try to rewrite children
-                return rewrite_children(self, LogicalPlan::Filter(filter), config);
-            }
-
-            if !can_flatten_join_inputs(&filter.input) {
-                return Ok(Transformed::no(LogicalPlan::Filter(filter)));
-            }
-
             let Filter {
                 input, predicate, ..
             } = filter;
@@ -130,29 +187,22 @@ impl OptimizerRule for EliminateCrossJoin {
             extract_possible_join_keys(&predicate, &mut possible_join_keys);
             Some(predicate)
         } else {
-            match plan {
-                LogicalPlan::Join(Join {
-                    join_type: JoinType::Inner,
-                    null_equality: original_null_equality,
-                    ..
-                }) => {
-                    if !can_flatten_join_inputs(&plan) {
-                        return Ok(Transformed::no(plan));
-                    }
-                    flatten_join_inputs(
-                        plan,
-                        &mut possible_join_keys,
-                        &mut all_inputs,
-                        &mut all_filters,
-                    )?;
-                    null_equality = original_null_equality;
-                    None
-                }
-                _ => {
-                    // recursively try to rewrite children
-                    return rewrite_children(self, plan, config);
-                }
-            }
+            // Caller guarantees this is a matching Inner Join.
+            let LogicalPlan::Join(Join {
+                null_equality: original_null_equality,
+                ..
+            }) = &plan
+            else {
+                unreachable!("rewrite_matched invoked on non-matching plan")
+            };
+            null_equality = *original_null_equality;
+            flatten_join_inputs(
+                plan,
+                &mut possible_join_keys,
+                &mut all_inputs,
+                &mut all_filters,
+            )?;
+            None
         };
 
         // Join keys are handled locally:
@@ -168,7 +218,11 @@ impl OptimizerRule for EliminateCrossJoin {
             )?;
         }
 
-        left = rewrite_children(self, left, config)?.data;
+        // Recurse into the children of the flattened join using the Arc
+        // path so their unchanged subtrees stay shared.
+        let left_arc = Arc::new(left);
+        let walked = self.rewrite_children_arc(&left_arc, config)?;
+        left = Arc::unwrap_or_clone(walked.data);
 
         if &plan_schema != left.schema() {
             left = LogicalPlan::Projection(Projection::new_from_schema(
@@ -202,23 +256,23 @@ impl OptimizerRule for EliminateCrossJoin {
         }
     }
 
-    fn name(&self) -> &str {
-        "eliminate_cross_join"
-    }
-}
-
-fn rewrite_children(
-    optimizer: &impl OptimizerRule,
-    plan: LogicalPlan,
-    config: &dyn OptimizerConfig,
-) -> Result<Transformed<LogicalPlan>> {
-    let transformed_plan = plan.map_children(|input| optimizer.rewrite(input, config))?;
-
-    // recompute schema if the plan was transformed
-    if transformed_plan.transformed {
-        transformed_plan.map_data(|plan| plan.recompute_schema())
-    } else {
-        Ok(transformed_plan)
+    /// Recurse into the direct children of `plan` using the Arc-aware
+    /// walker. Unchanged subtrees are preserved as `Arc::clone` of the
+    /// input — no heap allocation.
+    fn rewrite_children_arc(
+        &self,
+        plan: &Arc<LogicalPlan>,
+        config: &dyn OptimizerConfig,
+    ) -> Result<Transformed<Arc<LogicalPlan>>> {
+        let transformed =
+            plan.map_children_arc(|child| self.rewrite_arc(Arc::clone(child), config))?;
+        if transformed.transformed {
+            // Recompute schema (requires owned LogicalPlan).
+            let owned = Arc::unwrap_or_clone(transformed.data);
+            Ok(Transformed::yes(Arc::new(owned.recompute_schema()?)))
+        } else {
+            Ok(transformed)
+        }
     }
 }
 

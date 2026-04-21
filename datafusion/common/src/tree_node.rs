@@ -478,36 +478,24 @@ pub trait TreeNodeArc: Sized {
     ///
     /// The returned [`Transformed::transformed`] flag is set iff any
     /// child was transformed.
-    fn map_children_arc<F>(
-        self: &Arc<Self>,
-        f: F,
-    ) -> Result<Transformed<Arc<Self>>>
+    fn map_children_arc<F>(self: &Arc<Self>, f: F) -> Result<Transformed<Arc<Self>>>
     where
         F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>;
 
     /// Apply `f` to each direct child of this node, without transforming.
     /// Short-circuits on [`TreeNodeRecursion::Stop`].
-    fn apply_children_arc<F>(
-        self: &Arc<Self>,
-        f: F,
-    ) -> Result<TreeNodeRecursion>
+    fn apply_children_arc<F>(self: &Arc<Self>, f: F) -> Result<TreeNodeRecursion>
     where
         F: FnMut(&Arc<Self>) -> Result<TreeNodeRecursion>;
 
     /// Apply `f` to the tree in pre-order (top-down), recursing into
     /// children after `f` is called on the parent.
-    fn transform_down_arc<F>(
-        self: &Arc<Self>,
-        mut f: F,
-    ) -> Result<Transformed<Arc<Self>>>
+    fn transform_down_arc<F>(self: &Arc<Self>, mut f: F) -> Result<Transformed<Arc<Self>>>
     where
         F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>,
     {
         #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
-        fn impl_down<N, F>(
-            node: &Arc<N>,
-            f: &mut F,
-        ) -> Result<Transformed<Arc<N>>>
+        fn impl_down<N, F>(node: &Arc<N>, f: &mut F) -> Result<Transformed<Arc<N>>>
         where
             N: TreeNodeArc,
             F: FnMut(&Arc<N>) -> Result<Transformed<Arc<N>>>,
@@ -515,8 +503,7 @@ pub trait TreeNodeArc: Sized {
             let applied = f(node)?;
             match applied.tnr {
                 TreeNodeRecursion::Continue => {
-                    let walked =
-                        applied.data.map_children_arc(|c| impl_down(c, f))?;
+                    let walked = applied.data.map_children_arc(|c| impl_down(c, f))?;
                     Ok(Transformed::new(
                         walked.data,
                         applied.transformed || walked.transformed,
@@ -536,18 +523,12 @@ pub trait TreeNodeArc: Sized {
 
     /// Apply `f` to the tree in post-order (bottom-up), recursing into
     /// children before `f` is called on the parent.
-    fn transform_up_arc<F>(
-        self: &Arc<Self>,
-        mut f: F,
-    ) -> Result<Transformed<Arc<Self>>>
+    fn transform_up_arc<F>(self: &Arc<Self>, mut f: F) -> Result<Transformed<Arc<Self>>>
     where
         F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>,
     {
         #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
-        fn impl_up<N, F>(
-            node: &Arc<N>,
-            f: &mut F,
-        ) -> Result<Transformed<Arc<N>>>
+        fn impl_up<N, F>(node: &Arc<N>, f: &mut F) -> Result<Transformed<Arc<N>>>
         where
             N: TreeNodeArc,
             F: FnMut(&Arc<N>) -> Result<Transformed<Arc<N>>>,
@@ -575,16 +556,12 @@ pub trait TreeNodeArc: Sized {
         F: FnMut(&Arc<Self>) -> Result<TreeNodeRecursion>,
     {
         #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
-        fn impl_apply<N, F>(
-            node: &Arc<N>,
-            f: &mut F,
-        ) -> Result<TreeNodeRecursion>
+        fn impl_apply<N, F>(node: &Arc<N>, f: &mut F) -> Result<TreeNodeRecursion>
         where
             N: TreeNodeArc,
             F: FnMut(&Arc<N>) -> Result<TreeNodeRecursion>,
         {
-            f(node)?
-                .visit_children(|| node.apply_children_arc(|c| impl_apply(c, f)))
+            f(node)?.visit_children(|| node.apply_children_arc(|c| impl_apply(c, f)))
         }
         impl_apply(self, &mut f)
     }

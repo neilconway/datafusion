@@ -402,9 +402,7 @@ impl Optimizer {
                         &mut Rewriter::new(apply_order, rule.as_ref(), config),
                     ),
                     // rule handles recursion itself
-                    None => {
-                        rule.rewrite(new_plan, config)
-                    },
+                    None => rule.rewrite(new_plan, config),
                 }
                 .and_then(|tnr| {
                     // run checks optimizer invariant checks, per optimizer rule applied

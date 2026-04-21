@@ -822,9 +822,7 @@ impl<'a, T: 'a, C: TreeNodeContainer<'a, T> + Default> TreeNodeContainer<'a, T>
     }
 }
 
-impl<'a, T: 'a, C: TreeNodeContainer<'a, T> + Clone + Default> TreeNodeContainer<'a, T>
-    for Arc<C>
-{
+impl<'a, T: 'a, C: TreeNodeContainer<'a, T> + Clone> TreeNodeContainer<'a, T> for Arc<C> {
     fn apply_elements<F: FnMut(&'a T) -> Result<TreeNodeRecursion>>(
         &'a self,
         f: F,
@@ -833,18 +831,12 @@ impl<'a, T: 'a, C: TreeNodeContainer<'a, T> + Clone + Default> TreeNodeContainer
     }
 
     fn map_elements<F: FnMut(T) -> Result<Transformed<T>>>(
-        mut self,
+        self,
         f: F,
     ) -> Result<Transformed<Self>> {
-        // Rewrite in place using the same `mem::take` strategy as
-        // `Box<C>::map_elements`. `Arc::make_mut` gives us exclusive
-        // access (cloning `C` first if we were sharing), after which
-        // `get_mut` is infallible.
-        let inner = std::mem::take(Arc::make_mut(&mut self));
-        Ok(inner.map_elements(f)?.update_data(|c| {
-            *Arc::get_mut(&mut self).unwrap() = c;
-            self
-        }))
+        Arc::unwrap_or_clone(self)
+            .map_elements(f)?
+            .map_data(|c| Ok(Arc::new(c)))
     }
 }
 
@@ -1353,7 +1345,6 @@ impl<T: ConcreteTreeNode> TreeNode for T {
 pub(crate) mod tests {
     use std::collections::HashMap;
     use std::fmt::Display;
-    use std::sync::Arc;
 
     use crate::Result;
     use crate::tree_node::{
@@ -2458,25 +2449,6 @@ pub(crate) mod tests {
         let out = boxed.map_elements(|n| Ok(Transformed::no(n))).unwrap();
         let after: *const TestTreeNode<i32> = &*out.data;
         assert_eq!(after, before);
-    }
-
-    #[test]
-    fn arc_map_elements_reuses_allocation_when_unique() {
-        let arc = Arc::new(TestTreeNode::new_leaf(42i32));
-        let before = Arc::as_ptr(&arc);
-        let out = arc.map_elements(|n| Ok(Transformed::no(n))).unwrap();
-        assert_eq!(Arc::as_ptr(&out.data), before);
-    }
-
-    #[test]
-    fn arc_map_elements_clones_when_shared() {
-        // When the input `Arc` is shared, `make_mut` clones into a fresh
-        // allocation, so the reuse optimization does not apply.
-        let arc = Arc::new(TestTreeNode::new_leaf(42i32));
-        let _keepalive = Arc::clone(&arc);
-        let before = Arc::as_ptr(&arc);
-        let out = arc.map_elements(|n| Ok(Transformed::no(n))).unwrap();
-        assert_ne!(Arc::as_ptr(&out.data), before);
     }
 
     #[test]

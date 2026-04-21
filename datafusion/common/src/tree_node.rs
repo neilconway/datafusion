@@ -435,6 +435,161 @@ pub trait TreeNode: Sized {
     ) -> Result<Transformed<Self>>;
 }
 
+/// A variant of [`TreeNode`] for nodes that are typically stored in
+/// [`Arc`] and for which *unchanged* subtrees can be preserved in place
+/// across a rewrite without any heap allocation.
+///
+/// Where [`TreeNode`] consumes the owned node and, on every visit, unwraps
+/// and re-wraps it, the `_arc`-suffixed methods on this trait take
+/// `&Arc<Self>` and return `Transformed<Arc<Self>>`. When a subtree is
+/// unchanged, the returned `Arc<Self>` is an `Arc::clone` of the input
+/// (one atomic refcount bump, no `Box::new` / `Arc::new`). Only the
+/// *changed* spine from the rewritten node up to the root pays for
+/// allocation.
+///
+/// This trait is intended to coexist with [`TreeNode`]: individual types
+/// can implement one or both. Rules that walk a tree where the host type
+/// implements [`TreeNodeArc`] can migrate to the `_arc` methods to pick
+/// up the savings; rules that walk a tree where the host type is only a
+/// [`TreeNode`] are unaffected.
+///
+/// # Overview
+///
+/// | Traversal Order | Inspecting | Transforming |
+/// | --- | --- | --- |
+/// | top-down | [`apply_arc`] | [`transform_down_arc`] |
+/// | bottom-up | | [`transform_up_arc`] |
+///
+/// Implementors must provide [`map_children_arc`] and
+/// [`apply_children_arc`]; the other methods are provided by default.
+///
+/// [`apply_arc`]: Self::apply_arc
+/// [`transform_down_arc`]: Self::transform_down_arc
+/// [`transform_up_arc`]: Self::transform_up_arc
+/// [`map_children_arc`]: Self::map_children_arc
+/// [`apply_children_arc`]: Self::apply_children_arc
+pub trait TreeNodeArc: Sized {
+    /// Apply `f` to each direct child of this node.
+    ///
+    /// When no child is transformed, the returned `Arc<Self>` is
+    /// `Arc::clone` of `self` — no allocation. When any child is
+    /// transformed, a fresh `Arc` is allocated wrapping a newly built
+    /// variant whose unchanged non-child fields are cloned from `self`.
+    ///
+    /// The returned [`Transformed::transformed`] flag is set iff any
+    /// child was transformed.
+    fn map_children_arc<F>(
+        self: &Arc<Self>,
+        f: F,
+    ) -> Result<Transformed<Arc<Self>>>
+    where
+        F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>;
+
+    /// Apply `f` to each direct child of this node, without transforming.
+    /// Short-circuits on [`TreeNodeRecursion::Stop`].
+    fn apply_children_arc<F>(
+        self: &Arc<Self>,
+        f: F,
+    ) -> Result<TreeNodeRecursion>
+    where
+        F: FnMut(&Arc<Self>) -> Result<TreeNodeRecursion>;
+
+    /// Apply `f` to the tree in pre-order (top-down), recursing into
+    /// children after `f` is called on the parent.
+    fn transform_down_arc<F>(
+        self: &Arc<Self>,
+        mut f: F,
+    ) -> Result<Transformed<Arc<Self>>>
+    where
+        F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>,
+    {
+        #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+        fn impl_down<N, F>(
+            node: &Arc<N>,
+            f: &mut F,
+        ) -> Result<Transformed<Arc<N>>>
+        where
+            N: TreeNodeArc,
+            F: FnMut(&Arc<N>) -> Result<Transformed<Arc<N>>>,
+        {
+            let applied = f(node)?;
+            match applied.tnr {
+                TreeNodeRecursion::Continue => {
+                    let walked =
+                        applied.data.map_children_arc(|c| impl_down(c, f))?;
+                    Ok(Transformed::new(
+                        walked.data,
+                        applied.transformed || walked.transformed,
+                        walked.tnr,
+                    ))
+                }
+                TreeNodeRecursion::Jump => Ok(Transformed::new(
+                    applied.data,
+                    applied.transformed,
+                    TreeNodeRecursion::Continue,
+                )),
+                TreeNodeRecursion::Stop => Ok(applied),
+            }
+        }
+        impl_down(self, &mut f)
+    }
+
+    /// Apply `f` to the tree in post-order (bottom-up), recursing into
+    /// children before `f` is called on the parent.
+    fn transform_up_arc<F>(
+        self: &Arc<Self>,
+        mut f: F,
+    ) -> Result<Transformed<Arc<Self>>>
+    where
+        F: FnMut(&Arc<Self>) -> Result<Transformed<Arc<Self>>>,
+    {
+        #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+        fn impl_up<N, F>(
+            node: &Arc<N>,
+            f: &mut F,
+        ) -> Result<Transformed<Arc<N>>>
+        where
+            N: TreeNodeArc,
+            F: FnMut(&Arc<N>) -> Result<Transformed<Arc<N>>>,
+        {
+            let walked = node.map_children_arc(|c| impl_up(c, f))?;
+            match walked.tnr {
+                TreeNodeRecursion::Continue => {
+                    let applied = f(&walked.data)?;
+                    Ok(Transformed::new(
+                        applied.data,
+                        walked.transformed || applied.transformed,
+                        applied.tnr,
+                    ))
+                }
+                TreeNodeRecursion::Jump | TreeNodeRecursion::Stop => Ok(walked),
+            }
+        }
+        impl_up(self, &mut f)
+    }
+
+    /// Apply `f` to every node in the tree in pre-order, without
+    /// transforming. Short-circuits on [`TreeNodeRecursion::Stop`].
+    fn apply_arc<F>(self: &Arc<Self>, mut f: F) -> Result<TreeNodeRecursion>
+    where
+        F: FnMut(&Arc<Self>) -> Result<TreeNodeRecursion>,
+    {
+        #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+        fn impl_apply<N, F>(
+            node: &Arc<N>,
+            f: &mut F,
+        ) -> Result<TreeNodeRecursion>
+        where
+            N: TreeNodeArc,
+            F: FnMut(&Arc<N>) -> Result<TreeNodeRecursion>,
+        {
+            f(node)?
+                .visit_children(|| node.apply_children_arc(|c| impl_apply(c, f)))
+        }
+        impl_apply(self, &mut f)
+    }
+}
+
 /// A [Visitor](https://en.wikipedia.org/wiki/Visitor_pattern) for recursively
 /// inspecting [`TreeNode`]s via [`TreeNode::visit`].
 ///

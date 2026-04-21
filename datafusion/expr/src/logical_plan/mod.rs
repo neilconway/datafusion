@@ -25,6 +25,7 @@ pub use invariants::{InvariantLevel, assert_expected_schema, check_subquery_expr
 mod plan;
 mod statement;
 pub mod tree_node;
+mod tree_node_arc;
 
 pub use builder::{
     LogicalPlanBuilder, LogicalPlanBuilderOptions, LogicalTableSource, UNNAMED_TABLE,

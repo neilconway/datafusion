@@ -1907,6 +1907,125 @@ physical_plan
 statement ok
 RESET datafusion.explain.logical_plan_only;
 
+#############
+## Additional edge cases inspired by DuckDB scalar subquery bugs and tests.
+## References:
+##   DuckDB issue #13639: volatile functions in uncorrelated subqueries
+##   DuckDB issue #13469 / PR #13514: multi-row error semantics
+##   DuckDB issue #4113: uncorrelated scalar subquery wrong results
+##   DuckDB test: test/sql/subquery/scalar/test_uncorrelated_scalar_subquery.test
+##   DuckDB test: test/sql/subquery/scalar/test_scalar_subquery.test
+##   DuckDB test: test/sql/subquery/scalar/test_scalar_subquery_cte.test
+##   DuckDB test: test/sql/order/test_limit.test
+##   DuckDB PR #8519: TopN optimization with scalar subquery in LIMIT/OFFSET
+#############
+
+# Volatile function in uncorrelated subquery: random() is evaluated once and
+# the same value is used for every outer row. Both Postgres and DuckDB (#13639)
+# exhibit this behavior; it is correct per the SQL standard.
+# We cannot assert the exact value, but we can verify all rows are identical.
+query B
+SELECT count(DISTINCT r) = 1 FROM (
+  SELECT (SELECT random()) AS r
+  FROM (VALUES (1), (2), (3)) AS t(x)
+);
+----
+true
+
+# Subquery as GROUP BY key.
+# Ref: DuckDB test_uncorrelated_scalar_subquery.test, test #6
+query II
+SELECT (SELECT 42) AS k, max(x) FROM (VALUES (1), (2), (3)) AS t(x) GROUP BY k;
+----
+42 3
+
+# Subquery inside an aggregate function argument.
+# Ref: DuckDB test_uncorrelated_scalar_subquery.test, test #7
+query II
+SELECT x, max((SELECT 42)) FROM (VALUES (1), (2), (3)) AS t(x) GROUP BY x ORDER BY x;
+----
+1 42
+2 42
+3 42
+
+# Doubly-nested constant subquery.
+# Ref: DuckDB test_scalar_subquery.test
+query I
+SELECT (SELECT (SELECT 42));
+----
+42
+
+# Triple-nested constant subquery.
+query I
+SELECT (SELECT (SELECT (SELECT 99)));
+----
+99
+
+# Star expansion: single column is OK.
+# Ref: DuckDB test_uncorrelated_scalar_subquery.test, tests #16-17
+query I
+SELECT (SELECT * FROM (VALUES (1)) AS t(x));
+----
+1
+
+# Star expansion: two columns must error.
+query error Too many columns
+SELECT (SELECT * FROM (VALUES (1, 2)) AS t(x, y));
+
+# Subquery in BETWEEN bounds.
+query I
+SELECT x FROM (VALUES (1), (2), (3), (4), (5)) AS t(x)
+WHERE x BETWEEN (SELECT 2) AND (SELECT 4)
+ORDER BY x;
+----
+2
+3
+4
+
+# DISTINCT subquery returning exactly one distinct value (multi-row input).
+query I
+SELECT (SELECT DISTINCT 42 FROM (VALUES (1), (2), (3)) AS t(x));
+----
+42
+
+# DISTINCT subquery returning multiple distinct values must error.
+query error DataFusion error: Execution error: Scalar subquery returned more than one row
+SELECT (SELECT DISTINCT x FROM (VALUES (1), (2), (3)) AS t(x));
+
+# NULL comparison semantics through subquery boundary.
+# Ref: DuckDB test_scalar_subquery.test, NULL edge cases
+query B
+SELECT 1 = (SELECT CAST(NULL AS INT));
+----
+NULL
+
+query B
+SELECT CAST(NULL AS INT) = (SELECT 1);
+----
+NULL
+
+# Nested CTE inside scalar subquery.
+# Ref: DuckDB test_scalar_subquery_cte.test, nested CTE test
+query I
+SELECT (WITH cte1 AS (WITH cte2 AS (SELECT 42) SELECT * FROM cte2) SELECT * FROM cte1);
+----
+42
+
+# Subquery in LIMIT: not yet supported, verify clear error message.
+# Ref: DuckDB PR #8519, DuckDB test/sql/order/test_limit.test
+query error This feature is not implemented: Unsupported LIMIT expression
+SELECT * FROM (VALUES (1), (2), (3)) AS t(x) ORDER BY x LIMIT (SELECT 2);
+
+# Subquery in OFFSET: not yet supported, verify clear error message.
+query error This feature is not implemented: Unsupported OFFSET expression
+SELECT * FROM (VALUES (1), (2), (3)) AS t(x) ORDER BY x OFFSET (SELECT 1);
+
+# UNION ALL subquery with ORDER BY + LIMIT 1 to avoid multi-row error.
+query I
+SELECT (SELECT v FROM (SELECT 1 AS v UNION ALL SELECT 2) AS t ORDER BY v LIMIT 1);
+----
+1
+
 statement count 0
 DROP TABLE sq_values;
 

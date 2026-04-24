@@ -116,8 +116,13 @@ impl RequiredIndices {
         // handle those cases.
         expr.apply(|e| {
             match e {
-                Expr::Column(c) | Expr::OuterReferenceColumn(_, c) => {
+                Expr::Column(c) => {
                     if let Some(idx) = input_schema.maybe_index_of_column(c) {
+                        self.indices.push(idx);
+                    }
+                }
+                Expr::OuterReferenceColumn { column, .. } => {
+                    if let Some(idx) = input_schema.maybe_index_of_column(column) {
                         self.indices.push(idx);
                     }
                 }

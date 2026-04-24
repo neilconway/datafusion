@@ -69,11 +69,32 @@ pub fn col(ident: impl Into<Column>) -> Expr {
 }
 
 /// Create an out reference column which hold a reference that has been resolved to a field
-/// outside of the current plan.
+/// in the immediate enclosing outer query (`steps_out = 1`).
 /// The expression created by this function does not preserve the metadata of the outer column.
 /// Please use `out_ref_col_with_metadata` if you want to preserve the metadata.
 pub fn out_ref_col(dt: DataType, ident: impl Into<Column>) -> Expr {
     out_ref_col_with_metadata(dt, HashMap::new(), ident)
+}
+
+/// Create an out reference column that resolves to a field `steps_out`
+/// query levels out. `steps_out = 1` is the immediate parent query, `2` is
+/// the grandparent, etc.
+pub fn out_ref_col_at_steps_out(
+    dt: DataType,
+    ident: impl Into<Column>,
+    steps_out: u32,
+) -> Expr {
+    assert!(
+        steps_out >= 1,
+        "OuterReferenceColumn steps_out must be >= 1"
+    );
+    let column = ident.into();
+    let field: FieldRef = Arc::new(Field::new(column.name(), dt, true));
+    Expr::OuterReferenceColumn {
+        field,
+        column: Box::new(column),
+        steps_out,
+    }
 }
 
 /// Create an out reference column from an existing field (preserving metadata)
@@ -85,7 +106,11 @@ pub fn out_ref_col_with_metadata(
     let column = ident.into();
     let field: FieldRef =
         Arc::new(Field::new(column.name(), dt, true).with_metadata(metadata));
-    Expr::OuterReferenceColumn(field, column)
+    Expr::OuterReferenceColumn {
+        field,
+        column: Box::new(column),
+        steps_out: 1,
+    }
 }
 
 /// Create an unqualified column expression from the provided name, without normalizing

@@ -159,12 +159,13 @@ fn to_outer_reference(expr: Expr, outer_schema: &DFSchema) -> Result<Expr> {
     expr.transform_up(|expr| match expr {
         Expr::Column(col) => {
             let field = outer_schema.field_from_column(&col)?;
-            Ok(Transformed::yes(Expr::OuterReferenceColumn(
-                Arc::clone(field),
-                col,
-            )))
+            Ok(Transformed::yes(Expr::OuterReferenceColumn {
+                field: Arc::clone(field),
+                column: Box::new(col),
+                steps_out: 1,
+            }))
         }
-        Expr::OuterReferenceColumn(_, _) => Ok(Transformed::no(expr)),
+        Expr::OuterReferenceColumn { .. } => Ok(Transformed::no(expr)),
         _ => Ok(Transformed::no(expr)),
     })
     .map(|t| t.data)

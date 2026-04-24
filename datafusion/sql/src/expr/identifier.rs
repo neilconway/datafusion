@@ -75,16 +75,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 return Ok(Expr::Column(column));
             }
 
-            // Check the outer query schema
-            for outer in planner_context.outer_schemas_iter() {
+            // Check the outer query schema. `outer_schemas_iter` yields
+            // schemas innermost-first, so the 0-based index plus 1 gives
+            // `steps_out` (1 = immediate parent, 2 = grandparent, ...).
+            for (idx, outer) in planner_context.outer_schemas_iter().enumerate() {
                 if let Ok((qualifier, field)) =
                     outer.qualified_field_with_unqualified_name(normalize_ident.as_str())
                 {
-                    // Found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
-                    return Ok(Expr::OuterReferenceColumn(
-                        Arc::clone(field),
-                        Column::from((qualifier, field)),
-                    ));
+                    return Ok(Expr::OuterReferenceColumn {
+                        field: Arc::clone(field),
+                        column: Box::new(Column::from((qualifier, field))),
+                        steps_out: (idx as u32) + 1,
+                    });
                 }
             }
 
@@ -172,8 +174,12 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     if ids.len() == 5 {
                         not_impl_err!("compound identifier: {ids:?}")
                     } else {
-                        // Check the outer_query_schema and try to find a match
-                        for outer in planner_context.outer_schemas_iter() {
+                        // Check the outer_query_schema and try to find a
+                        // match. Index i => `steps_out = i + 1` (innermost
+                        // first).
+                        for (idx, outer) in
+                            planner_context.outer_schemas_iter().enumerate()
+                        {
                             let search_result = search_dfschema(&ids, outer);
                             let result = match search_result {
                                 // Found matching field with spare identifier(s) for nested field(s) in structure
@@ -189,11 +195,13 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 }
                                 // Found matching field with no spare identifier(s)
                                 Some((field, qualifier, _nested_names)) => {
-                                    // Found an exact match on a qualified name in the outer plan schema, so this is an outer reference column
-                                    Ok(Expr::OuterReferenceColumn(
-                                        Arc::clone(field),
-                                        Column::from((qualifier, field)),
-                                    ))
+                                    Ok(Expr::OuterReferenceColumn {
+                                        field: Arc::clone(field),
+                                        column: Box::new(Column::from((
+                                            qualifier, field,
+                                        ))),
+                                        steps_out: (idx as u32) + 1,
+                                    })
                                 }
                                 // Found no matching field, will return a default
                                 None => continue,

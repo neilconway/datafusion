@@ -136,7 +136,7 @@ impl ExprSchemable for Expr {
             },
             Expr::Negative(expr) => expr.get_type(schema),
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
-            Expr::OuterReferenceColumn(field, _) => Ok(field.data_type().clone()),
+            Expr::OuterReferenceColumn { field, .. } => Ok(field.data_type().clone()),
             Expr::ScalarVariable(field, _) => Ok(field.data_type().clone()),
             Expr::Literal(l, _) => Ok(l.data_type()),
             Expr::Case(case) => {
@@ -267,7 +267,7 @@ impl ExprSchemable for Expr {
                 || high.nullable(input_schema)?),
 
             Expr::Column(c) => input_schema.nullable(c),
-            Expr::OuterReferenceColumn(field, _) => Ok(field.is_nullable()),
+            Expr::OuterReferenceColumn { field, .. } => Ok(field.is_nullable()),
             Expr::Literal(value, _) => Ok(value.is_null()),
             Expr::Case(case) => {
                 let nullable_then = case
@@ -472,7 +472,7 @@ impl ExprSchemable for Expr {
             }
             Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
             Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
-            Expr::OuterReferenceColumn(field, _) => {
+            Expr::OuterReferenceColumn { field, .. } => {
                 Ok(Arc::clone(field).renamed(&schema_name))
             }
             Expr::ScalarVariable(field, _) => Ok(Arc::clone(field).renamed(&schema_name)),

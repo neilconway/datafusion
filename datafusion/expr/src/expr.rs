@@ -400,8 +400,20 @@ pub enum Expr {
     /// (e.g. `$foo` or `$1`)
     Placeholder(Placeholder),
     /// A placeholder which holds a reference to a qualified field
-    /// in the outer query, used for correlated sub queries.
-    OuterReferenceColumn(FieldRef, Column),
+    /// in an enclosing outer query, used for correlated subqueries.
+    ///
+    /// `steps_out` is the number of subquery levels to walk out to resolve
+    /// the reference: 1 means the immediate parent, 2 the grandparent,
+    /// and so on. A `steps_out` of 0 is invalid (that would be a regular
+    /// `Expr::Column`). The name matches the Substrait `OuterReference`
+    /// `steps_out` field for consistency between the two representations.
+    ///
+    /// The `column` is boxed to keep the size of [`Expr`] small.
+    OuterReferenceColumn {
+        field: FieldRef,
+        column: Box<Column>,
+        steps_out: u32,
+    },
     /// Unnest expression
     Unnest(Unnest),
 }
@@ -1592,7 +1604,7 @@ impl Expr {
             Expr::Case { .. } => "Case",
             Expr::Cast { .. } => "Cast",
             Expr::Column(..) => "Column",
-            Expr::OuterReferenceColumn(_, _) => "Outer",
+            Expr::OuterReferenceColumn { .. } => "Outer",
             Expr::Exists { .. } => "Exists",
             Expr::GroupingSet(..) => "GroupingSet",
             Expr::InList { .. } => "InList",
@@ -2168,7 +2180,7 @@ impl Expr {
             | Expr::SimilarTo(..)
             | Expr::Not(..)
             | Expr::Negative(..)
-            | Expr::OuterReferenceColumn(_, _)
+            | Expr::OuterReferenceColumn { .. }
             | Expr::TryCast(..)
             | Expr::Unnest(..)
             | Expr::Wildcard { .. }
@@ -2769,9 +2781,14 @@ impl HashNode for Expr {
             Expr::Placeholder(place_holder) => {
                 place_holder.hash(state);
             }
-            Expr::OuterReferenceColumn(field, column) => {
+            Expr::OuterReferenceColumn {
+                field,
+                column,
+                steps_out,
+            } => {
                 field.hash(state);
                 column.hash(state);
+                steps_out.hash(state);
             }
             Expr::Unnest(Unnest { expr: _expr }) => {}
         };
@@ -2822,7 +2839,7 @@ impl Display for SchemaDisplay<'_> {
             Expr::Column(_)
             | Expr::Literal(_, _)
             | Expr::ScalarVariable(..)
-            | Expr::OuterReferenceColumn(..)
+            | Expr::OuterReferenceColumn { .. }
             | Expr::Placeholder(_)
             | Expr::Wildcard { .. } => write!(f, "{}", self.0),
             Expr::AggregateFunction(AggregateFunction { func, params }) => {
@@ -3365,8 +3382,14 @@ impl Display for Expr {
         match self {
             Expr::Alias(Alias { expr, name, .. }) => write!(f, "{expr} AS {name}"),
             Expr::Column(c) => write!(f, "{c}"),
-            Expr::OuterReferenceColumn(_, c) => {
-                write!(f, "{OUTER_REFERENCE_COLUMN_PREFIX}({c})")
+            Expr::OuterReferenceColumn {
+                column, steps_out, ..
+            } => {
+                if *steps_out > 1 {
+                    write!(f, "{OUTER_REFERENCE_COLUMN_PREFIX}^{steps_out}({column})")
+                } else {
+                    write!(f, "{OUTER_REFERENCE_COLUMN_PREFIX}({column})")
+                }
             }
             Expr::ScalarVariable(_, var_names) => write!(f, "{}", var_names.join(".")),
             Expr::Literal(v, metadata) => {

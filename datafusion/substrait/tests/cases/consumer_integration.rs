@@ -574,7 +574,7 @@ mod tests {
           Subquery:
             Filter: B.b1 = outer_ref(A.a1) AND EXISTS (<subquery>)
               Subquery:
-                Filter: C.c1 = outer_ref(A.a1) AND C.c2 = outer_ref(B.b2)
+                Filter: C.c1 = outer_ref^2(A.a1) AND C.c2 = outer_ref(B.b2)
                   TableScan: C
               TableScan: B
           TableScan: A

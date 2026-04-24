@@ -238,7 +238,7 @@ fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
         | Expr::InSubquery(_)
         | Expr::SetComparison(_)
         | Expr::ScalarSubquery(_)
-        | Expr::OuterReferenceColumn(_, _)
+        | Expr::OuterReferenceColumn { .. }
         | Expr::Unnest(_) => {
             is_evaluate = false;
             Ok(TreeNodeRecursion::Stop)

@@ -83,5 +83,14 @@ fn resolve_outer_reference(
     };
     let (qualifier, field) = outer_schema.qualified_field(field_idx);
     let col = Column::from((qualifier, field));
-    Ok(Expr::OuterReferenceColumn(Arc::clone(field), col))
+    let steps_out_u32 = u32::try_from(steps_out).map_err(|_| {
+        datafusion::common::DataFusionError::Substrait(format!(
+            "OuterReference steps_out={steps_out} does not fit in u32"
+        ))
+    })?;
+    Ok(Expr::OuterReferenceColumn {
+        field: Arc::clone(field),
+        column: Box::new(col),
+        steps_out: steps_out_u32,
+    })
 }

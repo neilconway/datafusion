@@ -205,8 +205,8 @@ pub fn unnormalize_cols(exprs: impl IntoIterator<Item = Expr>) -> Vec<Expr> {
 pub fn strip_outer_reference(expr: Expr) -> Expr {
     expr.transform(|expr| {
         Ok({
-            if let Expr::OuterReferenceColumn(_, col) = expr {
-                Transformed::yes(Expr::Column(col))
+            if let Expr::OuterReferenceColumn { column, .. } = expr {
+                Transformed::yes(Expr::Column(*column))
             } else {
                 Transformed::no(expr)
             }

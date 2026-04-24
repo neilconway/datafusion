@@ -61,7 +61,7 @@ pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
         }
         Expr::Literal(_, _)
         | Expr::Alias(_)
-        | Expr::OuterReferenceColumn(_, _)
+        | Expr::OuterReferenceColumn { .. }
         | Expr::ScalarVariable(_, _)
         | Expr::Not(_)
         | Expr::IsNotNull(_)

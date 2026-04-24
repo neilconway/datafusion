@@ -550,7 +550,7 @@ impl Unparser<'_> {
             Expr::Placeholder(p) => {
                 Ok(ast::Expr::value(ast::Value::Placeholder(p.id.to_string())))
             }
-            Expr::OuterReferenceColumn(_, col) => self.col_to_sql(col),
+            Expr::OuterReferenceColumn { column, .. } => self.col_to_sql(column),
             Expr::Unnest(unnest) => self.unnest_to_sql(unnest),
         }
     }

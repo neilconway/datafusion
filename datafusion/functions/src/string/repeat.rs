@@ -15,13 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
-use crate::utils::utf8_to_str_type;
-use arrow::array::{
-    Array, ArrayRef, AsArray, GenericStringArray, GenericStringBuilder, Int64Array,
-    StringArrayType, StringLikeArrayBuilder, StringViewArray, StringViewBuilder,
+use crate::strings::{
+    BulkNullStringArrayBuilder, GenericStringArrayBuilder, StringViewArrayBuilder,
 };
+use crate::utils::utf8_to_str_type;
+use arrow::array::{Array, ArrayRef, AsArray, Int64Array, StringArrayType};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::DataType;
 use arrow::datatypes::DataType::{LargeUtf8, Utf8, Utf8View};
 use datafusion_common::cast::as_int64_array;
@@ -190,43 +189,28 @@ fn repeat(string_array: &ArrayRef, count_array: &ArrayRef) -> Result<ArrayRef> {
                 number_array,
                 i32::MAX as usize,
             )?;
-            let builder = StringViewBuilder::with_capacity(string_array.len());
-            repeat_impl::<&StringViewArray, StringViewBuilder>(
-                &string_view_array,
-                number_array,
-                max_item_capacity,
-                builder,
-            )
+            let builder = StringViewArrayBuilder::with_capacity(string_array.len());
+            repeat_impl(&string_view_array, number_array, max_item_capacity, builder)
         }
         Utf8 => {
             let string_arr = string_array.as_string::<i32>();
             let (total_capacity, max_item_capacity) =
                 calculate_capacities(&string_arr, number_array, i32::MAX as usize)?;
-            let builder = GenericStringBuilder::<i32>::with_capacity(
+            let builder = GenericStringArrayBuilder::<i32>::with_capacity(
                 string_array.len(),
                 total_capacity,
             );
-            repeat_impl::<&GenericStringArray<i32>, GenericStringBuilder<i32>>(
-                &string_arr,
-                number_array,
-                max_item_capacity,
-                builder,
-            )
+            repeat_impl(&string_arr, number_array, max_item_capacity, builder)
         }
         LargeUtf8 => {
             let string_arr = string_array.as_string::<i64>();
             let (total_capacity, max_item_capacity) =
                 calculate_capacities(&string_arr, number_array, i64::MAX as usize)?;
-            let builder = GenericStringBuilder::<i64>::with_capacity(
+            let builder = GenericStringArrayBuilder::<i64>::with_capacity(
                 string_array.len(),
                 total_capacity,
             );
-            repeat_impl::<&GenericStringArray<i64>, GenericStringBuilder<i64>>(
-                &string_arr,
-                number_array,
-                max_item_capacity,
-                builder,
-            )
+            repeat_impl(&string_arr, number_array, max_item_capacity, builder)
         }
         other => exec_err!(
             "Unsupported data type {other:?} for function repeat. \
@@ -278,7 +262,7 @@ fn repeat_impl<'a, S, B>(
 ) -> Result<ArrayRef>
 where
     S: StringArrayType<'a> + 'a,
-    B: StringLikeArrayBuilder,
+    B: BulkNullStringArrayBuilder,
 {
     // Reusable buffer to avoid allocations in string.repeat()
     let mut buffer = Vec::<u8>::with_capacity(max_item_capacity);
@@ -301,12 +285,18 @@ where
         }
     }
 
-    // Fast path: no nulls in either array
-    if string_array.null_count() == 0 && number_array.null_count() == 0 {
+    // Output is null IFF either input is null
+    let nulls = NullBuffer::union(string_array.nulls(), number_array.nulls());
+
+    if let Some(ref n) = nulls {
         for i in 0..string_array.len() {
-            // SAFETY: i is within bounds (0..len) and null_count() == 0 guarantees valid value
+            if n.is_null(i) {
+                builder.append_placeholder();
+                continue;
+            }
+            // SAFETY: index `i` in both arrays is valid
             let string = unsafe { string_array.value_unchecked(i) };
-            let count = number_array.value(i);
+            let count = unsafe { number_array.value_unchecked(i) };
             if count > 0 {
                 repeat_to_buffer(&mut buffer, string, count as usize);
                 // SAFETY: buffer contains valid UTF-8 since we only copy from a valid &str
@@ -316,22 +306,21 @@ where
             }
         }
     } else {
-        // Slow path: handle nulls
-        for (string, number) in string_array.iter().zip(number_array.iter()) {
-            match (string, number) {
-                (Some(string), Some(count)) if count > 0 => {
-                    repeat_to_buffer(&mut buffer, string, count as usize);
-                    // SAFETY: buffer contains valid UTF-8 since we only copy from a valid &str
-                    builder
-                        .append_value(unsafe { std::str::from_utf8_unchecked(&buffer) });
-                }
-                (Some(_), Some(_)) => builder.append_value(""),
-                _ => builder.append_null(),
+        for i in 0..string_array.len() {
+            // SAFETY: no nulls, so every index in both arrays is valid
+            let string = unsafe { string_array.value_unchecked(i) };
+            let count = unsafe { number_array.value_unchecked(i) };
+            if count > 0 {
+                repeat_to_buffer(&mut buffer, string, count as usize);
+                // SAFETY: buffer contains valid UTF-8 since we only copy from a valid &str
+                builder.append_value(unsafe { std::str::from_utf8_unchecked(&buffer) });
+            } else {
+                builder.append_value("");
             }
         }
     }
 
-    Ok(Arc::new(builder.finish()) as ArrayRef)
+    builder.finish(nulls)
 }
 
 #[cfg(test)]

@@ -493,6 +493,38 @@ impl<O: OffsetSizeTrait> GenericStringArrayBuilder<O> {
         self.placeholder_count += 1;
     }
 
+    /// Append a row whose bytes are produced by `f` writing into a caller-sized
+    /// destination slice.
+    ///
+    /// # Safety
+    ///
+    /// The destination slice points at uninitialized memory. The closure must:
+    /// - Write EXACTLY `out_len` bytes.
+    /// - Never read a byte before writing it.
+    /// - Write only bytes that, taken together, form valid UTF-8. The resulting
+    ///   array is finalized via `build_unchecked`, which does not validate
+    ///   UTF-8.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cumulative byte length exceeds `O::MAX`.
+    #[inline]
+    pub unsafe fn append_with<F: FnOnce(&mut [u8])>(&mut self, out_len: usize, f: F) {
+        let cursor = self.value_buffer.len();
+        let new_len = cursor + out_len;
+        self.value_buffer.reserve(out_len);
+        // SAFETY: the prior `reserve` ensures capacity >= new_len.
+        // Initialization of cursor..new_len is the caller's responsibility,
+        // per `append_with`'s safety contract.
+        unsafe {
+            self.value_buffer.set_len(new_len);
+        }
+        f(&mut self.value_buffer.as_slice_mut()[cursor..new_len]);
+        let next_offset =
+            O::from_usize(self.value_buffer.len()).expect("byte array offset overflow");
+        self.offsets_buffer.push(next_offset);
+    }
+
     /// Finalize into a [`GenericStringArray<O>`] using the caller-supplied
     /// null buffer.
     ///
@@ -576,6 +608,18 @@ impl StringViewArrayBuilder {
         self.block_size
     }
 
+    /// Ensure the in-progress block has room for `length` more bytes, flushing
+    /// the current block and starting a new (doubled) one if not.
+    #[inline]
+    fn ensure_long_capacity(&mut self, length: u32) {
+        let required_cap = self.in_progress.len() + length as usize;
+        if self.in_progress.capacity() < required_cap {
+            self.flush_in_progress();
+            let to_reserve = (length as usize).max(self.next_block_size() as usize);
+            self.in_progress.reserve(to_reserve);
+        }
+    }
+
     /// Append `value` as the next row.
     ///
     /// # Panics
@@ -595,12 +639,7 @@ impl StringViewArrayBuilder {
             return;
         }
 
-        let required_cap = self.in_progress.len() + length as usize;
-        if self.in_progress.capacity() < required_cap {
-            self.flush_in_progress();
-            let to_reserve = (length as usize).max(self.next_block_size() as usize);
-            self.in_progress.reserve(to_reserve);
-        }
+        self.ensure_long_capacity(length);
 
         let buffer_index: u32 = i32::try_from(self.completed.len())
             .expect("buffer count exceeds i32::MAX")
@@ -613,7 +652,7 @@ impl StringViewArrayBuilder {
         // which is marked as `[inline(never)]`.
         let view = ByteView {
             length,
-            // SAFETY: length > 12 here, so v has at least 4 bytes.
+            // length > 12, so v has at least 4 bytes — try_into() never fails.
             prefix: u32::from_le_bytes(v[0..4].try_into().unwrap()),
             buffer_index,
             offset,
@@ -628,6 +667,72 @@ impl StringViewArrayBuilder {
         // Zero-length inline view — `length` field is 0, no buffer ref.
         self.views.push(0);
         self.placeholder_count += 1;
+    }
+
+    /// Append a row whose bytes are produced by `f` writing into a caller-sized
+    /// destination slice.
+    ///
+    /// For `out_len <= 12` the destination is a stack-allocated buffer that is
+    /// then inlined into the view; the data block is not touched. Otherwise,
+    /// the destination is a slice of the in-progress data block.
+    ///
+    /// # Safety
+    ///
+    /// The destination slice may point at uninitialized memory. The closure must:    
+    /// - Write EXACTLY `out_len` bytes.
+    /// - Never read a byte before writing it.
+    /// - Write only bytes that, taken together, form valid UTF-8. The resulting
+    ///   array is finalized via `new_unchecked`, which does not validate UTF-8.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same conditions as [`Self::append_value`]: `out_len`,
+    /// the in-progress buffer offset, or the number of completed buffers
+    /// exceeding `i32::MAX`.
+    #[inline]
+    pub unsafe fn append_with<F: FnOnce(&mut [u8])>(&mut self, out_len: usize, f: F) {
+        let length: u32 =
+            i32::try_from(out_len).expect("value length exceeds i32::MAX") as u32;
+        if length <= 12 {
+            // Inline path: a 12-byte stack buffer is cheap to zero-init even
+            // though `f` is contractually required to overwrite the prefix it
+            // uses; the trailing bytes (out_len..12) must remain zero so the
+            // ByteView's inline payload is correct.
+            let mut bytes = [0u8; 12];
+            f(&mut bytes[..out_len]);
+            self.views.push(make_view(&bytes[..out_len], 0, 0));
+            return;
+        }
+
+        self.ensure_long_capacity(length);
+
+        let buffer_index: u32 = i32::try_from(self.completed.len())
+            .expect("buffer count exceeds i32::MAX")
+            as u32;
+        let cursor = self.in_progress.len();
+        let offset: u32 = i32::try_from(cursor).expect("offset exceeds i32::MAX") as u32;
+        let new_len = cursor + out_len;
+        // SAFETY: `ensure_long_capacity` guarantees capacity >= new_len.
+        // Initialization of cursor..new_len is the caller's responsibility,
+        // per `append_with`'s safety contract.
+        unsafe {
+            self.in_progress.set_len(new_len);
+        }
+        f(&mut self.in_progress[cursor..new_len]);
+
+        // Build the ByteView inline rather than going through `make_view`,
+        // which is marked as `[inline(never)]`.
+        let view = ByteView {
+            length,
+            // out_len > 12, so the slice has at least 4 bytes — try_into()
+            // never fails.
+            prefix: u32::from_le_bytes(
+                self.in_progress[cursor..cursor + 4].try_into().unwrap(),
+            ),
+            buffer_index,
+            offset,
+        };
+        self.views.push(view.into());
     }
 
     fn flush_in_progress(&mut self) {
@@ -684,6 +789,7 @@ impl StringViewArrayBuilder {
 pub(crate) trait BulkNullStringArrayBuilder {
     fn append_value(&mut self, value: &str);
     fn append_placeholder(&mut self);
+    unsafe fn append_with<F: FnOnce(&mut [u8])>(&mut self, out_len: usize, f: F);
     fn finish(self, nulls: Option<NullBuffer>) -> Result<ArrayRef>;
 }
 
@@ -695,6 +801,11 @@ impl<O: OffsetSizeTrait> BulkNullStringArrayBuilder for GenericStringArrayBuilde
     #[inline]
     fn append_placeholder(&mut self) {
         GenericStringArrayBuilder::<O>::append_placeholder(self)
+    }
+    #[inline]
+    unsafe fn append_with<F: FnOnce(&mut [u8])>(&mut self, out_len: usize, f: F) {
+        // SAFETY: forwarded contract is identical to the inherent method's.
+        unsafe { GenericStringArrayBuilder::<O>::append_with(self, out_len, f) }
     }
     fn finish(self, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
         Ok(Arc::new(GenericStringArrayBuilder::<O>::finish(
@@ -711,6 +822,11 @@ impl BulkNullStringArrayBuilder for StringViewArrayBuilder {
     #[inline]
     fn append_placeholder(&mut self) {
         StringViewArrayBuilder::append_placeholder(self)
+    }
+    #[inline]
+    unsafe fn append_with<F: FnOnce(&mut [u8])>(&mut self, out_len: usize, f: F) {
+        // SAFETY: forwarded contract is identical to the inherent method's.
+        unsafe { StringViewArrayBuilder::append_with(self, out_len, f) }
     }
     fn finish(self, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
         Ok(Arc::new(StringViewArrayBuilder::finish(self, nulls)?))
@@ -895,6 +1011,43 @@ mod tests {
     }
 
     #[test]
+    fn string_array_builder_append_with() {
+        // append_with should produce the same array as repeated append_value
+        // calls — verify against a simple round-trip and a mixed sequence
+        // containing placeholders.
+        let mut builder = GenericStringArrayBuilder::<i32>::with_capacity(4, 32);
+        // SAFETY: each closure fully overwrites its destination via
+        // copy_from_slice with valid UTF-8 bytes (or is empty).
+        unsafe {
+            builder.append_with(5, |dst| dst.copy_from_slice(b"hello"));
+            builder.append_placeholder();
+            builder.append_with(15, |dst| dst.copy_from_slice(b"hello world 123"));
+            builder.append_with(0, |_dst| {});
+        }
+        let nulls = NullBuffer::from(vec![true, false, true, true]);
+        let array = builder.finish(Some(nulls)).unwrap();
+        assert_eq!(array.len(), 4);
+        assert_eq!(array.value(0), "hello");
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2), "hello world 123");
+        assert_eq!(array.value(3), "");
+    }
+
+    #[test]
+    fn large_string_array_builder_append_with() {
+        let mut builder = GenericStringArrayBuilder::<i64>::with_capacity(2, 32);
+        // SAFETY: each closure fully overwrites its destination via
+        // copy_from_slice with valid UTF-8 bytes.
+        unsafe {
+            builder.append_with(5, |dst| dst.copy_from_slice(b"hello"));
+            builder.append_with(20, |dst| dst.copy_from_slice(b"hello world 123 abcd"));
+        }
+        let array = builder.finish(None).unwrap();
+        assert_eq!(array.value(0), "hello");
+        assert_eq!(array.value(1), "hello world 123 abcd");
+    }
+
+    #[test]
     fn large_string_array_builder_with_nulls() {
         let mut builder = GenericStringArrayBuilder::<i64>::with_capacity(3, 8);
         builder.append_value("a");
@@ -984,6 +1137,127 @@ mod tests {
         let mut builder = StringViewArrayBuilder::with_capacity(1);
         builder.append_placeholder();
         let _ = builder.finish(None);
+    }
+
+    #[test]
+    fn string_view_array_builder_append_with_inline() {
+        // out_len <= 12 routes through the inline path; no data buffers are
+        // produced, regardless of how many rows are appended.
+        let mut builder = StringViewArrayBuilder::with_capacity(4);
+        let inputs = ["hello", "world!", "", "0123456789ab"];
+        for s in &inputs {
+            let bytes = s.as_bytes();
+            // SAFETY: copy_from_slice fully overwrites with valid UTF-8.
+            unsafe {
+                builder.append_with(bytes.len(), |dst| {
+                    dst.copy_from_slice(bytes);
+                });
+            }
+        }
+        let array = builder.finish(None).unwrap();
+        assert_eq!(array.len(), inputs.len());
+        for (i, s) in inputs.iter().enumerate() {
+            assert_eq!(array.value(i), *s);
+        }
+        assert_eq!(array.data_buffers().len(), 0);
+    }
+
+    #[test]
+    fn string_view_array_builder_append_with_long_packs_into_block() {
+        // Long values flow into a single in-progress block until capacity is
+        // exhausted; small total volume should fit in one buffer.
+        let mut builder = StringViewArrayBuilder::with_capacity(3);
+        let inputs = [
+            "hello world 123",     // 15 bytes
+            "datafusion rocks!",   // 17 bytes
+            "another long string", // 19 bytes
+        ];
+        for s in &inputs {
+            let bytes = s.as_bytes();
+            // SAFETY: copy_from_slice fully overwrites with valid UTF-8.
+            unsafe {
+                builder.append_with(bytes.len(), |dst| {
+                    dst.copy_from_slice(bytes);
+                });
+            }
+        }
+        let array = builder.finish(None).unwrap();
+        assert_eq!(array.len(), inputs.len());
+        for (i, s) in inputs.iter().enumerate() {
+            assert_eq!(array.value(i), *s);
+        }
+        assert_eq!(array.data_buffers().len(), 1);
+        assert_eq!(array.data_buffers()[0].len(), 15 + 17 + 19);
+    }
+
+    #[test]
+    fn string_view_array_builder_append_with_rotates_blocks() {
+        // Output volume must exceed the first doubled block (2 * STARTING =
+        // 16 KiB) so that the builder rotates blocks. Each row is 500 bytes
+        // and we write 40 of them = 20 KiB.
+        const STR_LEN: usize = 500;
+        const N: usize = 40;
+        let value = vec![b'x'; STR_LEN];
+        let mut builder = StringViewArrayBuilder::with_capacity(N);
+        for _ in 0..N {
+            // SAFETY: copy_from_slice fully overwrites with valid UTF-8.
+            unsafe {
+                builder.append_with(STR_LEN, |dst| {
+                    dst.copy_from_slice(&value);
+                });
+            }
+        }
+        let array = builder.finish(None).unwrap();
+        assert_eq!(array.len(), N);
+        for i in 0..N {
+            assert_eq!(array.value(i).as_bytes(), value.as_slice());
+        }
+        assert!(
+            array.data_buffers().len() >= 2,
+            "expected the output to span more than one data buffer, got {}",
+            array.data_buffers().len()
+        );
+        let total: usize = array.data_buffers().iter().map(|b| b.len()).sum();
+        assert_eq!(total, N * STR_LEN);
+    }
+
+    #[test]
+    fn string_view_array_builder_append_with_empty_row() {
+        let mut builder = StringViewArrayBuilder::with_capacity(2);
+        // SAFETY: zero-length destination has no bytes to initialize; the
+        // 3-byte closure fully overwrites with valid UTF-8.
+        unsafe {
+            builder.append_with(0, |dst| {
+                assert_eq!(dst.len(), 0);
+            });
+            builder.append_with(3, |dst| dst.copy_from_slice(b"abc"));
+        }
+        let array = builder.finish(None).unwrap();
+        assert_eq!(array.len(), 2);
+        assert_eq!(array.value(0), "");
+        assert_eq!(array.value(1), "abc");
+        assert_eq!(array.data_buffers().len(), 0);
+    }
+
+    #[test]
+    fn string_view_array_builder_append_with_mixed_with_placeholders() {
+        // Mix inline, long, and null rows; null rows are committed via
+        // `append_placeholder` and the null buffer is bulk-supplied at finish.
+        let mut builder = StringViewArrayBuilder::with_capacity(4);
+        // SAFETY: each closure fully overwrites with valid UTF-8 (or is empty).
+        unsafe {
+            builder.append_with(5, |dst| dst.copy_from_slice(b"hello"));
+            builder.append_placeholder();
+            builder.append_with(15, |dst| dst.copy_from_slice(b"hello world 123"));
+            builder.append_with(0, |_dst| {});
+        }
+        let nulls = NullBuffer::from(vec![true, false, true, true]);
+        let array = builder.finish(Some(nulls)).unwrap();
+        assert_eq!(array.len(), 4);
+        assert_eq!(array.value(0), "hello");
+        assert!(array.is_null(1));
+        assert_eq!(array.value(2), "hello world 123");
+        assert_eq!(array.value(3), "");
     }
 
     #[test]

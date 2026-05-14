@@ -32,20 +32,26 @@ const NUM_ROWS: usize = 8192;
 const LIST_SIZE: usize = 10;
 const SEED: u64 = 42;
 
-/// Build a ListArray of Int64 with `num_rows` rows, each containing
-/// `list_size` elements. If `null_density > 0`, that fraction of
-/// rows will be null at the list level.
+/// Build a ListArray of Int64 with one row per entry in `list_sizes`.
+/// If `null_density > 0`, that fraction of rows will be null at the
+/// list level.
 fn make_list_array(
     rng: &mut StdRng,
-    num_rows: usize,
-    list_size: usize,
+    list_sizes: &[usize],
     null_density: f64,
 ) -> ArrayRef {
-    let total = num_rows * list_size;
+    let num_rows = list_sizes.len();
+    let total: usize = list_sizes.iter().sum();
     let values: Vec<i64> = (0..total).map(|_| rng.random_range(0..1000i64)).collect();
     let values_array = Arc::new(Int64Array::from(values)) as ArrayRef;
 
-    let offsets: Vec<i32> = (0..=num_rows).map(|i| (i * list_size) as i32).collect();
+    let mut offsets: Vec<i32> = Vec::with_capacity(num_rows + 1);
+    offsets.push(0);
+    let mut acc: i32 = 0;
+    for &size in list_sizes {
+        acc += size as i32;
+        offsets.push(acc);
+    }
 
     let nulls = if null_density > 0.0 {
         let valid: Vec<bool> = (0..num_rows)
@@ -67,30 +73,55 @@ fn make_list_array(
     )
 }
 
-fn bench_arrays_zip(c: &mut Criterion, name: &str, null_density: f64) {
+/// Three columns of `NUM_ROWS` rows where every row in every column
+/// has exactly `LIST_SIZE` elements (the padding path is never taken).
+fn uniform_arrays(null_density: f64) -> [ArrayRef; 3] {
     let mut rng = StdRng::seed_from_u64(SEED);
-    let arr1 = make_list_array(&mut rng, NUM_ROWS, LIST_SIZE, null_density);
-    let arr2 = make_list_array(&mut rng, NUM_ROWS, LIST_SIZE, null_density);
-    let arr3 = make_list_array(&mut rng, NUM_ROWS, LIST_SIZE, null_density);
+    let sizes = vec![LIST_SIZE; NUM_ROWS];
+    [
+        make_list_array(&mut rng, &sizes, null_density),
+        make_list_array(&mut rng, &sizes, null_density),
+        make_list_array(&mut rng, &sizes, null_density),
+    ]
+}
 
+/// Three columns where each row's list length is drawn independently
+/// from 5..=15 per column. Mean length stays at LIST_SIZE = 10, but
+/// columns disagree on most rows so `extend_nulls` padding runs
+/// frequently and per-row `max_len` varies.
+fn varying_arrays(null_density: f64) -> [ArrayRef; 3] {
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let sizes: Vec<Vec<usize>> = (0..3)
+        .map(|_| (0..NUM_ROWS).map(|_| rng.random_range(5..=15)).collect())
+        .collect();
+    [
+        make_list_array(&mut rng, &sizes[0], null_density),
+        make_list_array(&mut rng, &sizes[1], null_density),
+        make_list_array(&mut rng, &sizes[2], null_density),
+    ]
+}
+
+fn bench_arrays_zip(c: &mut Criterion, name: &str, arrays: &[ArrayRef; 3]) {
     let udf = ArraysZip::new();
     let args_vec = vec![
-        ColumnarValue::Array(Arc::clone(&arr1)),
-        ColumnarValue::Array(Arc::clone(&arr2)),
-        ColumnarValue::Array(Arc::clone(&arr3)),
+        ColumnarValue::Array(Arc::clone(&arrays[0])),
+        ColumnarValue::Array(Arc::clone(&arrays[1])),
+        ColumnarValue::Array(Arc::clone(&arrays[2])),
     ];
     let return_type = udf
         .return_type(&[
-            arr1.data_type().clone(),
-            arr2.data_type().clone(),
-            arr3.data_type().clone(),
+            arrays[0].data_type().clone(),
+            arrays[1].data_type().clone(),
+            arrays[2].data_type().clone(),
         ])
         .unwrap();
     let return_field = Arc::new(Field::new("f", return_type, true));
-    let arg_fields: Vec<_> = (0..3)
-        .map(|_| Arc::new(Field::new("a", arr1.data_type().clone(), true)))
+    let arg_fields: Vec<_> = arrays
+        .iter()
+        .map(|a| Arc::new(Field::new("a", a.data_type().clone(), true)))
         .collect();
     let config_options = Arc::new(ConfigOptions::default());
+    let num_rows = arrays[0].len();
 
     c.bench_function(name, |b| {
         b.iter(|| {
@@ -98,7 +129,7 @@ fn bench_arrays_zip(c: &mut Criterion, name: &str, null_density: f64) {
                 udf.invoke_with_args(ScalarFunctionArgs {
                     args: args_vec.clone(),
                     arg_fields: arg_fields.clone(),
-                    number_rows: NUM_ROWS,
+                    number_rows: num_rows,
                     return_field: Arc::clone(&return_field),
                     config_options: Arc::clone(&config_options),
                 })
@@ -109,8 +140,14 @@ fn bench_arrays_zip(c: &mut Criterion, name: &str, null_density: f64) {
 }
 
 fn criterion_benchmark(c: &mut Criterion) {
-    bench_arrays_zip(c, "arrays_zip_no_nulls_8192", 0.0);
-    bench_arrays_zip(c, "arrays_zip_10pct_nulls_8192", 0.1);
+    bench_arrays_zip(c, "arrays_zip_no_nulls_8192", &uniform_arrays(0.0));
+    bench_arrays_zip(c, "arrays_zip_10pct_nulls_8192", &uniform_arrays(0.1));
+    bench_arrays_zip(c, "arrays_zip_varying_no_nulls_8192", &varying_arrays(0.0));
+    bench_arrays_zip(
+        c,
+        "arrays_zip_varying_10pct_nulls_8192",
+        &varying_arrays(0.1),
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

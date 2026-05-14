@@ -22,7 +22,7 @@ use arrow::array::{
     Array, ArrayRef, Capacities, ListArray, MutableArrayData, NullBufferBuilder,
     StructArray, new_null_array,
 };
-use arrow::buffer::OffsetBuffer;
+use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::DataType::{FixedSizeList, LargeList, List, Null};
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion_common::cast::{
@@ -44,7 +44,7 @@ struct ListColumnView {
     /// Pre-computed per-row start offsets (length = num_rows + 1).
     offsets: Vec<usize>,
     /// Null bitmap from the input array (None means no nulls).
-    nulls: Option<arrow::buffer::NullBuffer>,
+    nulls: Option<NullBuffer>,
 }
 
 impl ListColumnView {
@@ -326,4 +326,210 @@ fn arrays_zip_inner(args: &[ArrayRef]) -> Result<ArrayRef> {
     )?;
 
     Ok(Arc::new(result))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arrays_zip_inner;
+    use arrow::array::{
+        Array, ArrayRef, AsArray, FixedSizeListArray, Int64Array, ListArray, StructArray,
+    };
+    use arrow::datatypes::{DataType, Field, Int64Type};
+    use std::sync::Arc;
+
+    /// Helper: from a `ListArray<Struct<...>>` output row, return the per-field
+    /// vec of `Option<i64>` for the named struct field index.
+    fn row_struct_field(
+        list: &ListArray,
+        row: usize,
+        field_idx: usize,
+    ) -> Vec<Option<i64>> {
+        let row_array = list.value(row);
+        let row_struct = row_array.as_any().downcast_ref::<StructArray>().unwrap();
+        let col = row_struct
+            .column(field_idx)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        (0..col.len())
+            .map(|i| {
+                if col.is_null(i) {
+                    None
+                } else {
+                    Some(col.value(i))
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sliced_list_input_uniform() {
+        // Full data, then slice off the first and last rows.
+        let a_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1), Some(2), Some(3)]),
+            Some(vec![Some(10), Some(20), Some(30)]),
+            Some(vec![Some(100), Some(200), Some(300)]),
+            Some(vec![Some(1000), Some(2000), Some(3000)]),
+        ]);
+        let b_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(4), Some(5), Some(6)]),
+            Some(vec![Some(40), Some(50), Some(60)]),
+            Some(vec![Some(400), Some(500), Some(600)]),
+            Some(vec![Some(4000), Some(5000), Some(6000)]),
+        ]);
+        let a: ArrayRef = Arc::new(a_full.slice(1, 2));
+        let b: ArrayRef = Arc::new(b_full.slice(1, 2));
+
+        let out = arrays_zip_inner(&[a, b]).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.null_count(), 0);
+
+        assert_eq!(
+            row_struct_field(list, 0, 0),
+            vec![Some(10), Some(20), Some(30)]
+        );
+        assert_eq!(
+            row_struct_field(list, 0, 1),
+            vec![Some(40), Some(50), Some(60)]
+        );
+        assert_eq!(
+            row_struct_field(list, 1, 0),
+            vec![Some(100), Some(200), Some(300)]
+        );
+        assert_eq!(
+            row_struct_field(list, 1, 1),
+            vec![Some(400), Some(500), Some(600)]
+        );
+    }
+
+    #[test]
+    fn test_sliced_list_input_with_padding() {
+        // Mismatched lengths within the slice window so extend_nulls fires.
+        let a_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![Some(10), Some(20)]), // visible row 0
+            Some(vec![Some(100)]),          // visible row 1
+            Some(vec![Some(1000), Some(2000)]),
+        ]);
+        let b_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(2)]),
+            Some(vec![Some(40)]), // visible row 0: shorter than a
+            Some(vec![Some(400), Some(500), Some(600)]), // visible row 1: longer than a
+            Some(vec![Some(4000)]),
+        ]);
+        let a: ArrayRef = Arc::new(a_full.slice(1, 2));
+        let b: ArrayRef = Arc::new(b_full.slice(1, 2));
+
+        let out = arrays_zip_inner(&[a, b]).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(list.len(), 2);
+
+        // row 0: a=[10,20], b=[40] → max_len=2, expect [(10,40),(20,NULL)]
+        assert_eq!(row_struct_field(list, 0, 0), vec![Some(10), Some(20)]);
+        assert_eq!(row_struct_field(list, 0, 1), vec![Some(40), None]);
+
+        // row 1: a=[100], b=[400,500,600] → max_len=3, expect [(100,400),(NULL,500),(NULL,600)]
+        assert_eq!(row_struct_field(list, 1, 0), vec![Some(100), None, None]);
+        assert_eq!(
+            row_struct_field(list, 1, 1),
+            vec![Some(400), Some(500), Some(600)]
+        );
+    }
+
+    #[test]
+    fn test_sliced_list_with_list_level_nulls() {
+        // Slice contains both list-level null rows and a non-null row.
+        let a_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1)]),          // hidden
+            None,                         // visible row 0: a null, b non-null
+            Some(vec![Some(5), Some(6)]), // visible row 1: a non-null, b null
+            Some(vec![Some(9)]),          // hidden
+        ]);
+        let b_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(2)]),
+            Some(vec![Some(30), Some(40)]),
+            None,
+            Some(vec![Some(99)]),
+        ]);
+        let a: ArrayRef = Arc::new(a_full.slice(1, 2));
+        let b: ArrayRef = Arc::new(b_full.slice(1, 2));
+
+        let out = arrays_zip_inner(&[a, b]).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list.null_count(), 0);
+
+        // row 0: a NULL, b=[30,40] → max_len=2, a side all NULL
+        assert_eq!(row_struct_field(list, 0, 0), vec![None, None]);
+        assert_eq!(row_struct_field(list, 0, 1), vec![Some(30), Some(40)]);
+
+        // row 1: a=[5,6], b NULL → max_len=2, b side all NULL
+        assert_eq!(row_struct_field(list, 1, 0), vec![Some(5), Some(6)]);
+        assert_eq!(row_struct_field(list, 1, 1), vec![None, None]);
+    }
+
+    #[test]
+    fn test_sliced_list_with_all_null_row() {
+        // Slice contains one all-null row sandwiched between non-null rows.
+        let a_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(1)]),
+            Some(vec![Some(10)]),  // visible row 0
+            None,                  // visible row 1: ALL NULL
+            Some(vec![Some(100)]), // visible row 2
+            Some(vec![Some(1000)]),
+        ]);
+        let b_full = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(2)]),
+            Some(vec![Some(20)]),
+            None,
+            Some(vec![Some(200)]),
+            Some(vec![Some(2000)]),
+        ]);
+        let a: ArrayRef = Arc::new(a_full.slice(1, 3));
+        let b: ArrayRef = Arc::new(b_full.slice(1, 3));
+
+        let out = arrays_zip_inner(&[a, b]).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(list.len(), 3);
+        // The middle row's outer list is NULL.
+        assert!(!list.is_null(0));
+        assert!(list.is_null(1));
+        assert!(!list.is_null(2));
+
+        assert_eq!(row_struct_field(list, 0, 0), vec![Some(10)]);
+        assert_eq!(row_struct_field(list, 0, 1), vec![Some(20)]);
+        assert_eq!(row_struct_field(list, 2, 0), vec![Some(100)]);
+        assert_eq!(row_struct_field(list, 2, 1), vec![Some(200)]);
+    }
+
+    #[test]
+    fn test_sliced_fixed_size_list_input() {
+        // FixedSizeList: each row has exactly `size` elements; slice cuts rows.
+        let a_full_values = Int64Array::from(vec![1, 2, 10, 20, 100, 200, 1000, 2000]);
+        let a_full = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            2,
+            Arc::new(a_full_values),
+            None,
+        );
+        let b_full_values = Int64Array::from(vec![3, 4, 30, 40, 300, 400, 3000, 4000]);
+        let b_full = FixedSizeListArray::new(
+            Arc::new(Field::new("item", DataType::Int64, true)),
+            2,
+            Arc::new(b_full_values),
+            None,
+        );
+        let a: ArrayRef = Arc::new(a_full.slice(1, 2));
+        let b: ArrayRef = Arc::new(b_full.slice(1, 2));
+
+        let out = arrays_zip_inner(&[a, b]).unwrap();
+        let list = out.as_list::<i32>();
+        assert_eq!(list.len(), 2);
+
+        assert_eq!(row_struct_field(list, 0, 0), vec![Some(10), Some(20)]);
+        assert_eq!(row_struct_field(list, 0, 1), vec![Some(30), Some(40)]);
+        assert_eq!(row_struct_field(list, 1, 0), vec![Some(100), Some(200)]);
+        assert_eq!(row_struct_field(list, 1, 1), vec![Some(300), Some(400)]);
+    }
 }

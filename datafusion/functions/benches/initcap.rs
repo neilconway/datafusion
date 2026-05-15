@@ -66,6 +66,34 @@ fn create_unicode_utf8view_args(size: usize) -> Vec<ColumnarValue> {
     vec![ColumnarValue::Array(array)]
 }
 
+const MIXED_ASCII: &str = "hello WORLD with SOME ASCII words AND numbers 1234567890";
+const MIXED_UNICODE: &str = "ñAnDÚ ÁrBOL ОлЕГ ÍslENsku";
+
+fn mixed_value(i: usize) -> &'static str {
+    if i % 2 == 0 {
+        MIXED_ASCII
+    } else {
+        MIXED_UNICODE
+    }
+}
+
+/// Create a Utf8 array with both ASCII-only and non-ASCII rows.
+fn create_mixed_utf8_args(size: usize) -> Vec<ColumnarValue> {
+    let array =
+        Arc::new(StringArray::from_iter_values((0..size).map(mixed_value))) as ArrayRef;
+    vec![ColumnarValue::Array(array)]
+}
+
+/// Create a Utf8View array with both ASCII-only and non-ASCII rows.
+fn create_mixed_utf8view_args(size: usize) -> Vec<ColumnarValue> {
+    let mut builder = StringViewBuilder::with_capacity(size);
+    for i in 0..size {
+        builder.append_value(mixed_value(i));
+    }
+    let array = Arc::new(builder.finish()) as ArrayRef;
+    vec![ColumnarValue::Array(array)]
+}
+
 fn criterion_benchmark(c: &mut Criterion) {
     let initcap = unicode::initcap();
     let config_options = Arc::new(ConfigOptions::default());
@@ -114,6 +142,48 @@ fn criterion_benchmark(c: &mut Criterion) {
 
             group.finish();
         }
+    }
+
+    // Mixed array benchmarks: include ASCII-only rows in an otherwise
+    // non-ASCII array, exercising the row-level ASCII path.
+    for size in [8192] {
+        let mut group = c.benchmark_group(format!("initcap mixed size={size}"));
+        group.sampling_mode(SamplingMode::Flat);
+        group.sample_size(10);
+        group.measurement_time(Duration::from_secs(10));
+
+        let mixed_args = create_mixed_utf8_args(size);
+        let mixed_arg_fields = vec![Field::new("arg_0", DataType::Utf8, true).into()];
+
+        group.bench_function("array_utf8", |b| {
+            b.iter(|| {
+                black_box(initcap.invoke_with_args(ScalarFunctionArgs {
+                    args: mixed_args.clone(),
+                    arg_fields: mixed_arg_fields.clone(),
+                    number_rows: size,
+                    return_field: Field::new("f", DataType::Utf8, true).into(),
+                    config_options: Arc::clone(&config_options),
+                }))
+            })
+        });
+
+        let mixed_view_args = create_mixed_utf8view_args(size);
+        let mixed_view_arg_fields =
+            vec![Field::new("arg_0", DataType::Utf8View, true).into()];
+
+        group.bench_function("array_utf8view", |b| {
+            b.iter(|| {
+                black_box(initcap.invoke_with_args(ScalarFunctionArgs {
+                    args: mixed_view_args.clone(),
+                    arg_fields: mixed_view_arg_fields.clone(),
+                    number_rows: size,
+                    return_field: Field::new("f", DataType::Utf8View, true).into(),
+                    config_options: Arc::clone(&config_options),
+                }))
+            })
+        });
+
+        group.finish();
     }
 
     // Unicode array benchmarks

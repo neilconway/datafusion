@@ -21,7 +21,7 @@ use arrow::array::{Array, ArrayRef, GenericStringArray, OffsetSizeTrait};
 use arrow::buffer::{Buffer, OffsetBuffer};
 use arrow::datatypes::DataType;
 
-use crate::strings::{GenericStringArrayBuilder, StringViewArrayBuilder};
+use crate::strings::{GenericStringArrayBuilder, StringViewArrayBuilder, StringWriter};
 use crate::utils::{make_scalar_function, utf8_to_str_type};
 use datafusion_common::cast::{as_generic_string_array, as_string_view_array};
 use datafusion_common::types::logical_string;
@@ -161,7 +161,6 @@ fn initcap<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
         string_array.value_data().len(),
     );
 
-    let mut container = String::new();
     let nulls = string_array.nulls().cloned();
     if let Some(ref n) = nulls {
         for i in 0..len {
@@ -170,16 +169,14 @@ fn initcap<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
             } else {
                 // SAFETY: not null per check above.
                 let s = unsafe { string_array.value_unchecked(i) };
-                initcap_string(s, &mut container);
-                builder.append_value(&container);
+                append_initcap(&mut builder, s);
             }
         }
     } else {
         for i in 0..len {
             // SAFETY: no null buffer means every index is valid.
             let s = unsafe { string_array.value_unchecked(i) };
-            initcap_string(s, &mut container);
-            builder.append_value(&container);
+            append_initcap(&mut builder, s);
         }
     }
 
@@ -272,6 +269,60 @@ fn initcap_utf8view(args: &[ArrayRef]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish(nulls)?) as ArrayRef)
 }
 
+#[inline]
+fn append_initcap<T: OffsetSizeTrait>(
+    builder: &mut GenericStringArrayBuilder<T>,
+    input: &str,
+) {
+    if input.is_ascii() {
+        let mut prev_is_alphanumeric = false;
+        // SAFETY: input is ASCII, and ASCII case conversion preserves valid
+        // UTF-8 while keeping output length equal to input length.
+        unsafe {
+            builder.append_byte_map(input.as_bytes(), |b| {
+                let converted = if prev_is_alphanumeric {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                };
+                prev_is_alphanumeric = b.is_ascii_alphanumeric();
+                converted
+            });
+        }
+    } else {
+        builder.append_with(|w| write_initcap(input, w));
+    }
+}
+
+#[inline]
+fn write_initcap<W: StringWriter>(input: &str, writer: &mut W) {
+    let mut prev_is_alphanumeric = false;
+
+    for c in input.chars() {
+        if c.is_ascii() {
+            let b = c as u8;
+            let converted = if prev_is_alphanumeric {
+                b.to_ascii_lowercase()
+            } else {
+                b.to_ascii_uppercase()
+            };
+            writer.write_char(converted as char);
+            prev_is_alphanumeric = b.is_ascii_alphanumeric();
+        } else {
+            if prev_is_alphanumeric {
+                for c in c.to_lowercase() {
+                    writer.write_char(c);
+                }
+            } else {
+                for c in c.to_uppercase() {
+                    writer.write_char(c);
+                }
+            }
+            prev_is_alphanumeric = c.is_alphanumeric();
+        }
+    }
+}
+
 fn initcap_string(input: &str, container: &mut String) {
     container.clear();
     let mut prev_is_alphanumeric = false;
@@ -290,12 +341,23 @@ fn initcap_string(input: &str, container: &mut String) {
         }
     } else {
         for c in input.chars() {
-            if prev_is_alphanumeric {
-                container.extend(c.to_lowercase());
+            if c.is_ascii() {
+                let b = c as u8;
+                let converted = if prev_is_alphanumeric {
+                    b.to_ascii_lowercase()
+                } else {
+                    b.to_ascii_uppercase()
+                };
+                container.push(converted as char);
+                prev_is_alphanumeric = b.is_ascii_alphanumeric();
             } else {
-                container.extend(c.to_uppercase());
+                if prev_is_alphanumeric {
+                    container.extend(c.to_lowercase());
+                } else {
+                    container.extend(c.to_uppercase());
+                }
+                prev_is_alphanumeric = c.is_alphanumeric();
             }
-            prev_is_alphanumeric = c.is_alphanumeric();
         }
     }
 }
@@ -462,6 +524,50 @@ mod tests {
         assert_eq!(result.value(4), "123 Abc 456def");
         assert_eq!(result.value(5), "All Caps");
         assert_eq!(result.value(6), "Already Correct");
+        Ok(())
+    }
+
+    #[test]
+    fn test_initcap_mixed_unicode_array() -> Result<()> {
+        let array = StringArray::from(vec![
+            Some("hello WORLD"),
+            None,
+            Some("đẸp đẼ êM"),
+            Some("foo-bar_baz/baX"),
+            Some("ОлЕГ ИвАНОВИч"),
+        ]);
+        let args: Vec<ArrayRef> = vec![Arc::new(array)];
+        let result = super::initcap::<i32>(&args)?;
+        let result = result.as_any().downcast_ref::<StringArray>().unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result.value(0), "Hello World");
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), "Đẹp Đẽ Êm");
+        assert_eq!(result.value(3), "Foo-Bar_Baz/Bax");
+        assert_eq!(result.value(4), "Олег Иванович");
+        Ok(())
+    }
+
+    #[test]
+    fn test_initcap_utf8view_array() -> Result<()> {
+        let array = StringViewArray::from(vec![
+            Some("hello WORLD"),
+            None,
+            Some("đẸp đẼ êM"),
+            Some("hi THOMAS wIth M0re ThAN 12 ChaRs"),
+            Some(""),
+        ]);
+        let args: Vec<ArrayRef> = vec![Arc::new(array)];
+        let result = super::initcap_utf8view(&args)?;
+        let result = result.as_any().downcast_ref::<StringViewArray>().unwrap();
+
+        assert_eq!(result.len(), 5);
+        assert_eq!(result.value(0), "Hello World");
+        assert!(result.is_null(1));
+        assert_eq!(result.value(2), "Đẹp Đẽ Êm");
+        assert_eq!(result.value(3), "Hi Thomas With M0re Than 12 Chars");
+        assert_eq!(result.value(4), "");
         Ok(())
     }
 

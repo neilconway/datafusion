@@ -102,26 +102,16 @@ macro_rules! preimage_bounds {
         })
     };
 
-    // Decimal types: call decimal_preimage_bounds with the literal and input
-    // precision/scale, then wrap results in ScalarValue with the input type.
-    (decimal: $variant:ident, $decimal_type:ty, $value:expr, $literal_precision:expr, $literal_scale:expr, $arg_data_type:expr) => {
-        if let DataType::$variant(arg_precision, arg_scale) = $arg_data_type {
-            decimal_preimage_bounds::<$decimal_type>(
-                $value,
-                $literal_precision,
-                $literal_scale,
-                *arg_precision,
-                *arg_scale,
-            )
-            .map(|(lo, hi)| {
+    // Decimal types: call decimal_preimage_bounds with precision/scale and wrap in ScalarValue
+    (decimal: $variant:ident, $decimal_type:ty, $value:expr, $precision:expr, $scale:expr) => {
+        decimal_preimage_bounds::<$decimal_type>($value, $precision, $scale).map(
+            |(lo, hi)| {
                 (
-                    ScalarValue::$variant(Some(lo), *arg_precision, *arg_scale),
-                    ScalarValue::$variant(Some(hi), *arg_precision, *arg_scale),
+                    ScalarValue::$variant(Some(lo), $precision, $scale),
+                    ScalarValue::$variant(Some(hi), $precision, $scale),
                 )
-            })
-        } else {
-            None
-        }
+            },
+        )
     };
 }
 
@@ -271,9 +261,11 @@ impl ScalarUDFImpl for FloorFunc {
         let Expr::Literal(lit_value, _) = lit_expr else {
             return Ok(PreimageResult::None);
         };
-        let arg_data_type = info
-            .get_data_type(&arg)
-            .unwrap_or_else(|_| lit_value.data_type());
+        let arg_data_type = info.get_data_type(&arg).ok();
+        let lit_data_type = lit_value.data_type();
+        let decimal_arg_matches = arg_data_type
+            .as_ref()
+            .is_none_or(|arg_data_type| arg_data_type == &lit_data_type);
 
         // Compute lower bound (N) and upper bound (N + 1) using helper functions
         let Some((lower, upper)) = (match lit_value {
@@ -294,44 +286,32 @@ impl ScalarUDFImpl for FloorFunc {
             // DECIMAL(precision, scale) where precision > 38 -> Decimal256(precision, scale)
             // Decimal32 and Decimal64 are unreachable from SQL/SLT.
             ScalarValue::Decimal32(Some(n), precision, scale) => {
-                preimage_bounds!(
-                    decimal: Decimal32,
-                    Decimal32Type,
-                    *n,
-                    *precision,
-                    *scale,
-                    &arg_data_type
-                )
+                if decimal_arg_matches {
+                    preimage_bounds!(decimal: Decimal32, Decimal32Type, *n, *precision, *scale)
+                } else {
+                    None
+                }
             }
             ScalarValue::Decimal64(Some(n), precision, scale) => {
-                preimage_bounds!(
-                    decimal: Decimal64,
-                    Decimal64Type,
-                    *n,
-                    *precision,
-                    *scale,
-                    &arg_data_type
-                )
+                if decimal_arg_matches {
+                    preimage_bounds!(decimal: Decimal64, Decimal64Type, *n, *precision, *scale)
+                } else {
+                    None
+                }
             }
             ScalarValue::Decimal128(Some(n), precision, scale) => {
-                preimage_bounds!(
-                    decimal: Decimal128,
-                    Decimal128Type,
-                    *n,
-                    *precision,
-                    *scale,
-                    &arg_data_type
-                )
+                if decimal_arg_matches {
+                    preimage_bounds!(decimal: Decimal128, Decimal128Type, *n, *precision, *scale)
+                } else {
+                    None
+                }
             }
             ScalarValue::Decimal256(Some(n), precision, scale) => {
-                preimage_bounds!(
-                    decimal: Decimal256,
-                    Decimal256Type,
-                    *n,
-                    *precision,
-                    *scale,
-                    &arg_data_type
-                )
+                if decimal_arg_matches {
+                    preimage_bounds!(decimal: Decimal256, Decimal256Type, *n, *precision, *scale)
+                } else {
+                    None
+                }
             }
 
             // Unsupported types
@@ -391,54 +371,41 @@ fn int_preimage_bounds<I: CheckedAdd + One + Copy>(n: I) -> Option<(I, I)> {
 /// - Adding 1 would overflow
 fn decimal_preimage_bounds<D: DecimalType>(
     value: D::Native,
-    literal_precision: u8,
-    literal_scale: i8,
-    arg_precision: u8,
-    arg_scale: i8,
+    precision: u8,
+    scale: i8,
 ) -> Option<(D::Native, D::Native)>
 where
     D::Native: DecimalCast + ArrowNativeTypeOp + std::ops::Rem<Output = D::Native>,
 {
     // Avoid producing inexact bounds across negative decimal scales.
-    if literal_scale < 0 || arg_scale < 0 {
+    if scale < 0 {
         return None;
     }
 
     // Use rescale_decimal to compute "1" at target scale (avoids manual pow)
     // Convert integer 1 (scale=0) to the target scale
-    let one_literal_scaled: D::Native = rescale_decimal::<D, D>(
-        D::Native::ONE,    // value = 1
-        1,                 // input_precision = 1
-        0,                 // input_scale = 0 (integer)
-        literal_precision, // output_precision
-        literal_scale,     // output_scale
+    let one_scaled: D::Native = rescale_decimal::<D, D>(
+        D::Native::ONE, // value = 1
+        1,              // input_precision = 1
+        0,              // input_scale = 0 (integer)
+        precision,      // output_precision
+        scale,          // output_scale
     )?;
 
     // floor always returns an integer, so if value has a fractional part, there's no solution
     // Check: value % one_scaled != 0 means fractional part exists
-    if literal_scale > 0 && value % one_literal_scaled != D::Native::ZERO {
+    if scale > 0 && value % one_scaled != D::Native::ZERO {
         return None;
     }
-
-    let lower = rescale_decimal::<D, D>(
-        value,
-        literal_precision,
-        literal_scale,
-        arg_precision,
-        arg_scale,
-    )?;
-
-    let one_arg_scaled: D::Native =
-        rescale_decimal::<D, D>(D::Native::ONE, 1, 0, arg_precision, arg_scale)?;
 
     // Compute upper bound using checked addition
     // Before preimage stage, the internal i128/i256(value) is validated based on the precision and scale.
     // MAX_DECIMAL128_FOR_EACH_PRECISION and MAX_DECIMAL256_FOR_EACH_PRECISION are used to validate the internal i128/i256.
     // Any invalid i128/i256 will not reach here.
     // Therefore, the add_checked will always succeed if tested via SQL/SLT path.
-    let upper = lower.add_checked(one_arg_scaled).ok()?;
+    let upper = value.add_checked(one_scaled).ok()?;
 
-    Some((lower, upper))
+    Some((value, upper))
 }
 
 #[cfg(test)]

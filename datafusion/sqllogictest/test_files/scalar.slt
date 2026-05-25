@@ -1215,6 +1215,50 @@ select trunc(12345.678, -3);
 ----
 12000
 
+# trunc decimal should not cast through float
+query TR
+select arrow_typeof(trunc(CAST(9007199254740993 AS DECIMAL(20,0)))),
+       trunc(CAST(9007199254740993 AS DECIMAL(20,0)));
+----
+Decimal128(20, 0) 9007199254740993
+
+# trunc decimal with positive and zero precision
+query TRRR
+select arrow_typeof(trunc('12345.67'::decimal(10,2), 1)),
+       trunc('12345.67'::decimal(10,2), 1),
+       trunc('-12345.67'::decimal(10,2), 1),
+       trunc('12345.67'::decimal(10,2), 0);
+----
+Decimal128(10, 1) 12345.6 -12345.6 12345
+
+# trunc decimal with negative precision truncates toward zero
+query TRR
+select arrow_typeof(trunc('12345.67'::decimal(10,2), -3)),
+       trunc('12345.67'::decimal(10,2), -3),
+       trunc('-12345.67'::decimal(10,2), -3);
+----
+Decimal128(10, 0) 12000 -12000
+
+# trunc decimal256 keeps decimal output
+query TR
+select arrow_typeof(trunc('1234.5678'::decimal(50,4), 2)),
+       trunc('1234.5678'::decimal(50,4), 2);
+----
+Decimal256(50, 2) 1234.56
+
+# trunc decimal with non-literal precision keeps input scale
+query TR
+select arrow_typeof(trunc(val, dp)), trunc(val, dp)
+from (values (cast('123.45' as decimal(5,2)), 1)) as t(val, dp);
+----
+Decimal128(5, 2) 123.4
+
+# trunc decimal with NULL precision returns NULL
+query R
+select trunc('123.45'::decimal(5,2), null);
+----
+NULL
+
 # trunc with columns and precision
 query RRR rowsort
 select

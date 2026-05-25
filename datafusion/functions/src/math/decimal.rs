@@ -23,7 +23,7 @@ use arrow::error::ArrowError;
 use arrow_buffer::ArrowNativeType;
 use datafusion_common::{DataFusionError, Result};
 
-pub(super) fn apply_decimal_op<T, F>(
+pub(super) fn apply_decimal_to_integral_op<T, F>(
     array: &ArrayRef,
     precision: u8,
     scale: i8,
@@ -33,7 +33,7 @@ pub(super) fn apply_decimal_op<T, F>(
 where
     T: DecimalType,
     T::Native: ArrowNativeType + ArrowNativeTypeOp,
-    F: Fn(T::Native, T::Native) -> T::Native,
+    F: Fn(T::Native, T::Native, &str) -> std::result::Result<T::Native, ArrowError>,
 {
     if scale <= 0 {
         return Ok(Arc::clone(array));
@@ -41,13 +41,18 @@ where
 
     let factor = decimal_scale_factor::<T>(scale, fn_name)?;
     let decimal = array.as_primitive::<T>();
-    let data_type = array.data_type().clone();
+    let output_scale = 0;
+    let data_type = T::TYPE_CONSTRUCTOR(precision, output_scale);
 
     let result: PrimitiveArray<T> = decimal.try_unary(|value| {
-        let new_value = op(value, factor);
-        T::validate_decimal_precision(new_value, precision, scale).map_err(|_| {
-            ArrowError::ComputeError(format!("Decimal overflow while applying {fn_name}"))
-        })?;
+        let new_value = op(value, factor, fn_name)?;
+        T::validate_decimal_precision(new_value, precision, output_scale).map_err(
+            |_| {
+                ArrowError::ComputeError(format!(
+                    "Decimal overflow while applying {fn_name}"
+                ))
+            },
+        )?;
         Ok::<_, ArrowError>(new_value)
     })?;
 
@@ -74,38 +79,50 @@ where
     })
 }
 
-pub(super) fn ceil_decimal_value<T>(value: T, factor: T) -> T
+pub(super) fn ceil_decimal_value<T>(
+    value: T,
+    factor: T,
+    fn_name: &str,
+) -> std::result::Result<T, ArrowError>
 where
-    T: ArrowNativeTypeOp + std::ops::Rem<Output = T>,
+    T: ArrowNativeTypeOp,
 {
-    let remainder = value % factor;
+    let quotient = value.div_wrapping(factor);
+    let remainder = value.mod_wrapping(factor);
 
     if remainder == T::ZERO {
-        return value;
+        return Ok(quotient);
     }
 
     if value >= T::ZERO {
-        let increment = factor.sub_wrapping(remainder);
-        value.add_wrapping(increment)
+        quotient.add_checked(T::ONE).map_err(|_| {
+            ArrowError::ComputeError(format!("Decimal overflow while applying {fn_name}"))
+        })
     } else {
-        value.sub_wrapping(remainder)
+        Ok(quotient)
     }
 }
 
-pub(super) fn floor_decimal_value<T>(value: T, factor: T) -> T
+pub(super) fn floor_decimal_value<T>(
+    value: T,
+    factor: T,
+    fn_name: &str,
+) -> std::result::Result<T, ArrowError>
 where
-    T: ArrowNativeTypeOp + std::ops::Rem<Output = T>,
+    T: ArrowNativeTypeOp,
 {
-    let remainder = value % factor;
+    let quotient = value.div_wrapping(factor);
+    let remainder = value.mod_wrapping(factor);
 
     if remainder == T::ZERO {
-        return value;
+        return Ok(quotient);
     }
 
     if value >= T::ZERO {
-        value.sub_wrapping(remainder)
+        Ok(quotient)
     } else {
-        let adjustment = factor.add_wrapping(remainder);
-        value.sub_wrapping(adjustment)
+        quotient.sub_checked(T::ONE).map_err(|_| {
+            ArrowError::ComputeError(format!("Decimal overflow while applying {fn_name}"))
+        })
     }
 }

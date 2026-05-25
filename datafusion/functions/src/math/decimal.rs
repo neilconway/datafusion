@@ -18,10 +18,30 @@
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, AsArray, PrimitiveArray};
-use arrow::datatypes::{ArrowNativeTypeOp, DecimalType};
+use arrow::datatypes::{ArrowNativeTypeOp, DataType, DecimalType};
 use arrow::error::ArrowError;
 use arrow_buffer::ArrowNativeType;
 use datafusion_common::{DataFusionError, Result};
+
+pub(super) fn decimal_integral_output_type(data_type: &DataType) -> Option<DataType> {
+    // ceil/floor remove fractional digits. Decimals with scale 0 or negative
+    // scale are already integral, so their type can be preserved.
+    match data_type {
+        DataType::Decimal32(precision, scale) if *scale > 0 => {
+            Some(DataType::Decimal32(*precision, 0))
+        }
+        DataType::Decimal64(precision, scale) if *scale > 0 => {
+            Some(DataType::Decimal64(*precision, 0))
+        }
+        DataType::Decimal128(precision, scale) if *scale > 0 => {
+            Some(DataType::Decimal128(*precision, 0))
+        }
+        DataType::Decimal256(precision, scale) if *scale > 0 => {
+            Some(DataType::Decimal256(*precision, 0))
+        }
+        _ => None,
+    }
+}
 
 pub(super) fn apply_decimal_to_integral_op<T, F>(
     array: &ArrayRef,

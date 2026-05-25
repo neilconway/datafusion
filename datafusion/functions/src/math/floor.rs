@@ -35,7 +35,9 @@ use datafusion_expr::{
 use datafusion_macros::user_doc;
 use num_traits::{CheckedAdd, Float, One};
 
-use super::decimal::{apply_decimal_to_integral_op, floor_decimal_value};
+use super::decimal::{
+    apply_decimal_to_integral_op, decimal_integral_output_type, floor_decimal_value,
+};
 
 #[user_doc(
     doc_section(label = "Math Functions"),
@@ -135,19 +137,9 @@ impl ScalarUDFImpl for FloorFunc {
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         match &arg_types[0] {
             DataType::Null => Ok(DataType::Float64),
-            DataType::Decimal32(precision, scale) if *scale > 0 => {
-                Ok(DataType::Decimal32(*precision, 0))
+            other => {
+                Ok(decimal_integral_output_type(other).unwrap_or_else(|| other.clone()))
             }
-            DataType::Decimal64(precision, scale) if *scale > 0 => {
-                Ok(DataType::Decimal64(*precision, 0))
-            }
-            DataType::Decimal128(precision, scale) if *scale > 0 => {
-                Ok(DataType::Decimal128(*precision, 0))
-            }
-            DataType::Decimal256(precision, scale) if *scale > 0 => {
-                Ok(DataType::Decimal256(*precision, 0))
-            }
-            other => Ok(other.clone()),
         }
     }
 
@@ -407,6 +399,11 @@ fn decimal_preimage_bounds<D: DecimalType>(
 where
     D::Native: DecimalCast + ArrowNativeTypeOp + std::ops::Rem<Output = D::Native>,
 {
+    // Avoid producing inexact bounds across negative decimal scales.
+    if literal_scale < 0 || arg_scale < 0 {
+        return None;
+    }
+
     // Use rescale_decimal to compute "1" at target scale (avoids manual pow)
     // Convert integer 1 (scale=0) to the target scale
     let one_literal_scaled: D::Native = rescale_decimal::<D, D>(

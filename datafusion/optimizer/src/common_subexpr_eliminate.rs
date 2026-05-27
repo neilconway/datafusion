@@ -24,6 +24,7 @@ use std::sync::Arc;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use crate::optimizer::ApplyOrder;
+use crate::simplify_expressions::{ExprSimplifier, SimplifyContext};
 use crate::utils::NamePreserver;
 use datafusion_common::alias::AliasGenerator;
 
@@ -469,8 +470,13 @@ impl CommonSubexprEliminate {
                 original_nodes_list: _,
             } => {
                 let new_exprs = new_exprs_list.pop().unwrap();
-                build_common_expr_project_plan(input, common_exprs)
-                    .map(|new_input| Transformed::yes((new_exprs, new_input)))
+                build_common_expr_project_plan(input, common_exprs).and_then(
+                    |new_input| {
+                        let new_exprs =
+                            simplify_cse_rewritten_exprs(new_exprs, &new_input, config)?;
+                        Ok(Transformed::yes((new_exprs, new_input)))
+                    },
+                )
             }
             FoundCommonNodes::No {
                 original_nodes_list: mut original_exprs_list,
@@ -486,6 +492,24 @@ impl CommonSubexprEliminate {
                 .map_data(|new_input| Ok((new_exprs, new_input)))
         })
     }
+}
+
+fn simplify_cse_rewritten_exprs(
+    exprs: Vec<Expr>,
+    input: &LogicalPlan,
+    config: &dyn OptimizerConfig,
+) -> Result<Vec<Expr>> {
+    let context = SimplifyContext::builder()
+        .with_schema(Arc::clone(input.schema()))
+        .with_config_options(config.options())
+        .with_query_execution_start_time(config.query_execution_start_time())
+        .build();
+    let simplifier = ExprSimplifier::new(context);
+
+    exprs
+        .into_iter()
+        .map(|expr| simplifier.simplify(expr))
+        .collect()
 }
 
 /// Get all window expressions inside the consecutive window operators.
@@ -1287,6 +1311,29 @@ mod test {
     }
 
     #[test]
+    fn filter_common_expr_simplified_after_rewrite() -> Result<()> {
+        let table_scan = test_table_scan()?;
+        let common_expr = col("a").eq(lit(1_u64));
+        let plan = LogicalPlanBuilder::from(table_scan)
+            .filter(
+                common_expr
+                    .clone()
+                    .and(common_expr.or(col("b").eq(lit(2_u64)))),
+            )?
+            .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @ r"
+        Projection: test.a, test.b, test.c
+          Filter: __common_expr_1
+            Projection: test.a = UInt64(1) AS __common_expr_1, test.a, test.b, test.c
+              TableScan: test
+        "
+        )
+    }
+
+    #[test]
     fn test_extract_expressions_from_grouping_set() -> Result<()> {
         let mut result = Vec::with_capacity(3);
         let grouping = grouping_set(vec![vec![col("a"), col("b")], vec![col("c")]]);
@@ -1402,7 +1449,7 @@ mod test {
         assert_optimized_plan_equal!(
             plan,
             @ r"
-        Projection: __common_expr_1 AS c1, __common_expr_1 AS c2, __common_expr_2 OR test.a - test.b = Int32(0) AS c3, __common_expr_2 AND test.a - test.b = Int32(0) AS c4, __common_expr_3 OR __common_expr_3 AS c5
+        Projection: __common_expr_1 AS c1, __common_expr_1 AS c2, __common_expr_2 OR test.a - test.b = Int32(0) AS c3, __common_expr_2 AND test.a - test.b = Int32(0) AS c4, __common_expr_3 AS c5
           Projection: test.a = Int32(0) OR test.b = Int32(0) AS __common_expr_1, test.a + test.b = Int32(0) AS __common_expr_2, test.a * test.b = Int32(0) AS __common_expr_3, test.a, test.b, test.c
             TableScan: test
         "

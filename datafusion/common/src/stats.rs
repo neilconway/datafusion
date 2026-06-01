@@ -23,7 +23,10 @@ use crate::{Result, ScalarValue};
 
 use crate::error::_plan_err;
 use crate::utils::aggregate::precision_add;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{
+    DECIMAL32_MAX_PRECISION, DECIMAL64_MAX_PRECISION, DECIMAL128_MAX_PRECISION,
+    DECIMAL256_MAX_PRECISION, DataType, Field, Schema,
+};
 
 /// Represents a value with a degree of certainty. `Precision` is used to
 /// propagate information the precision of statistical values.
@@ -207,6 +210,20 @@ impl Precision<ScalarValue> {
         match data_type {
             DataType::Int8 | DataType::Int16 | DataType::Int32 => DataType::Int64,
             DataType::UInt8 | DataType::UInt16 | DataType::UInt32 => DataType::UInt64,
+            DataType::Decimal32(precision, scale) => {
+                DataType::Decimal32(DECIMAL32_MAX_PRECISION.min(*precision + 10), *scale)
+            }
+            DataType::Decimal64(precision, scale) => {
+                DataType::Decimal64(DECIMAL64_MAX_PRECISION.min(*precision + 10), *scale)
+            }
+            DataType::Decimal128(precision, scale) => DataType::Decimal128(
+                DECIMAL128_MAX_PRECISION.min(*precision + 10),
+                *scale,
+            ),
+            DataType::Decimal256(precision, scale) => DataType::Decimal256(
+                DECIMAL256_MAX_PRECISION.min(*precision + 10),
+                *scale,
+            ),
             _ => data_type.clone(),
         }
     }
@@ -600,12 +617,7 @@ impl Statistics {
                 ..
             } => {
                 // Here, the inexact case gives us an estimate of the number of rows.
-                if nr <= skip {
-                    // All input data will be skipped. Preserve the exactness of
-                    // the input estimate: if the input was inexact, the
-                    // resulting zero is also inexact.
-                    check_num_rows(Some(0), self.num_rows.is_exact().unwrap())
-                } else if nr <= fetch_val && skip == 0 {
+                if nr <= fetch_val && skip == 0 {
                     // If the input does not reach the `fetch` globally, and `skip`
                     // is zero (meaning the input and output are identical), return
                     // input stats as is.
@@ -620,6 +632,11 @@ impl Statistics {
                         n_partitions,
                     );
                     return Ok(self);
+                } else if nr <= skip {
+                    // All input data will be skipped. Preserve the exactness of
+                    // the input estimate: if the input was inexact, the
+                    // resulting zero is also inexact.
+                    check_num_rows(Some(0), self.num_rows.is_exact().unwrap())
                 } else if nr - skip <= fetch_val {
                     // After `skip` input rows are skipped, the remaining rows are
                     // less than or equal to the `fetch` values, so `num_rows` must
@@ -673,6 +690,7 @@ impl Statistics {
                 };
                 // NDV can never exceed the number of rows
                 if let Some(&rows) = self.num_rows.get_value() {
+                    cs.null_count = cs.null_count.min(&Precision::Inexact(rows));
                     cs.distinct_count = cs.distinct_count.min(&Precision::Inexact(rows));
                 }
                 cs
@@ -951,6 +969,7 @@ fn validate_column_statistics(
             && matches!(column_stats.max_value, Precision::Exact(_))
             && !min.is_null()
             && min == max
+            && singleton_bounds_imply_single_distinct(field_type)
             && column_stats.null_count == Precision::Exact(0)
             && let Some(&distinct_count) = column_stats.distinct_count.get_value()
             && distinct_count > 1
@@ -963,6 +982,42 @@ fn validate_column_statistics(
     }
 
     Ok(())
+}
+
+fn singleton_bounds_imply_single_distinct(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Null
+            | DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(_, _)
+            | DataType::Decimal64(_, _)
+            | DataType::Decimal128(_, _)
+            | DataType::Decimal256(_, _)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+            | DataType::Timestamp(_, _)
+            | DataType::Duration(_)
+            | DataType::Interval(_)
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View
+    )
 }
 
 fn validate_scalar_precision_type(
@@ -1133,12 +1188,10 @@ pub fn estimate_ndv_with_overlap(
     let right_min = right.min_value.get_value()?;
     let right_max = right.max_value.get_value()?;
 
-    let range_left = left_max.distance(left_min)?;
-    let range_right = right_max.distance(right_min)?;
-
-    // Constant columns (range == 0) can't use the proportional overlap
-    // formula below, so check interval overlap directly instead.
-    if range_left == 0 || range_right == 0 {
+    // Constant columns can not use the proportional overlap formula below, so
+    // check interval overlap directly instead. Do this before `distance`
+    // because some comparable types, such as strings, do not support distance.
+    if left_min == left_max || right_min == right_max {
         let overlaps = left_min <= right_max && right_min <= left_max;
         return Some(if overlaps {
             usize::max(ndv_left, ndv_right)
@@ -1146,6 +1199,9 @@ pub fn estimate_ndv_with_overlap(
             ndv_left + ndv_right
         });
     }
+
+    let range_left = left_max.distance(left_min)?;
+    let range_right = right_max.distance(right_min)?;
 
     let overlap_min = if left_min >= right_min {
         left_min
@@ -2441,6 +2497,68 @@ mod tests {
             );
 
         let merged = Statistics::try_merge_iter([&stats3, &stats4], &schema).unwrap();
+        assert_eq!(
+            merged.column_statistics[0].distinct_count,
+            Precision::Inexact(2)
+        );
+
+        // Same non-numeric constant: ["a","a"]+["a","a"] -> max.
+        let stats5 = Statistics::default()
+            .with_num_rows(Precision::Exact(10))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "a".to_string(),
+                    ))))
+                    .with_max_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "a".to_string(),
+                    ))))
+                    .with_distinct_count(Precision::Exact(1)),
+            );
+        let stats6 = Statistics::default()
+            .with_num_rows(Precision::Exact(10))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "a".to_string(),
+                    ))))
+                    .with_max_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "a".to_string(),
+                    ))))
+                    .with_distinct_count(Precision::Exact(1)),
+            );
+
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let merged = Statistics::try_merge_iter_with_ndv_fallback(
+            [&stats5, &stats6],
+            &schema,
+            NdvFallback::Sum,
+        )
+        .unwrap();
+        assert_eq!(
+            merged.column_statistics[0].distinct_count,
+            Precision::Inexact(1)
+        );
+
+        // Different non-numeric constants: ["a","a"]+["b","b"] -> sum.
+        let stats7 = Statistics::default()
+            .with_num_rows(Precision::Exact(10))
+            .add_column_statistics(
+                ColumnStatistics::new_unknown()
+                    .with_min_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "b".to_string(),
+                    ))))
+                    .with_max_value(Precision::Exact(ScalarValue::Utf8(Some(
+                        "b".to_string(),
+                    ))))
+                    .with_distinct_count(Precision::Exact(1)),
+            );
+        let merged = Statistics::try_merge_iter_with_ndv_fallback(
+            [&stats5, &stats7],
+            &schema,
+            NdvFallback::Sum,
+        )
+        .unwrap();
         assert_eq!(
             merged.column_statistics[0].distinct_count,
             Precision::Inexact(2)

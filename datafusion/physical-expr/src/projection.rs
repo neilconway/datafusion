@@ -706,15 +706,29 @@ impl ProjectionExprs {
                     };
 
                     let widened_sum = Precision::Exact(value.clone()).cast_to_sum_type();
-                    let sum_value = widened_sum
-                        .get_value()
-                        .and_then(|sum| {
-                            Precision::<ScalarValue>::from(stats.num_rows)
-                                .cast_to(&sum.data_type())
-                                .ok()
-                        })
-                        .map(|row_count| widened_sum.multiply(&row_count))
-                        .unwrap_or(Precision::Absent);
+                    let sum_value = if matches!(
+                        value.data_type(),
+                        DataType::Decimal32(_, _)
+                            | DataType::Decimal64(_, _)
+                            | DataType::Decimal128(_, _)
+                            | DataType::Decimal256(_, _)
+                    ) {
+                        if stats.num_rows == Precision::Exact(1) {
+                            widened_sum
+                        } else {
+                            Precision::Absent
+                        }
+                    } else {
+                        widened_sum
+                            .get_value()
+                            .and_then(|sum| {
+                                Precision::<ScalarValue>::from(stats.num_rows)
+                                    .cast_to(&sum.data_type())
+                                    .ok()
+                            })
+                            .map(|row_count| widened_sum.multiply(&row_count))
+                            .unwrap_or(Precision::Absent)
+                    };
 
                     ColumnStatistics {
                         min_value: Precision::Exact(value.clone()),

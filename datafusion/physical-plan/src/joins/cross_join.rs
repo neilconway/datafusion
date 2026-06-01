@@ -454,6 +454,25 @@ fn stats_cartesian_product(
     let left_col_stats = left_stats.column_statistics;
     let right_col_stats = right_stats.column_statistics;
 
+    if num_rows == Precision::Exact(0) {
+        let column_statistics = std::iter::repeat_with(|| ColumnStatistics {
+            null_count: Precision::Exact(0),
+            max_value: Precision::Absent,
+            min_value: Precision::Absent,
+            sum_value: Precision::Absent,
+            distinct_count: Precision::Exact(0),
+            byte_size: Precision::Exact(0),
+        })
+        .take(left_col_stats.len() + right_col_stats.len())
+        .collect();
+
+        return Statistics {
+            num_rows,
+            total_byte_size: Precision::Exact(0),
+            column_statistics,
+        };
+    }
+
     // the null counts must be multiplied by the row counts of the other side (if defined)
     // Min, max and distinct_count on the other hand are invariants.
     let cross_join_stats = left_col_stats

@@ -416,28 +416,39 @@ impl Statistics {
         }
     }
 
-    /// Calculates `total_byte_size` based on the schema and `num_rows`.
-    /// If any of the columns has non-primitive width, `total_byte_size` is set to inexact.
+    /// Calculates `total_byte_size` from column statistics and fixed-width
+    /// schema fields.
+    ///
+    /// If all output columns have either column-level `byte_size` statistics or
+    /// a fixed primitive width, `total_byte_size` is set to their sum. If any
+    /// variable-width output column lacks column-level `byte_size`, the
+    /// existing `total_byte_size` is retained as an inexact whole-row estimate.
     pub fn calculate_total_byte_size(&mut self, schema: &Schema) {
-        let mut row_size = Some(0);
-        for field in schema.fields() {
-            match field.data_type().primitive_width() {
-                Some(width) => {
-                    row_size = row_size.map(|s| s + width);
+        let mut has_unknown_variable_width_column = false;
+        let total_byte_size = self
+            .column_statistics
+            .iter()
+            .map(Some)
+            .chain(std::iter::repeat(None))
+            .zip(schema.fields())
+            .map(|(column_stats, field)| {
+                if let Some(column_stats) = column_stats
+                    && column_stats.byte_size != Precision::Absent
+                {
+                    column_stats.byte_size
+                } else if let Some(width) = field.data_type().primitive_width() {
+                    self.num_rows.multiply(&Precision::Exact(width))
+                } else {
+                    has_unknown_variable_width_column = true;
+                    Precision::Absent
                 }
-                None => {
-                    row_size = None;
-                    break;
-                }
-            }
-        }
-        match row_size {
-            None => {
-                self.total_byte_size = self.total_byte_size.to_inexact();
-            }
-            Some(size) => {
-                self.total_byte_size = self.num_rows.multiply(&Precision::Exact(size));
-            }
+            })
+            .fold(Precision::Exact(0), |acc, byte_size| acc.add(&byte_size));
+
+        if has_unknown_variable_width_column {
+            self.total_byte_size = self.total_byte_size.to_inexact();
+        } else {
+            self.total_byte_size = total_byte_size;
         }
     }
 
@@ -1502,6 +1513,43 @@ mod tests {
             distinct_count: Precision::Exact(100),
             byte_size: Precision::Exact(800),
         }
+    }
+
+    #[test]
+    fn test_calculate_total_byte_size_sums_column_and_primitive_bytes() {
+        let schema = Schema::new(vec![
+            Field::new("s", DataType::Utf8, false),
+            Field::new("i", DataType::Int64, false),
+        ]);
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    byte_size: Precision::Exact(20),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        stats.calculate_total_byte_size(&schema);
+
+        assert_eq!(stats.total_byte_size, Precision::Exact(60));
+    }
+
+    #[test]
+    fn test_calculate_total_byte_size_falls_back_for_unknown_variable_width() {
+        let schema = Schema::new(vec![Field::new("s", DataType::Utf8, false)]);
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        stats.calculate_total_byte_size(&schema);
+
+        assert_eq!(stats.total_byte_size, Precision::Inexact(100));
     }
 
     fn make_single_i64_ndv_stats(

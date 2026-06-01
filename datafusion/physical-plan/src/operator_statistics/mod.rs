@@ -594,12 +594,17 @@ impl StatisticsProvider for ProjectionStatisticsProvider {
         }
 
         let input_stats = (*child_stats[0].base).clone();
+        let input_schema = proj.input().schema();
         let output_schema = proj.schema();
         // TODO: pass proj.expression_analyzer_registry() once #21122 lands,
         // so expression-level NDV/min/max feeds into projected column stats.
         let stats = proj
             .projection_expr()
-            .project_statistics(input_stats, &output_schema)?;
+            .project_statistics_with_input_schema(
+                input_stats,
+                &input_schema,
+                &output_schema,
+            )?;
         Ok(StatisticsResult::Computed(ExtendedStatistics::new(stats)))
     }
 }

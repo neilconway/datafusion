@@ -808,11 +808,14 @@ impl DataSource for FileScanConfig {
                 && let Some(stat) = file_group.file_statistics(None)
             {
                 // Project the statistics based on the projection
+                let input_schema = self.file_source.table_schema().table_schema();
                 let output_schema = self.projected_schema()?;
                 return if let Some(projection) = self.file_source.projection() {
-                    Ok(Arc::new(
-                        projection.project_statistics(stat.clone(), &output_schema)?,
-                    ))
+                    Ok(Arc::new(projection.project_statistics_with_input_schema(
+                        stat.clone(),
+                        input_schema,
+                        &output_schema,
+                    )?))
                 } else {
                     Ok(Arc::new(stat.clone()))
                 };
@@ -825,11 +828,14 @@ impl DataSource for FileScanConfig {
             // Return aggregate statistics across all partitions
             let statistics = self.statistics();
             let projection = self.file_source.projection();
+            let input_schema = self.file_source.table_schema().table_schema();
             let output_schema = self.projected_schema()?;
             if let Some(projection) = &projection {
-                Ok(Arc::new(
-                    projection.project_statistics(statistics.clone(), &output_schema)?,
-                ))
+                Ok(Arc::new(projection.project_statistics_with_input_schema(
+                    statistics.clone(),
+                    input_schema,
+                    &output_schema,
+                )?))
             } else {
                 Ok(Arc::new(statistics))
             }

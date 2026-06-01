@@ -209,6 +209,46 @@ pub(crate) fn is_order_preserving_cast_family(
         || source_type.eq(target_type)
 }
 
+pub(crate) fn cast_preserves_exact_distinct_count(
+    source_type: &DataType,
+    target_type: &DataType,
+) -> bool {
+    if source_type == target_type {
+        return true;
+    }
+
+    match (source_type, target_type) {
+        (Int8, Int16 | Int32 | Int64)
+        | (Int16, Int32 | Int64)
+        | (Int32, Int64)
+        | (UInt8, UInt16 | UInt32 | UInt64)
+        | (UInt16, UInt32 | UInt64)
+        | (UInt32, UInt64)
+        | (Utf8, LargeUtf8)
+        | (Binary, LargeBinary)
+        | (Date32, Date64)
+        | (Time32(_), Time64(_)) => true,
+        (Timestamp(source_unit, source_tz), Timestamp(target_unit, target_tz)) => {
+            source_tz == target_tz && time_unit_widens(source_unit, target_unit)
+        }
+        _ => false,
+    }
+}
+
+fn time_unit_widens(
+    source_unit: &arrow::datatypes::TimeUnit,
+    target_unit: &arrow::datatypes::TimeUnit,
+) -> bool {
+    use arrow::datatypes::TimeUnit::*;
+
+    matches!(
+        (source_unit, target_unit),
+        (Second, Millisecond | Microsecond | Nanosecond)
+            | (Millisecond, Microsecond | Nanosecond)
+            | (Microsecond, Nanosecond)
+    )
+}
+
 pub(crate) fn cast_expr_properties(
     child: &ExprProperties,
     target_type: &DataType,
@@ -473,6 +513,31 @@ mod tests {
 
         let result = expr.evaluate(&batch)?.into_array(batch.num_rows())?;
         Ok(as_struct_array(result.as_ref())?.clone())
+    }
+
+    #[test]
+    fn test_cast_preserves_exact_distinct_count_classifier() {
+        assert!(cast_preserves_exact_distinct_count(&Int8, &Int64));
+        assert!(cast_preserves_exact_distinct_count(&UInt8, &UInt64));
+        assert!(cast_preserves_exact_distinct_count(&Utf8, &LargeUtf8));
+        assert!(cast_preserves_exact_distinct_count(&Binary, &LargeBinary));
+        assert!(cast_preserves_exact_distinct_count(&Date32, &Date64));
+        assert!(cast_preserves_exact_distinct_count(
+            &Time32(TimeUnit::Second),
+            &Time64(TimeUnit::Nanosecond)
+        ));
+        assert!(cast_preserves_exact_distinct_count(
+            &Timestamp(TimeUnit::Second, None),
+            &Timestamp(TimeUnit::Nanosecond, None)
+        ));
+
+        assert!(!cast_preserves_exact_distinct_count(&Int64, &Int8));
+        assert!(!cast_preserves_exact_distinct_count(&Int64, &Float64));
+        assert!(!cast_preserves_exact_distinct_count(&Float64, &Int64));
+        assert!(!cast_preserves_exact_distinct_count(
+            &Timestamp(TimeUnit::Nanosecond, None),
+            &Timestamp(TimeUnit::Second, None)
+        ));
     }
 
     // runs an end-to-end test of physical type cast

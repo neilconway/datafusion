@@ -21,7 +21,9 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::PhysicalExpr;
-use crate::expressions::{CastExpr, Column, Literal};
+use crate::expressions::{
+    CastExpr, Column, Literal, cast_preserves_exact_distinct_count,
+};
 use crate::scalar_function::ScalarFunctionExpr;
 use crate::utils::collect_columns;
 
@@ -653,7 +655,27 @@ impl ProjectionExprs {
     /// ```
     pub fn project_statistics(
         &self,
+        stats: Statistics,
+        output_schema: &Schema,
+    ) -> Result<Statistics> {
+        self.project_statistics_inner(stats, None, output_schema)
+    }
+
+    /// Project statistics according to this projection, using the input schema
+    /// to preserve cast statistics only when the cast source type is known.
+    pub fn project_statistics_with_input_schema(
+        &self,
+        stats: Statistics,
+        input_schema: &Schema,
+        output_schema: &Schema,
+    ) -> Result<Statistics> {
+        self.project_statistics_inner(stats, Some(input_schema), output_schema)
+    }
+
+    fn project_statistics_inner(
+        &self,
         mut stats: Statistics,
+        input_schema: Option<&Schema>,
         output_schema: &Schema,
     ) -> Result<Statistics> {
         let mut column_statistics = Vec::with_capacity(self.exprs.len());
@@ -664,7 +686,7 @@ impl ProjectionExprs {
                 stats.column_statistics[col.index()].clone()
             } else if let Some(literal) = expr.downcast_ref::<Literal>() {
                 // Handle literal expressions (constants) by calculating proper statistics
-                let data_type = expr.data_type(output_schema)?;
+                let data_type = expr.data_type(input_schema.unwrap_or(output_schema))?;
 
                 if literal.value().is_null() {
                     let null_count = match stats.num_rows {
@@ -675,7 +697,7 @@ impl ProjectionExprs {
                     ColumnStatistics {
                         min_value: Precision::Exact(literal.value().clone()),
                         max_value: Precision::Exact(literal.value().clone()),
-                        distinct_count: Precision::Exact(1),
+                        distinct_count: Precision::Exact(0),
                         null_count,
                         sum_value: Precision::Exact(literal.value().clone()),
                         byte_size: Precision::Exact(0),
@@ -717,12 +739,13 @@ impl ProjectionExprs {
                 project_column_statistics_through_expr(
                     expr.as_ref(),
                     &stats.column_statistics,
-                )
+                    input_schema,
+                )?
             };
             column_statistics.push(col_stats);
         }
-        stats.calculate_total_byte_size(output_schema);
         stats.column_statistics = column_statistics;
+        stats.calculate_total_byte_size(output_schema);
         Ok(stats)
     }
 }
@@ -734,29 +757,63 @@ impl ProjectionExprs {
 fn project_column_statistics_through_expr(
     expr: &dyn PhysicalExpr,
     column_stats: &[ColumnStatistics],
-) -> ColumnStatistics {
+    input_schema: Option<&Schema>,
+) -> Result<ColumnStatistics> {
     if let Some(col) = expr.downcast_ref::<Column>() {
-        return column_stats[col.index()].clone();
+        return Ok(column_stats[col.index()].clone());
     }
     let Some(cast_expr) = expr.downcast_ref::<CastExpr>() else {
-        return ColumnStatistics::new_unknown();
+        return Ok(ColumnStatistics::new_unknown());
     };
-    let inner_stats =
-        project_column_statistics_through_expr(cast_expr.expr.as_ref(), column_stats);
+    let inner_stats = project_column_statistics_through_expr(
+        cast_expr.expr.as_ref(),
+        column_stats,
+        input_schema,
+    )?;
+    let source_type = input_schema
+        .map(|schema| cast_expr.expr.data_type(schema))
+        .transpose()?;
     let target_type = cast_expr.cast_type();
-    ColumnStatistics {
-        min_value: inner_stats
-            .min_value
-            .cast_to(target_type)
-            .unwrap_or(Precision::Absent),
-        max_value: inner_stats
-            .max_value
-            .cast_to(target_type)
-            .unwrap_or(Precision::Absent),
+    let (min_value, max_value) = match (
+        inner_stats.min_value.cast_to(target_type),
+        inner_stats.max_value.cast_to(target_type),
+    ) {
+        (Ok(min_value), Ok(max_value)) => (min_value, max_value),
+        _ => (Precision::Absent, Precision::Absent),
+    };
+    let mut projected_stats = ColumnStatistics {
+        min_value,
+        max_value,
         null_count: inner_stats.null_count,
-        distinct_count: inner_stats.distinct_count,
+        distinct_count: Precision::Absent,
         sum_value: Precision::Absent,
         byte_size: Precision::Absent,
+    };
+    projected_stats.distinct_count = project_cast_distinct_count(
+        &inner_stats,
+        &projected_stats,
+        source_type.as_ref(),
+        target_type,
+    );
+    Ok(projected_stats)
+}
+
+fn project_cast_distinct_count(
+    inner_stats: &ColumnStatistics,
+    projected_stats: &ColumnStatistics,
+    source_type: Option<&DataType>,
+    target_type: &DataType,
+) -> Precision<usize> {
+    if projected_stats.is_singleton() {
+        return Precision::Exact(1);
+    }
+
+    if source_type.is_some_and(|source_type| {
+        cast_preserves_exact_distinct_count(source_type, target_type)
+    }) {
+        inner_stats.distinct_count
+    } else {
+        inner_stats.distinct_count.to_inexact()
     }
 }
 
@@ -2202,6 +2259,19 @@ pub(crate) mod tests {
         Schema::new(vec![field_0, field_1, field_2])
     }
 
+    fn project_stats_with_input_schema(
+        projection: &ProjectionExprs,
+        input_stats: Statistics,
+        input_schema: &Schema,
+    ) -> Result<Statistics> {
+        let output_schema = projection.project_schema(input_schema)?;
+        projection.project_statistics_with_input_schema(
+            input_stats,
+            input_schema,
+            &output_schema,
+        )
+    }
+
     #[test]
     fn test_stats_projection_columns_only() {
         let source = get_stats();
@@ -2224,8 +2294,8 @@ pub(crate) mod tests {
 
         let expected = Statistics {
             num_rows: Precision::Exact(5),
-            // Because there is a variable length Utf8 column we cannot calculate exact byte size after projection
-            // Thus we set it to Inexact (originally it was Exact(23))
+            // Because there is a variable length Utf8 column without column
+            // byte_size, we fall back to the previous whole-row estimate.
             total_byte_size: Precision::Inexact(23),
             column_statistics: vec![
                 ColumnStatistics {
@@ -2749,10 +2819,8 @@ pub(crate) mod tests {
             },
         ]);
 
-        let output_stats = projection.project_statistics(
-            input_stats,
-            &projection.project_schema(&input_schema)?,
-        )?;
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
 
         // Row count should be preserved
         assert_eq!(output_stats.num_rows, Precision::Exact(5));
@@ -2883,6 +2951,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_project_statistics_duplicate_column_byte_size() -> Result<()> {
+        let input_schema = Schema::new(vec![Field::new("col0", DataType::Int32, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(40),
+            column_statistics: vec![ColumnStatistics {
+                byte_size: Precision::Exact(40),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let projection = ProjectionExprs::new([
+            ProjectionExpr::new(Arc::new(Column::new("col0", 0)), "a"),
+            ProjectionExpr::new(Arc::new(Column::new("col0", 0)), "b"),
+        ]);
+
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].byte_size,
+            Precision::Exact(40)
+        );
+        assert_eq!(
+            output_stats.column_statistics[1].byte_size,
+            Precision::Exact(40)
+        );
+        assert_eq!(output_stats.total_byte_size, Precision::Exact(80));
+        Ok(())
+    }
+
+    #[test]
     fn test_project_statistics_column_and_cast() -> Result<()> {
         let input_stats = get_stats();
         let col0 = input_stats.column_statistics[0].clone();
@@ -2907,12 +3006,192 @@ pub(crate) mod tests {
             ColumnStatistics {
                 min_value: Precision::Exact(ScalarValue::Int32(Some(-4))),
                 max_value: Precision::Exact(ScalarValue::Int32(Some(21))),
-                distinct_count: Precision::Exact(5),
+                distinct_count: Precision::Inexact(5),
                 null_count: Precision::Exact(0),
                 sum_value: Precision::Absent,
                 byte_size: Precision::Absent,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_cast_collapses_distinct_count() -> Result<()> {
+        let input_schema =
+            Schema::new(vec![Field::new("col0", DataType::Float64, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Float64(Some(1.2))),
+                min_value: Precision::Exact(ScalarValue::Float64(Some(1.1))),
+                sum_value: Precision::Absent,
+                null_count: Precision::Exact(0),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(CastExpr::new(
+                Arc::new(Column::new("col0", 0)),
+                DataType::Int64,
+                None,
+            )),
+            alias: "casted".to_string(),
+        }]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Exact(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_cast_uses_expr_source_type_for_distinct_count()
+    -> Result<()> {
+        let input_schema =
+            Schema::new(vec![Field::new("col0", DataType::Float64, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(2))),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                sum_value: Precision::Absent,
+                null_count: Precision::Exact(0),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(CastExpr::new(
+                Arc::new(Column::new("col0", 0)),
+                DataType::Int64,
+                None,
+            )),
+            alias: "casted".to_string(),
+        }]);
+
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(2)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Inexact(2)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_cast_overflow_drops_both_bounds() -> Result<()> {
+        let input_schema = Schema::new(vec![Field::new("col0", DataType::Int64, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(300))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+                sum_value: Precision::Absent,
+                null_count: Precision::Exact(0),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(CastExpr::new(
+                Arc::new(Column::new("col0", 0)),
+                DataType::Int8,
+                None,
+            )),
+            alias: "casted".to_string(),
+        }]);
+
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].min_value,
+            Precision::Absent
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Absent
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Inexact(2)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_cast_singleton_with_nulls() -> Result<()> {
+        let input_schema = Schema::new(vec![Field::new("col0", DataType::Float64, true)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(3),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(1),
+                max_value: Precision::Exact(ScalarValue::Float64(Some(2.0))),
+                min_value: Precision::Exact(ScalarValue::Float64(Some(2.0))),
+                sum_value: Precision::Absent,
+                null_count: Precision::Exact(2),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(CastExpr::new(
+                Arc::new(Column::new("col0", 0)),
+                DataType::Int64,
+                None,
+            )),
+            alias: "casted".to_string(),
+        }]);
+
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(2)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(2)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Exact(1)
+        );
+
         Ok(())
     }
 
@@ -2971,6 +3250,108 @@ pub(crate) mod tests {
 
         // Total byte size should be 0 for empty projection
         assert_eq!(output_stats.total_byte_size, Precision::Exact(0));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_sums_projected_complex_column_byte_sizes() -> Result<()> {
+        let input_schema = Schema::new(vec![
+            Field::new("col0", DataType::Utf8, false),
+            Field::new("col1", DataType::Utf8, false),
+        ]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(30),
+            column_statistics: vec![
+                ColumnStatistics {
+                    byte_size: Precision::Exact(10),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics {
+                    byte_size: Precision::Exact(20),
+                    ..ColumnStatistics::new_unknown()
+                },
+            ],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(Column::new("col1", 1)),
+            alias: "col1".to_string(),
+        }]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(output_stats.total_byte_size, Precision::Exact(20));
+        assert_eq!(
+            output_stats.column_statistics[0].byte_size,
+            Precision::Exact(20)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_combines_column_and_primitive_byte_sizes() -> Result<()> {
+        let input_schema = Schema::new(vec![
+            Field::new("col0", DataType::Utf8, false),
+            Field::new("col1", DataType::Int64, false),
+        ]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    byte_size: Precision::Exact(20),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        let projection = ProjectionExprs::new(vec![
+            ProjectionExpr {
+                expr: Arc::new(Column::new("col0", 0)),
+                alias: "col0".to_string(),
+            },
+            ProjectionExpr {
+                expr: Arc::new(Column::new("col1", 1)),
+                alias: "col1".to_string(),
+            },
+        ]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(output_stats.total_byte_size, Precision::Exact(60));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_var_length_without_byte_size_uses_total_fallback()
+    -> Result<()> {
+        let input_schema = Schema::new(vec![Field::new("col0", DataType::Utf8, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(Column::new("col0", 0)),
+            alias: "col0".to_string(),
+        }]);
+
+        let output_stats =
+            project_stats_with_input_schema(&projection, input_stats, &input_schema)?;
+
+        assert_eq!(output_stats.total_byte_size, Precision::Inexact(100));
 
         Ok(())
     }
@@ -3114,7 +3495,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             output_stats.column_statistics[0].distinct_count,
-            Precision::Exact(1) // All NULLs are considered the same
+            Precision::Exact(0)
         );
         assert_eq!(
             output_stats.column_statistics[0].null_count,

@@ -1488,7 +1488,9 @@ impl ExecutionPlan for HashJoinExec {
         // Project statistics if there is a projection
         let stats = stats.project(self.projection.as_ref());
         // Apply fetch limit to statistics
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        let stats = stats.with_fetch(self.fetch, 0, 1)?;
+        stats.debug_assert_valid_for_schema(&self.schema(), "HashJoinExec statistics");
+        Ok(Arc::new(stats))
     }
 
     /// Tries to push `projection` down through `hash_join`. If possible, performs the

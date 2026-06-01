@@ -321,12 +321,15 @@ impl FilterExec {
         predicate: &Arc<dyn PhysicalExpr>,
         default_selectivity: u8,
     ) -> Result<Statistics> {
+        #[cfg(debug_assertions)]
+        let input_stats_for_assert = input_stats.clone();
+
         let (eq_columns, is_infeasible) = collect_equality_columns(predicate);
 
         let input_num_rows = input_stats.num_rows;
         let input_total_byte_size = input_stats.total_byte_size;
 
-        let (selectivity, num_rows, column_statistics) = if is_infeasible {
+        let (selectivity, num_rows, mut column_statistics) = if is_infeasible {
             // Contradictory predicate: zero rows, and null/min/max are
             // undefined on an empty column.
             let mut cs = input_stats.to_inexact().column_statistics;
@@ -377,15 +380,23 @@ impl FilterExec {
             );
             (selectivity, filtered_num_rows, cs)
         };
+        cap_distinct_counts_at_num_rows(&mut column_statistics, num_rows);
 
         let total_byte_size =
             input_total_byte_size.with_estimated_selectivity(selectivity);
 
-        Ok(Statistics {
+        let stats = Statistics {
             num_rows,
             total_byte_size,
             column_statistics,
-        })
+        };
+        #[cfg(debug_assertions)]
+        crate::statistics_assert::assert_filter_statistics(
+            &input_stats_for_assert,
+            &stats,
+            schema,
+        );
+        Ok(stats)
     }
 
     /// This function creates the cache object that stores the plan properties such as schema, equivalence properties, ordering, partitioning, etc.
@@ -578,7 +589,9 @@ impl ExecutionPlan for FilterExec {
             self.predicate(),
             self.default_selectivity,
         )?;
-        Ok(Arc::new(stats.project(self.projection.as_ref())))
+        let stats = stats.project(self.projection.as_ref());
+        stats.debug_assert_valid_for_schema(&self.schema(), "FilterExec statistics");
+        Ok(Arc::new(stats))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -926,6 +939,34 @@ fn collect_new_statistics(
             },
         )
         .collect()
+}
+
+fn cap_distinct_counts_at_num_rows(
+    column_statistics: &mut [ColumnStatistics],
+    num_rows: Precision<usize>,
+) {
+    let Some(&rows) = num_rows.get_value() else {
+        return;
+    };
+
+    for column_stats in column_statistics {
+        let Some(&distinct_count) = column_stats.distinct_count.get_value() else {
+            continue;
+        };
+        if distinct_count <= rows {
+            continue;
+        }
+
+        column_stats.distinct_count = match num_rows {
+            Precision::Exact(rows)
+                if matches!(column_stats.distinct_count, Precision::Exact(_)) =>
+            {
+                Precision::Exact(rows)
+            }
+            Precision::Exact(rows) | Precision::Inexact(rows) => Precision::Inexact(rows),
+            Precision::Absent => Precision::Absent,
+        };
+    }
 }
 
 /// The FilterExec streams wraps the input iterator and applies the predicate expression to
@@ -2425,7 +2466,7 @@ mod tests {
                 vec![Precision::Exact(1)],
             ),
             (
-                "OR preserves original NDV",
+                "OR caps original NDV at filtered row count",
                 vec![Field::new("name", DataType::Utf8, false)],
                 vec![ColumnStatistics {
                     distinct_count: Precision::Inexact(50),
@@ -2444,7 +2485,7 @@ mod tests {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
                     )),
                 )),
-                vec![Precision::Inexact(50)],
+                vec![Precision::Inexact(20)],
             ),
             (
                 "AND with mixed types (Utf8 + Int32)",

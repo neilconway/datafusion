@@ -456,16 +456,30 @@ pub(crate) fn estimate_join_statistics(
     join_type: &JoinType,
     schema: &Schema,
 ) -> Result<Statistics> {
+    #[cfg(debug_assertions)]
+    let left_stats_for_assert = left_stats.clone();
+    #[cfg(debug_assertions)]
+    let right_stats_for_assert = right_stats.clone();
+
     let join_stats = estimate_join_cardinality(join_type, left_stats, right_stats, on);
     let (num_rows, column_statistics) = match join_stats {
         Some(stats) => (Precision::Inexact(stats.num_rows), stats.column_statistics),
         None => (Precision::Absent, Statistics::unknown_column(schema)),
     };
-    Ok(Statistics {
+    let stats = Statistics {
         num_rows,
         total_byte_size: Precision::Absent,
         column_statistics,
-    })
+    };
+    #[cfg(debug_assertions)]
+    crate::statistics_assert::assert_join_statistics(
+        &left_stats_for_assert,
+        &right_stats_for_assert,
+        join_type,
+        &stats,
+        schema,
+    );
+    Ok(stats)
 }
 
 // Estimate the cardinality for the given join with input statistics.

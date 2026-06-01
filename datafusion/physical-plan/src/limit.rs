@@ -221,7 +221,9 @@ impl ExecutionPlan for GlobalLimitExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(self.fetch, self.skip, 1)?))
+        let stats = stats.with_fetch(self.fetch, self.skip, 1)?;
+        stats.debug_assert_valid_for_schema(&self.schema(), "GlobalLimitExec statistics");
+        Ok(Arc::new(stats))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -384,7 +386,9 @@ impl ExecutionPlan for LocalLimitExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(Some(self.fetch), 0, 1)?))
+        let stats = stats.with_fetch(Some(self.fetch), 0, 1)?;
+        stats.debug_assert_valid_for_schema(&self.schema(), "LocalLimitExec statistics");
+        Ok(Arc::new(stats))
     }
 
     fn fetch(&self) -> Option<usize> {

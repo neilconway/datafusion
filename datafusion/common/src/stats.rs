@@ -23,7 +23,7 @@ use crate::{Result, ScalarValue};
 
 use crate::error::_plan_err;
 use crate::utils::aggregate::precision_add;
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 
 /// Represents a value with a degree of certainty. `Precision` is used to
 /// propagate information the precision of statistical values.
@@ -450,6 +450,49 @@ impl Statistics {
             .collect()
     }
 
+    /// Validate this [`Statistics`] instance against the given schema.
+    ///
+    /// This checks invariants that should hold for any statistics object,
+    /// regardless of which operator produced it. It intentionally does not
+    /// judge estimate quality.
+    pub fn validate_for_schema(&self, schema: &Schema) -> Result<()> {
+        if self.column_statistics.len() != schema.fields().len() {
+            return _plan_err!(
+                "Statistics column count {} does not match schema field count {}",
+                self.column_statistics.len(),
+                schema.fields().len()
+            );
+        }
+
+        let exact_num_rows = match self.num_rows {
+            Precision::Exact(num_rows) => Some(num_rows),
+            Precision::Inexact(_) | Precision::Absent => None,
+        };
+        for (idx, (column_stats, field)) in self
+            .column_statistics
+            .iter()
+            .zip(schema.fields().iter())
+            .enumerate()
+        {
+            validate_column_statistics(idx, field, column_stats, exact_num_rows)?;
+        }
+
+        Ok(())
+    }
+
+    /// Debug-build assertion wrapper for [`Statistics::validate_for_schema`].
+    ///
+    /// In release builds this method is a no-op.
+    pub fn debug_assert_valid_for_schema(&self, schema: &Schema, context: &str) {
+        #[cfg(debug_assertions)]
+        if let Err(e) = self.validate_for_schema(schema) {
+            panic!("Invalid statistics in {context}: {e}\nStatistics: {self}");
+        }
+
+        #[cfg(not(debug_assertions))]
+        let _ = (schema, context);
+    }
+
     /// Set the number of rows
     pub fn with_num_rows(mut self, num_rows: Precision<usize>) -> Self {
         self.num_rows = num_rows;
@@ -539,6 +582,9 @@ impl Statistics {
         skip: usize,
         n_partitions: usize,
     ) -> Result<Self> {
+        #[cfg(debug_assertions)]
+        let input_stats = self.clone();
+
         let fetch_val = fetch.unwrap_or(usize::MAX);
 
         // Get the ratio of rows after / rows before on a per-partition basis
@@ -565,6 +611,14 @@ impl Statistics {
                     // input stats as is.
                     // TODO: Can input stats still be used, but adjusted, when `skip`
                     //       is non-zero?
+                    #[cfg(debug_assertions)]
+                    debug_assert_fetch_statistics(
+                        &input_stats,
+                        &self,
+                        fetch,
+                        skip,
+                        n_partitions,
+                    );
                     return Ok(self);
                 } else if nr - skip <= fetch_val {
                     // After `skip` input rows are skipped, the remaining rows are
@@ -645,6 +699,8 @@ impl Statistics {
                 }
             }
         };
+        #[cfg(debug_assertions)]
+        debug_assert_fetch_statistics(&input_stats, &self, fetch, skip, n_partitions);
         Ok(self)
     }
 
@@ -714,10 +770,20 @@ impl Statistics {
     {
         let mut items = items.into_iter();
         let Some(first) = items.next() else {
-            return Ok(Statistics::new_unknown(schema));
+            let stats = Statistics::new_unknown(schema);
+            stats.debug_assert_valid_for_schema(
+                schema,
+                "Statistics::try_merge_iter_with_ndv_fallback empty input",
+            );
+            return Ok(stats);
         };
         let Some(second) = items.next() else {
-            return Ok(first.clone());
+            let stats = first.clone();
+            stats.debug_assert_valid_for_schema(
+                schema,
+                "Statistics::try_merge_iter_with_ndv_fallback single input",
+            );
+            return Ok(stats);
         };
 
         let num_cols = first.column_statistics.len();
@@ -770,12 +836,256 @@ impl Statistics {
             }
         }
 
-        Ok(Statistics {
+        let stats = Statistics {
             num_rows,
             total_byte_size,
             column_statistics,
-        })
+        };
+        stats.debug_assert_valid_for_schema(
+            schema,
+            "Statistics::try_merge_iter_with_ndv_fallback",
+        );
+        Ok(stats)
     }
+}
+
+fn validate_column_statistics(
+    idx: usize,
+    field: &Field,
+    column_stats: &ColumnStatistics,
+    exact_num_rows: Option<usize>,
+) -> Result<()> {
+    let field_type = field.data_type();
+
+    validate_scalar_precision_type(
+        idx,
+        field.name(),
+        "min_value",
+        &column_stats.min_value,
+        field_type,
+    )?;
+    validate_scalar_precision_type(
+        idx,
+        field.name(),
+        "max_value",
+        &column_stats.max_value,
+        field_type,
+    )?;
+    validate_sum_value_type(idx, field.name(), &column_stats.sum_value, field_type)?;
+
+    if let (Some(rows), Some(&null_count)) =
+        (exact_num_rows, column_stats.null_count.get_value())
+        && null_count > rows
+    {
+        return _plan_err!(
+            "Statistics for column {idx} ({}) has null_count {null_count} greater than num_rows {rows}",
+            field.name()
+        );
+    }
+
+    if let (Some(rows), Some(&distinct_count)) =
+        (exact_num_rows, column_stats.distinct_count.get_value())
+        && distinct_count > rows
+    {
+        return _plan_err!(
+            "Statistics for column {idx} ({}) has distinct_count {distinct_count} greater than num_rows {rows}",
+            field.name()
+        );
+    }
+
+    if exact_num_rows == Some(0) {
+        validate_zero_rows_usize(
+            idx,
+            field.name(),
+            "null_count",
+            &column_stats.null_count,
+        )?;
+        validate_zero_rows_usize(
+            idx,
+            field.name(),
+            "distinct_count",
+            &column_stats.distinct_count,
+        )?;
+        validate_zero_rows_usize(
+            idx,
+            field.name(),
+            "byte_size",
+            &column_stats.byte_size,
+        )?;
+        validate_zero_rows_scalar(
+            idx,
+            field.name(),
+            "min_value",
+            &column_stats.min_value,
+        )?;
+        validate_zero_rows_scalar(
+            idx,
+            field.name(),
+            "max_value",
+            &column_stats.max_value,
+        )?;
+        validate_zero_rows_scalar(
+            idx,
+            field.name(),
+            "sum_value",
+            &column_stats.sum_value,
+        )?;
+    }
+
+    if let (Some(min), Some(max)) = (
+        column_stats.min_value.get_value(),
+        column_stats.max_value.get_value(),
+    ) {
+        if !min.is_null()
+            && !max.is_null()
+            && min.data_type() == max.data_type()
+            && min > max
+        {
+            return _plan_err!(
+                "Statistics for column {idx} ({}) has min_value {min:?} greater than max_value {max:?}",
+                field.name()
+            );
+        }
+
+        if matches!(column_stats.min_value, Precision::Exact(_))
+            && matches!(column_stats.max_value, Precision::Exact(_))
+            && !min.is_null()
+            && min == max
+            && column_stats.null_count == Precision::Exact(0)
+            && let Some(&distinct_count) = column_stats.distinct_count.get_value()
+            && distinct_count > 1
+        {
+            return _plan_err!(
+                "Statistics for column {idx} ({}) has exact singleton bounds but distinct_count {distinct_count}",
+                field.name()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_scalar_precision_type(
+    idx: usize,
+    field_name: &str,
+    stat_name: &str,
+    stat: &Precision<ScalarValue>,
+    field_type: &DataType,
+) -> Result<()> {
+    if let Some(value) = stat.get_value()
+        && !scalar_cast_compatible(value, field_type)
+    {
+        return _plan_err!(
+            "Statistics for column {idx} ({field_name}) has {stat_name} value {value:?} incompatible with field type {field_type:?}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_sum_value_type(
+    idx: usize,
+    field_name: &str,
+    stat: &Precision<ScalarValue>,
+    field_type: &DataType,
+) -> Result<()> {
+    let sum_type = Precision::<ScalarValue>::sum_data_type(field_type);
+    if let Some(value) = stat.get_value()
+        && !scalar_cast_compatible(value, field_type)
+        && !scalar_cast_compatible(value, &sum_type)
+    {
+        return _plan_err!(
+            "Statistics for column {idx} ({field_name}) has sum_value {value:?} incompatible with field type {field_type:?} or sum type {sum_type:?}"
+        );
+    }
+    Ok(())
+}
+
+fn scalar_cast_compatible(value: &ScalarValue, data_type: &DataType) -> bool {
+    value.data_type() == *data_type || value.cast_to(data_type).is_ok()
+}
+
+fn validate_zero_rows_usize(
+    idx: usize,
+    field_name: &str,
+    stat_name: &str,
+    stat: &Precision<usize>,
+) -> Result<()> {
+    if let Some(&value) = stat.get_value()
+        && value != 0
+    {
+        return _plan_err!(
+            "Statistics for zero-row column {idx} ({field_name}) has {stat_name} {value}, expected 0"
+        );
+    }
+    Ok(())
+}
+
+fn validate_zero_rows_scalar(
+    idx: usize,
+    field_name: &str,
+    stat_name: &str,
+    stat: &Precision<ScalarValue>,
+) -> Result<()> {
+    if let Some(value) = stat.get_value()
+        && !value.is_null()
+    {
+        return _plan_err!(
+            "Statistics for zero-row column {idx} ({field_name}) has non-null {stat_name} {value:?}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn debug_assert_fetch_statistics(
+    input: &Statistics,
+    output: &Statistics,
+    fetch: Option<usize>,
+    skip: usize,
+    n_partitions: usize,
+) {
+    if let Err(e) = validate_fetch_statistics(input, output, fetch, skip, n_partitions) {
+        panic!("Invalid fetch statistics: {e}\nInput: {input}\nOutput: {output}");
+    }
+}
+
+#[cfg(debug_assertions)]
+fn validate_fetch_statistics(
+    input: &Statistics,
+    output: &Statistics,
+    fetch: Option<usize>,
+    skip: usize,
+    n_partitions: usize,
+) -> Result<()> {
+    if let (Some(input_rows), Some(output_rows)) =
+        (input.num_rows.get_value(), output.num_rows.get_value())
+        && output_rows > input_rows
+    {
+        return _plan_err!(
+            "Fetch statistics increased row count from {input_rows} to {output_rows}"
+        );
+    }
+
+    if let (Some(fetch), Some(&output_rows)) = (fetch, output.num_rows.get_value()) {
+        let bound = fetch.saturating_mul(n_partitions);
+        if output_rows > bound {
+            return _plan_err!(
+                "Fetch statistics row count {output_rows} exceeds fetch bound {bound}"
+            );
+        }
+    }
+
+    if skip == 0
+        && let (Some(fetch), Some(&input_rows)) = (fetch, input.num_rows.get_value())
+        && input_rows <= fetch
+        && output != input
+    {
+        return _plan_err!(
+            "No-op fetch changed statistics: input row count {input_rows}, fetch {fetch}"
+        );
+    }
+
+    Ok(())
 }
 
 /// Estimates the combined number of distinct values (NDV) when merging two
@@ -1181,6 +1491,114 @@ mod tests {
     use arrow::datatypes::Field;
     use std::sync::Arc;
 
+    fn one_i32_schema() -> Schema {
+        Schema::new(vec![Field::new("a", DataType::Int32, true)])
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_accepts_valid_stats() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(1),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(9))),
+                sum_value: Precision::Exact(ScalarValue::Int64(Some(45))),
+                distinct_count: Precision::Exact(9),
+                byte_size: Precision::Exact(40),
+            }],
+        };
+
+        stats.validate_for_schema(&one_i32_schema()).unwrap();
+        Statistics::new_unknown(&one_i32_schema())
+            .validate_for_schema(&one_i32_schema())
+            .unwrap();
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_wrong_column_count() {
+        let stats = Statistics::default();
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "column count 0");
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_counts_above_rows() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(11),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "null_count 11 greater than num_rows 10");
+
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(11),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "distinct_count 11 greater than num_rows 10"
+        );
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_invalid_bounds() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                min_value: Precision::Exact(ScalarValue::Int32(Some(9))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "min_value");
+        assert_contains!(err.to_string(), "greater than max_value");
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_zero_row_values() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                byte_size: Precision::Exact(1),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "zero-row column");
+        assert_contains!(err.to_string(), "byte_size 1");
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_singleton_with_large_ndv() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(0),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                distinct_count: Precision::Exact(2),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "exact singleton bounds");
+    }
+
     #[test]
     fn test_get_value() {
         let exact_precision = Precision::Exact(42);
@@ -1512,7 +1930,7 @@ mod tests {
         let to_precision = |value| Precision::Exact(ScalarValue::Int64(Some(value)));
 
         Statistics::default()
-            .with_num_rows(Precision::Exact(10))
+            .with_num_rows(Precision::Exact(1_000))
             .add_column_statistics(
                 ColumnStatistics::new_unknown()
                     .with_distinct_count(distinct_count)

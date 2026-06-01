@@ -820,7 +820,14 @@ fn merge_input_statistics(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Statistics::try_merge_iter_with_ndv_fallback(stats.iter(), schema, NdvFallback::Sum)
+    let merged = Statistics::try_merge_iter_with_ndv_fallback(
+        stats.iter(),
+        schema,
+        NdvFallback::Sum,
+    )?;
+    #[cfg(debug_assertions)]
+    crate::statistics_assert::assert_union_statistics(&stats, &merged, schema);
+    Ok(merged)
 }
 
 #[cfg(test)]

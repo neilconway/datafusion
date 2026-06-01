@@ -377,7 +377,20 @@ impl ExecutionPlan for CrossJoinExec {
         let right_stats =
             Arc::unwrap_or_clone(self.right.partition_statistics(partition)?);
 
-        Ok(Arc::new(stats_cartesian_product(left_stats, right_stats)))
+        #[cfg(debug_assertions)]
+        let left_stats_for_assert = left_stats.clone();
+        #[cfg(debug_assertions)]
+        let right_stats_for_assert = right_stats.clone();
+
+        let stats = stats_cartesian_product(left_stats, right_stats);
+        #[cfg(debug_assertions)]
+        crate::statistics_assert::assert_cross_join_statistics(
+            &left_stats_for_assert,
+            &right_stats_for_assert,
+            &stats,
+            self.schema().as_ref(),
+        );
+        Ok(Arc::new(stats))
     }
 
     /// Tries to swap the projection with its input [`CrossJoinExec`]. If it can be done,

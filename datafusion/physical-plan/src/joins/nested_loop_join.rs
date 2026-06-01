@@ -717,7 +717,12 @@ impl ExecutionPlan for NestedLoopJoinExec {
             &self.join_schema,
         )?;
 
-        Ok(Arc::new(stats.project(self.projection.as_ref())))
+        let stats = stats.project(self.projection.as_ref());
+        stats.debug_assert_valid_for_schema(
+            &self.schema(),
+            "NestedLoopJoinExec statistics",
+        );
+        Ok(Arc::new(stats))
     }
 
     /// Tries to push `projection` down through `nested_loop_join`. If possible, performs the

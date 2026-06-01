@@ -985,6 +985,38 @@ mod test {
             scan_schema.clone(),
         )?);
 
+        let partial_empty_stat = Statistics {
+            num_rows: Precision::Exact(1),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        assert_eq!(
+            partial_empty_stat,
+            *agg_partial.partition_statistics(Some(0))?
+        );
+        assert_eq!(
+            partial_empty_stat,
+            *agg_partial.partition_statistics(Some(1))?
+        );
+        let partial_full_stat = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        };
+        assert_eq!(partial_full_stat, *agg_partial.partition_statistics(None)?);
+
+        let partitions = execute_stream_partitioned(
+            agg_partial.clone(),
+            Arc::new(TaskContext::default()),
+        )?;
+        let mut partial_row_counts = Vec::new();
+        for partition_stream in partitions.into_iter() {
+            let results: Vec<RecordBatch> = partition_stream.try_collect().await?;
+            partial_row_counts
+                .push(results.iter().map(RecordBatch::num_rows).sum::<usize>());
+        }
+        assert_eq!(partial_row_counts, vec![1, 1]);
+
         let coalesce = Arc::new(CoalescePartitionsExec::new(agg_partial.clone()));
 
         let agg_final = Arc::new(AggregateExec::try_new(

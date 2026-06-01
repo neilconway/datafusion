@@ -32,7 +32,7 @@ use crate::filter_pushdown::{
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::{
-    DisplayFormatType, Distribution, ExecutionPlan, InputOrderMode,
+    ColumnStatistics, DisplayFormatType, Distribution, ExecutionPlan, InputOrderMode,
     SendableRecordBatchStream, Statistics, check_if_same_properties,
 };
 use datafusion_common::config::ConfigOptions;
@@ -1128,7 +1128,11 @@ impl AggregateExec {
     /// - Per-set products are summed across all grouping sets
     /// - Requires NDV stats for ALL active group-by columns; if any lacks stats,
     ///   falls back to `input_rows` (or `Absent` if that is also unknown)
-    fn statistics_inner(&self, child_statistics: &Statistics) -> Result<Statistics> {
+    fn statistics_inner(
+        &self,
+        child_statistics: &Statistics,
+        partition: Option<usize>,
+    ) -> Result<Statistics> {
         // TODO stats: group expressions:
         // - once expressions will be able to compute their own stats, use it here
         // - case where we group by on a column for which with have the `distinct` stat
@@ -1152,38 +1156,45 @@ impl AggregateExec {
 
             column_statistics
         };
-        match self.mode {
-            AggregateMode::Final | AggregateMode::FinalPartitioned
-                if self.group_by.expr.is_empty() =>
-            {
-                let total_byte_size =
-                    Self::calculate_scaled_byte_size(child_statistics, 1);
+        let mut stats = if self.group_by.expr.is_empty() {
+            let output_rows = match self.mode.output_mode() {
+                AggregateOutputMode::Partial => {
+                    if partition.is_some() {
+                        1
+                    } else {
+                        self.cache.output_partitioning().partition_count()
+                    }
+                }
+                AggregateOutputMode::Final => 1,
+            };
+            let total_byte_size =
+                Self::calculate_scaled_byte_size(child_statistics, output_rows);
 
-                Ok(Statistics {
-                    num_rows: Precision::Exact(1),
-                    column_statistics,
-                    total_byte_size,
-                })
+            Statistics {
+                num_rows: Precision::Exact(output_rows),
+                column_statistics,
+                total_byte_size,
             }
-            _ => {
-                let num_rows = self.estimate_num_rows(child_statistics);
+        } else {
+            let num_rows = self.estimate_num_rows(child_statistics);
 
-                let total_byte_size = num_rows
-                    .get_value()
-                    .and_then(|&output_rows| {
-                        Self::calculate_scaled_byte_size(child_statistics, output_rows)
-                            .get_value()
-                            .map(|&bytes| Precision::Inexact(bytes))
-                    })
-                    .unwrap_or(Precision::Absent);
-
-                Ok(Statistics {
-                    num_rows,
-                    column_statistics,
-                    total_byte_size,
+            let total_byte_size = num_rows
+                .get_value()
+                .and_then(|&output_rows| {
+                    Self::calculate_scaled_byte_size(child_statistics, output_rows)
+                        .get_value()
+                        .map(|&bytes| Precision::Inexact(bytes))
                 })
+                .unwrap_or(Precision::Absent);
+
+            Statistics {
+                num_rows,
+                column_statistics,
+                total_byte_size,
             }
-        }
+        };
+        Self::cap_column_counts_at_num_rows(&mut stats.column_statistics, stats.num_rows);
+        Ok(stats)
     }
 
     /// Estimates the output row count for grouped aggregations, combining NDV,
@@ -1265,6 +1276,41 @@ impl AggregateExec {
             total = total.saturating_add(set_product);
         }
         Some(total)
+    }
+
+    fn cap_column_counts_at_num_rows(
+        column_statistics: &mut [ColumnStatistics],
+        num_rows: Precision<usize>,
+    ) {
+        let Some(&rows) = num_rows.get_value() else {
+            return;
+        };
+
+        for column_stats in column_statistics {
+            Self::cap_count_at_num_rows(&mut column_stats.null_count, rows, num_rows);
+            Self::cap_count_at_num_rows(&mut column_stats.distinct_count, rows, num_rows);
+        }
+    }
+
+    fn cap_count_at_num_rows(
+        count: &mut Precision<usize>,
+        rows: usize,
+        num_rows: Precision<usize>,
+    ) {
+        let Some(&count_value) = count.get_value() else {
+            return;
+        };
+        if count_value <= rows {
+            return;
+        }
+
+        *count = match num_rows {
+            Precision::Exact(rows) if matches!(*count, Precision::Exact(_)) => {
+                Precision::Exact(rows)
+            }
+            Precision::Exact(rows) | Precision::Inexact(rows) => Precision::Inexact(rows),
+            Precision::Absent => Precision::Absent,
+        };
     }
 
     /// Check if dynamic filter is possible for the current plan node.
@@ -1614,7 +1660,9 @@ impl ExecutionPlan for AggregateExec {
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let child_statistics = self.input().partition_statistics(partition)?;
-        Ok(Arc::new(self.statistics_inner(&child_statistics)?))
+        Ok(Arc::new(
+            self.statistics_inner(&child_statistics, partition)?,
+        ))
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
@@ -4513,6 +4561,44 @@ mod tests {
             stats.column_statistics[0].distinct_count,
             Precision::Exact(100),
             "distinct_count should be propagated from child for group-by columns"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_aggregate_stats_limit_caps_group_column_distinct_count() -> Result<()> {
+        use datafusion_common::ColumnStatistics;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]));
+
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            total_byte_size: Precision::Inexact(10000),
+            column_statistics: vec![
+                ColumnStatistics {
+                    distinct_count: Precision::Exact(500),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        let agg = build_test_aggregate(
+            &schema,
+            input_stats,
+            simple_group_by(&schema, &["a"]),
+            Some(LimitOptions::new(10)),
+        )?;
+
+        let stats = agg.partition_statistics(None)?;
+        assert_eq!(stats.num_rows, Precision::Inexact(10));
+        assert_eq!(
+            stats.column_statistics[0].distinct_count,
+            Precision::Inexact(10),
+            "group column NDV cannot exceed limited aggregate output rows"
         );
 
         Ok(())

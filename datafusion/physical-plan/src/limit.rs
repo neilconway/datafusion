@@ -383,8 +383,25 @@ impl ExecutionPlan for LocalLimitExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(Some(self.fetch), 0, 1)?))
+        let stats = if let Some(partition) = partition {
+            let stats =
+                Arc::unwrap_or_clone(self.input.partition_statistics(Some(partition))?);
+            stats.with_fetch(Some(self.fetch), 0, 1)?
+        } else if self.cache.output_partitioning().partition_count() == 1 {
+            let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+            stats.with_fetch(Some(self.fetch), 0, 1)?
+        } else {
+            let limited_stats = (0..self.cache.output_partitioning().partition_count())
+                .map(|partition| {
+                    let stats = Arc::unwrap_or_clone(
+                        self.input.partition_statistics(Some(partition))?,
+                    );
+                    stats.with_fetch(Some(self.fetch), 0, 1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Statistics::try_merge_iter(limited_stats.iter(), &self.schema())?
+        };
+        Ok(Arc::new(stats))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -795,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn test_row_number_statistics_for_local_limit() -> Result<()> {
         let row_count = row_number_statistics_for_local_limit(4, 10).await?;
-        assert_eq!(row_count, Precision::Exact(10));
+        assert_eq!(row_count, Precision::Inexact(40));
 
         Ok(())
     }

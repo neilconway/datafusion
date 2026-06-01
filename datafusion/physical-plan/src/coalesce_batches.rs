@@ -216,8 +216,25 @@ impl ExecutionPlan for CoalesceBatchesExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        let stats = if let Some(partition) = partition {
+            let stats =
+                Arc::unwrap_or_clone(self.input.partition_statistics(Some(partition))?);
+            stats.with_fetch(self.fetch, 0, 1)?
+        } else if self.cache.output_partitioning().partition_count() == 1 {
+            let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+            stats.with_fetch(self.fetch, 0, 1)?
+        } else {
+            let limited_stats = (0..self.cache.output_partitioning().partition_count())
+                .map(|partition| {
+                    let stats = Arc::unwrap_or_clone(
+                        self.input.partition_statistics(Some(partition))?,
+                    );
+                    stats.with_fetch(self.fetch, 0, 1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Statistics::try_merge_iter(limited_stats.iter(), &self.schema())?
+        };
+        Ok(Arc::new(stats))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -365,5 +382,41 @@ impl CoalesceBatchesStream {
 impl RecordBatchStream for CoalesceBatchesStream {
     fn schema(&self) -> SchemaRef {
         self.coalescer.schema()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::test::TestMemoryExec;
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::stats::Precision;
+
+    #[expect(deprecated)]
+    #[test]
+    fn test_coalesce_batches_fetch_global_statistics() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![3, 4]))],
+        )?;
+        let input =
+            TestMemoryExec::try_new_exec(&[vec![batch1], vec![batch2]], schema, None)?;
+        let coalesce = CoalesceBatchesExec::new(input, 1024).with_fetch(Some(1));
+
+        let global_stats = coalesce.partition_statistics(None)?;
+        assert_eq!(global_stats.num_rows, Precision::Inexact(2));
+
+        let partition_stats = coalesce.partition_statistics(Some(0))?;
+        assert_eq!(partition_stats.num_rows, Precision::Inexact(1));
+
+        Ok(())
     }
 }

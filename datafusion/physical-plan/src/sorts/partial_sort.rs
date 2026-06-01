@@ -335,7 +335,21 @@ impl ExecutionPlan for PartialSortExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        let input_partition = if self.preserve_partitioning {
+            partition
+        } else {
+            None
+        };
+        let stats =
+            Arc::unwrap_or_clone(self.input.partition_statistics(input_partition)?);
+        let fetch = if partition.is_none() && self.preserve_partitioning {
+            self.fetch.map(|fetch| {
+                fetch.saturating_mul(self.cache.output_partitioning().partition_count())
+            })
+        } else {
+            self.fetch
+        };
+        Ok(Arc::new(stats.with_fetch(fetch, 0, 1)?))
     }
 }
 
@@ -497,6 +511,7 @@ mod tests {
     use arrow::array::*;
     use arrow::compute::SortOptions;
     use arrow::datatypes::*;
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
     use futures::FutureExt;
     use insta::allow_duplicates;
@@ -850,6 +865,11 @@ mod tests {
                     Arc::clone(&partial_sort_exec.input),
                 )
                 .with_fetch(fetch_size),
+            );
+            let stats = partial_sort_exec.partition_statistics(None)?;
+            assert_eq!(
+                stats.num_rows,
+                Precision::Exact(expected_batch_num_rows.iter().sum())
             );
             let result =
                 collect(Arc::new(partial_sort_exec), Arc::clone(&task_ctx)).await?;

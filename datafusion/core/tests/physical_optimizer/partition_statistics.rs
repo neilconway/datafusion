@@ -760,6 +760,10 @@ mod test {
             .collect();
         assert_eq!(*statistics[0], expected_0);
         assert_eq!(*statistics[1], expected_1);
+
+        let global_statistics = local_limit.partition_statistics(None)?;
+        assert_eq!(global_statistics.num_rows, Precision::Exact(2));
+        assert_eq!(global_statistics.total_byte_size, Precision::Inexact(16));
         Ok(())
     }
 

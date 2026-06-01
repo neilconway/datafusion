@@ -195,22 +195,43 @@ impl DataSource for MemorySourceConfig {
         if let Some(partition) = partition {
             // Compute statistics for a specific partition
             if let Some(batches) = self.partitions.get(partition) {
-                Ok(Arc::new(common::compute_record_batch_statistics(
+                let stats = common::compute_record_batch_statistics(
                     from_ref(batches),
                     &self.schema,
                     self.projection.clone(),
-                )))
+                )
+                .with_fetch(self.fetch, 0, 1)?;
+                Ok(Arc::new(stats))
             } else {
                 // Invalid partition index
                 Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)))
             }
+        } else if self.fetch.is_some() && self.partitions.len() > 1 {
+            let limited_stats = self
+                .partitions
+                .iter()
+                .map(|batches| {
+                    common::compute_record_batch_statistics(
+                        from_ref(batches),
+                        &self.schema,
+                        self.projection.clone(),
+                    )
+                    .with_fetch(self.fetch, 0, 1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(Statistics::try_merge_iter(
+                limited_stats.iter(),
+                &self.projected_schema,
+            )?))
         } else {
             // Compute statistics across all partitions
-            Ok(Arc::new(common::compute_record_batch_statistics(
+            let stats = common::compute_record_batch_statistics(
                 &self.partitions,
                 &self.schema,
                 self.projection.clone(),
-            )))
+            )
+            .with_fetch(self.fetch, 0, 1)?;
+            Ok(Arc::new(stats))
         }
     }
 
@@ -879,6 +900,24 @@ mod tests {
             "+---+", "| i |", "+---+", "| 0 |", "| 1 |", "| 2 |", "| 3 |", "+---+",
         ];
         assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[test]
+    fn statistics_with_limit() -> Result<()> {
+        let partitions = vec![vec![batch(10)], vec![batch(10)]];
+        let source =
+            MemorySourceConfig::try_new(&partitions, schema(), None)?.with_limit(Some(4));
+
+        assert_eq!(
+            source.partition_statistics(Some(0))?.num_rows,
+            Precision::Exact(4)
+        );
+        assert_eq!(
+            source.partition_statistics(None)?.num_rows,
+            Precision::Exact(8)
+        );
+
         Ok(())
     }
 

@@ -559,7 +559,7 @@ impl Statistics {
                     // the input estimate: if the input was inexact, the
                     // resulting zero is also inexact.
                     check_num_rows(Some(0), self.num_rows.is_exact().unwrap())
-                } else if nr <= fetch_val && skip == 0 {
+                } else if n_partitions == 1 && nr <= fetch_val && skip == 0 {
                     // If the input does not reach the `fetch` globally, and `skip`
                     // is zero (meaning the input and output are identical), return
                     // input stats as is.
@@ -619,6 +619,7 @@ impl Statistics {
                 };
                 // NDV can never exceed the number of rows
                 if let Some(&rows) = self.num_rows.get_value() {
+                    cs.null_count = cs.null_count.min(&Precision::Inexact(rows));
                     cs.distinct_count = cs.distinct_count.min(&Precision::Inexact(rows));
                 }
                 cs
@@ -2405,6 +2406,31 @@ mod tests {
         assert_eq!(result.num_rows, Precision::Exact(400));
         // Column 1: byte_size 800 * 0.4 = 320, Sum = 320
         assert_eq!(result.total_byte_size, Precision::Inexact(320));
+    }
+
+    #[test]
+    fn test_with_fetch_multi_partition_no_global_limit() {
+        let original_stats = Statistics {
+            num_rows: Precision::Exact(10), // per partition
+            total_byte_size: Precision::Exact(80),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(1))),
+                sum_value: Precision::Exact(ScalarValue::Int64(Some(55))),
+                distinct_count: Precision::Exact(10),
+                byte_size: Precision::Exact(80),
+            }],
+        };
+
+        let result = original_stats.clone().with_fetch(Some(100), 0, 4).unwrap();
+
+        assert_eq!(result.num_rows, Precision::Exact(40));
+        assert_eq!(result.total_byte_size, Precision::Inexact(320));
+        assert_eq!(
+            result.column_statistics[0].byte_size,
+            Precision::Inexact(320)
+        );
     }
 
     #[test]

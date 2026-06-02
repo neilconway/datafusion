@@ -1284,13 +1284,30 @@ impl ExecutionPlan for SortExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let p = if !self.preserve_partitioning() {
-            None
+        let stats = if self.preserve_partitioning()
+            && partition.is_none()
+            && self.cache.output_partitioning().partition_count() > 1
+        {
+            let limited_stats = (0..self.cache.output_partitioning().partition_count())
+                .map(|partition| {
+                    let stats = Arc::unwrap_or_clone(
+                        self.input.partition_statistics(Some(partition))?,
+                    );
+                    stats.with_fetch(self.fetch, 0, 1)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Statistics::try_merge_iter(limited_stats.iter(), &self.schema())?
         } else {
-            partition
+            let input_partition = if self.preserve_partitioning() {
+                partition
+            } else {
+                None
+            };
+            let stats =
+                Arc::unwrap_or_clone(self.input.partition_statistics(input_partition)?);
+            stats.with_fetch(self.fetch, 0, 1)?
         };
-        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(p)?);
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        Ok(Arc::new(stats))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -1443,6 +1460,7 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_common::cast::as_primitive_array;
     use datafusion_common::config::ConfigOptions;
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -2925,6 +2943,35 @@ mod tests {
             input,
         )
         .with_fetch(fetch)
+    }
+
+    #[test]
+    fn test_sort_preserve_partitioning_fetch_global_statistics() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch1 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2]))],
+        )?;
+        let batch2 = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![3, 4]))],
+        )?;
+        let input =
+            TestMemoryExec::try_new_exec(&[vec![batch1], vec![batch2]], schema, None)?;
+        let sort = SortExec::new(
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into(),
+            input,
+        )
+        .with_fetch(Some(1))
+        .with_preserve_partitioning(true);
+
+        let global_stats = sort.partition_statistics(None)?;
+        assert_eq!(global_stats.num_rows, Precision::Inexact(2));
+
+        let partition_stats = sort.partition_statistics(Some(0))?;
+        assert_eq!(partition_stats.num_rows, Precision::Inexact(1));
+
+        Ok(())
     }
 
     #[test]

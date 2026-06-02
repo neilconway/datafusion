@@ -381,7 +381,8 @@ impl ExecutionPlan for SortPreservingMergeExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(None)
+        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -444,7 +445,7 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion_common::test_util::batches_to_string;
-    use datafusion_common::{assert_batches_eq, exec_err};
+    use datafusion_common::{assert_batches_eq, exec_err, stats::Precision};
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -1037,6 +1038,9 @@ mod tests {
         let exec = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None).unwrap();
         let merge =
             Arc::new(SortPreservingMergeExec::new(sort, exec).with_fetch(Some(2)));
+
+        let stats = merge.partition_statistics(None).unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(2));
 
         let collected = collect(merge, task_ctx).await.unwrap();
         assert_eq!(collected.len(), 1);

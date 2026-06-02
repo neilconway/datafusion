@@ -687,7 +687,7 @@ impl ProjectionExprs {
                     ColumnStatistics {
                         min_value: Precision::Exact(literal.value().clone()),
                         max_value: Precision::Exact(literal.value().clone()),
-                        distinct_count: Precision::Exact(1),
+                        distinct_count: Precision::Exact(0),
                         null_count,
                         sum_value: Precision::Exact(literal.value().clone()),
                         byte_size: Precision::Exact(0),
@@ -747,8 +747,8 @@ impl ProjectionExprs {
             };
             column_statistics.push(col_stats);
         }
-        stats.calculate_total_byte_size(output_schema);
         stats.column_statistics = column_statistics;
+        stats.total_byte_size = project_total_byte_size(&stats, output_schema);
         stats.debug_assert_valid_for_schema(
             output_schema,
             "ProjectionExprs::project_statistics",
@@ -757,6 +757,30 @@ impl ProjectionExprs {
         debug_assert_projection_statistics(&input_stats, self, &stats);
         Ok(stats)
     }
+}
+
+fn project_total_byte_size(
+    stats: &Statistics,
+    output_schema: &Schema,
+) -> Precision<usize> {
+    stats
+        .column_statistics
+        .iter()
+        .zip(output_schema.fields())
+        .map(|(column_stats, field)| {
+            if column_stats.byte_size != Precision::Absent {
+                column_stats.byte_size
+            } else if let Some(width) = field.data_type().primitive_width() {
+                stats.num_rows.multiply(&Precision::Exact(width))
+            } else {
+                Precision::Absent
+            }
+        })
+        .try_fold(Precision::Exact(0), |acc, byte_size| match byte_size {
+            Precision::Absent => None,
+            _ => Some(acc.add(&byte_size)),
+        })
+        .unwrap_or(Precision::Absent)
 }
 
 #[cfg(debug_assertions)]
@@ -809,21 +833,46 @@ fn validate_projection_statistics(
                     );
                 }
                 if output_col_stats.distinct_count != input_col_stats.distinct_count {
-                    return plan_err!(
-                        "Projection cast at output index {idx} changed distinct_count from {} to {}",
-                        input_col_stats.distinct_count,
-                        output_col_stats.distinct_count
+                    let expected_distinct_count = project_cast_distinct_count(
+                        input_col_stats,
+                        &output_col_stats.min_value,
+                        &output_col_stats.max_value,
+                        cast.cast_type(),
                     );
+                    if output_col_stats.distinct_count != expected_distinct_count {
+                        return plan_err!(
+                            "Projection cast at output index {idx} produced distinct_count {}, expected {}",
+                            output_col_stats.distinct_count,
+                            expected_distinct_count
+                        );
+                    }
                 }
             }
         } else if let Some(literal) = proj_expr.expr.downcast_ref::<Literal>()
-            && !literal.value().is_null()
             && input_stats
                 .num_rows
                 .get_value()
                 .is_some_and(|rows| *rows > 0)
         {
             let literal_value = literal.value();
+            if literal_value.is_null() {
+                let Some(&rows) = input_stats.num_rows.get_value() else {
+                    continue;
+                };
+                if output_col_stats.min_value == Precision::Exact(literal_value.clone())
+                    && output_col_stats.max_value
+                        == Precision::Exact(literal_value.clone())
+                    && output_col_stats.distinct_count == Precision::Exact(0)
+                    && output_col_stats.null_count == Precision::Exact(rows)
+                {
+                    continue;
+                }
+
+                return plan_err!(
+                    "Projection literal at output index {idx} did not produce all-null statistics"
+                );
+            }
+
             if output_col_stats.min_value == Precision::Exact(literal_value.clone())
                 && output_col_stats.max_value == Precision::Exact(literal_value.clone())
                 && output_col_stats.distinct_count == Precision::Exact(1)
@@ -872,20 +921,116 @@ fn project_column_statistics_through_expr(
     let inner_stats =
         project_column_statistics_through_expr(cast_expr.expr.as_ref(), column_stats);
     let target_type = cast_expr.cast_type();
+    let min_value = inner_stats
+        .min_value
+        .cast_to(target_type)
+        .unwrap_or(Precision::Absent);
+    let max_value = inner_stats
+        .max_value
+        .cast_to(target_type)
+        .unwrap_or(Precision::Absent);
+    let distinct_count =
+        project_cast_distinct_count(&inner_stats, &min_value, &max_value, target_type);
+
     ColumnStatistics {
-        min_value: inner_stats
-            .min_value
-            .cast_to(target_type)
-            .unwrap_or(Precision::Absent),
-        max_value: inner_stats
-            .max_value
-            .cast_to(target_type)
-            .unwrap_or(Precision::Absent),
+        min_value,
+        max_value,
         null_count: inner_stats.null_count,
-        distinct_count: inner_stats.distinct_count,
+        distinct_count,
         sum_value: Precision::Absent,
         byte_size: Precision::Absent,
     }
+}
+
+fn project_cast_distinct_count(
+    inner_stats: &ColumnStatistics,
+    min_value: &Precision<ScalarValue>,
+    max_value: &Precision<ScalarValue>,
+    target_type: &DataType,
+) -> Precision<usize> {
+    if exact_non_null_singleton_bounds(min_value, max_value)
+        && inner_stats.null_count == Precision::Exact(0)
+    {
+        return Precision::Exact(1);
+    }
+
+    if cast_preserves_exact_distinct_count(inner_stats, target_type) {
+        inner_stats.distinct_count
+    } else {
+        inner_stats.distinct_count.to_inexact()
+    }
+}
+
+fn exact_non_null_singleton_bounds(
+    min_value: &Precision<ScalarValue>,
+    max_value: &Precision<ScalarValue>,
+) -> bool {
+    matches!(
+        (min_value, max_value),
+        (Precision::Exact(min), Precision::Exact(max))
+            if !min.is_null() && min == max
+    )
+}
+
+fn cast_preserves_exact_distinct_count(
+    inner_stats: &ColumnStatistics,
+    target_type: &DataType,
+) -> bool {
+    let Some(source_type) = scalar_stat_data_type(inner_stats) else {
+        return false;
+    };
+    exact_distinct_preserving_cast(&source_type, target_type)
+}
+
+fn scalar_stat_data_type(stats: &ColumnStatistics) -> Option<DataType> {
+    stats
+        .min_value
+        .get_value()
+        .or_else(|| stats.max_value.get_value())
+        .map(ScalarValue::data_type)
+        .filter(|data_type| *data_type != DataType::Null)
+}
+
+fn exact_distinct_preserving_cast(
+    source_type: &DataType,
+    target_type: &DataType,
+) -> bool {
+    use DataType::*;
+
+    if source_type == target_type {
+        return true;
+    }
+
+    match (source_type, target_type) {
+        (Int8, Int16 | Int32 | Int64)
+        | (Int16, Int32 | Int64)
+        | (Int32, Int64)
+        | (UInt8, UInt16 | UInt32 | UInt64)
+        | (UInt16, UInt32 | UInt64)
+        | (UInt32, UInt64)
+        | (Utf8, LargeUtf8)
+        | (Binary, LargeBinary)
+        | (Date32, Date64)
+        | (Time32(_), Time64(_)) => true,
+        (Timestamp(source_unit, source_tz), Timestamp(target_unit, target_tz)) => {
+            source_tz == target_tz && time_unit_widens(source_unit, target_unit)
+        }
+        _ => false,
+    }
+}
+
+fn time_unit_widens(
+    source_unit: &arrow::datatypes::TimeUnit,
+    target_unit: &arrow::datatypes::TimeUnit,
+) -> bool {
+    use arrow::datatypes::TimeUnit::*;
+
+    matches!(
+        (source_unit, target_unit),
+        (Second, Millisecond | Microsecond | Nanosecond)
+            | (Millisecond, Microsecond | Nanosecond)
+            | (Microsecond, Nanosecond)
+    )
 }
 
 impl<'a> IntoIterator for &'a ProjectionExprs {
@@ -2961,12 +3106,59 @@ pub(crate) mod tests {
             ColumnStatistics {
                 min_value: Precision::Exact(ScalarValue::Int32(Some(-4))),
                 max_value: Precision::Exact(ScalarValue::Int32(Some(21))),
-                distinct_count: Precision::Exact(5),
+                distinct_count: Precision::Inexact(5),
                 null_count: Precision::Exact(0),
                 sum_value: Precision::Absent,
                 byte_size: Precision::Absent,
             }
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_cast_collapses_distinct_count() -> Result<()> {
+        let input_schema =
+            Schema::new(vec![Field::new("col0", DataType::Float64, false)]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(2),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                distinct_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Float64(Some(1.2))),
+                min_value: Precision::Exact(ScalarValue::Float64(Some(1.1))),
+                sum_value: Precision::Absent,
+                null_count: Precision::Exact(0),
+                byte_size: Precision::Absent,
+            }],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(CastExpr::new(
+                Arc::new(Column::new("col0", 0)),
+                DataType::Int64,
+                None,
+            )),
+            alias: "casted".to_string(),
+        }]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].min_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(1)))
+        );
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Exact(1)
+        );
+
         Ok(())
     }
 
@@ -3084,6 +3276,85 @@ pub(crate) mod tests {
 
         // Should have 2 column statistics
         assert_eq!(output_stats.column_statistics.len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_sums_projected_complex_column_byte_sizes() -> Result<()> {
+        let input_schema = Schema::new(vec![
+            Field::new("col0", DataType::Utf8, false),
+            Field::new("col1", DataType::Utf8, false),
+        ]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Exact(30),
+            column_statistics: vec![
+                ColumnStatistics {
+                    byte_size: Precision::Exact(10),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics {
+                    byte_size: Precision::Exact(20),
+                    ..ColumnStatistics::new_unknown()
+                },
+            ],
+        };
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(Column::new("col1", 1)),
+            alias: "col1".to_string(),
+        }]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(output_stats.total_byte_size, Precision::Exact(20));
+        assert_eq!(
+            output_stats.column_statistics[0].byte_size,
+            Precision::Exact(20)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_combines_column_and_primitive_byte_sizes() -> Result<()> {
+        let input_schema = Schema::new(vec![
+            Field::new("col0", DataType::Utf8, false),
+            Field::new("col1", DataType::Int64, false),
+        ]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(5),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics {
+                    byte_size: Precision::Exact(20),
+                    ..ColumnStatistics::new_unknown()
+                },
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+
+        let projection = ProjectionExprs::new(vec![
+            ProjectionExpr {
+                expr: Arc::new(Column::new("col0", 0)),
+                alias: "col0".to_string(),
+            },
+            ProjectionExpr {
+                expr: Arc::new(Column::new("col1", 1)),
+                alias: "col1".to_string(),
+            },
+        ]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(output_stats.total_byte_size, Precision::Exact(60));
 
         Ok(())
     }
@@ -3280,7 +3551,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             output_stats.column_statistics[0].distinct_count,
-            Precision::Exact(1) // All NULLs are considered the same
+            Precision::Exact(0)
         );
         assert_eq!(
             output_stats.column_statistics[0].null_count,

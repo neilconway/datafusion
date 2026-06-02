@@ -380,7 +380,8 @@ impl FilterExec {
             );
             (selectivity, filtered_num_rows, cs)
         };
-        cap_distinct_counts_at_num_rows(&mut column_statistics, num_rows);
+        cap_column_counts_at_num_rows(&mut column_statistics, num_rows);
+        scale_column_byte_sizes(&mut column_statistics, selectivity);
 
         let total_byte_size =
             input_total_byte_size.with_estimated_selectivity(selectivity);
@@ -941,7 +942,7 @@ fn collect_new_statistics(
         .collect()
 }
 
-fn cap_distinct_counts_at_num_rows(
+fn cap_column_counts_at_num_rows(
     column_statistics: &mut [ColumnStatistics],
     num_rows: Precision<usize>,
 ) {
@@ -950,20 +951,39 @@ fn cap_distinct_counts_at_num_rows(
     };
 
     for column_stats in column_statistics {
-        let Some(&distinct_count) = column_stats.distinct_count.get_value() else {
-            continue;
-        };
-        if distinct_count <= rows {
-            continue;
-        }
+        cap_count_at_num_rows(&mut column_stats.null_count, rows, num_rows);
+        cap_count_at_num_rows(&mut column_stats.distinct_count, rows, num_rows);
+    }
+}
 
-        column_stats.distinct_count = match num_rows {
+fn cap_count_at_num_rows(
+    count: &mut Precision<usize>,
+    rows: usize,
+    num_rows: Precision<usize>,
+) {
+    let Some(&count_value) = count.get_value() else {
+        return;
+    };
+    if count_value <= rows {
+        return;
+    }
+
+    *count = match num_rows {
+        Precision::Exact(rows) if matches!(*count, Precision::Exact(_)) => {
             Precision::Exact(rows)
-                if matches!(column_stats.distinct_count, Precision::Exact(_)) =>
-            {
-                Precision::Exact(rows)
+        }
+        Precision::Exact(rows) | Precision::Inexact(rows) => Precision::Inexact(rows),
+        Precision::Absent => Precision::Absent,
+    };
+}
+
+fn scale_column_byte_sizes(column_statistics: &mut [ColumnStatistics], selectivity: f64) {
+    for column_stats in column_statistics {
+        column_stats.byte_size = match column_stats.byte_size {
+            Precision::Exact(0) if selectivity == 0.0 => Precision::Exact(0),
+            Precision::Exact(size) | Precision::Inexact(size) => {
+                Precision::Inexact((size as f64 * selectivity) as usize)
             }
-            Precision::Exact(rows) | Precision::Inexact(rows) => Precision::Inexact(rows),
             Precision::Absent => Precision::Absent,
         };
     }
@@ -2681,6 +2701,58 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_caps_null_count_and_scales_column_bytes() -> Result<()>
+    {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(100),
+                total_byte_size: Precision::Inexact(1000),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Inexact(80),
+                    distinct_count: Precision::Inexact(80),
+                    byte_size: Precision::Exact(400),
+                    ..ColumnStatistics::new_unknown()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("name", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("a".to_string())))),
+            )),
+            Operator::Or,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("name", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
+            )),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+        let statistics = filter.partition_statistics(None)?;
+
+        assert_eq!(statistics.num_rows, Precision::Inexact(20));
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Inexact(20)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].distinct_count,
+            Precision::Inexact(20)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(80)
+        );
+
         Ok(())
     }
 

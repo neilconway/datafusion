@@ -617,7 +617,7 @@ impl Statistics {
                 ..
             } => {
                 // Here, the inexact case gives us an estimate of the number of rows.
-                if nr <= fetch_val && skip == 0 {
+                if n_partitions == 1 && nr <= fetch_val && skip == 0 {
                     // If the input does not reach the `fetch` globally, and `skip`
                     // is zero (meaning the input and output are identical), return
                     // input stats as is.
@@ -891,8 +891,8 @@ fn validate_column_statistics(
     )?;
     validate_sum_value_type(idx, field.name(), &column_stats.sum_value, field_type)?;
 
-    if let (Some(rows), Some(&null_count)) =
-        (exact_num_rows, column_stats.null_count.get_value())
+    if let (Some(rows), Precision::Exact(null_count)) =
+        (exact_num_rows, column_stats.null_count)
         && null_count > rows
     {
         return _plan_err!(
@@ -901,12 +901,25 @@ fn validate_column_statistics(
         );
     }
 
-    if let (Some(rows), Some(&distinct_count)) =
-        (exact_num_rows, column_stats.distinct_count.get_value())
+    if let (Some(rows), Precision::Exact(distinct_count)) =
+        (exact_num_rows, column_stats.distinct_count)
         && distinct_count > rows
     {
         return _plan_err!(
             "Statistics for column {idx} ({}) has distinct_count {distinct_count} greater than num_rows {rows}",
+            field.name()
+        );
+    }
+
+    if let (Some(rows), Precision::Exact(null_count), Precision::Exact(distinct_count)) = (
+        exact_num_rows,
+        column_stats.null_count,
+        column_stats.distinct_count,
+    ) && null_count == rows
+        && distinct_count != 0
+    {
+        return _plan_err!(
+            "Statistics for column {idx} ({}) has distinct_count {distinct_count} for all-null column",
             field.name()
         );
     }
@@ -971,7 +984,7 @@ fn validate_column_statistics(
             && min == max
             && singleton_bounds_imply_single_distinct(field_type)
             && column_stats.null_count == Precision::Exact(0)
-            && let Some(&distinct_count) = column_stats.distinct_count.get_value()
+            && let Precision::Exact(distinct_count) = column_stats.distinct_count
             && distinct_count > 1
         {
             return _plan_err!(
@@ -1114,8 +1127,9 @@ fn validate_fetch_statistics(
 ) -> Result<()> {
     if let (Some(input_rows), Some(output_rows)) =
         (input.num_rows.get_value(), output.num_rows.get_value())
-        && output_rows > input_rows
+        && output_rows > &input_rows.saturating_mul(n_partitions)
     {
+        let input_rows = input_rows.saturating_mul(n_partitions);
         return _plan_err!(
             "Fetch statistics increased row count from {input_rows} to {output_rows}"
         );
@@ -1130,7 +1144,8 @@ fn validate_fetch_statistics(
         }
     }
 
-    if skip == 0
+    if n_partitions == 1
+        && skip == 0
         && let (Some(fetch), Some(&input_rows)) = (fetch, input.num_rows.get_value())
         && input_rows <= fetch
         && output != input
@@ -1605,6 +1620,32 @@ mod tests {
             err.to_string(),
             "distinct_count 11 greater than num_rows 10"
         );
+
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Inexact(11),
+                distinct_count: Precision::Inexact(11),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        stats.validate_for_schema(&one_i32_schema()).unwrap();
+    }
+
+    #[test]
+    fn test_statistics_validate_for_schema_rejects_all_null_distinct_count() {
+        let stats = Statistics {
+            num_rows: Precision::Exact(10),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(10),
+                distinct_count: Precision::Exact(1),
+                ..ColumnStatistics::new_unknown()
+            }],
+        };
+        let err = stats.validate_for_schema(&one_i32_schema()).unwrap_err();
+        assert_contains!(err.to_string(), "all-null column");
     }
 
     #[test]
@@ -2941,6 +2982,31 @@ mod tests {
         assert_eq!(result.num_rows, Precision::Exact(400));
         // Column 1: byte_size 800 * 0.4 = 320, Sum = 320
         assert_eq!(result.total_byte_size, Precision::Inexact(320));
+    }
+
+    #[test]
+    fn test_with_fetch_multi_partition_no_global_limit() {
+        let original_stats = Statistics {
+            num_rows: Precision::Exact(10), // per partition
+            total_byte_size: Precision::Exact(80),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(2),
+                max_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+                min_value: Precision::Exact(ScalarValue::Int64(Some(1))),
+                sum_value: Precision::Exact(ScalarValue::Int64(Some(55))),
+                distinct_count: Precision::Exact(10),
+                byte_size: Precision::Exact(80),
+            }],
+        };
+
+        let result = original_stats.clone().with_fetch(Some(100), 0, 4).unwrap();
+
+        assert_eq!(result.num_rows, Precision::Exact(40));
+        assert_eq!(result.total_byte_size, Precision::Inexact(320));
+        assert_eq!(
+            result.column_statistics[0].byte_size,
+            Precision::Inexact(320)
+        );
     }
 
     #[test]

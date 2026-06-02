@@ -510,17 +510,22 @@ fn estimate_join_cardinality(
 
     match join_type {
         JoinType::Inner | JoinType::Left | JoinType::Right | JoinType::Full => {
+            let left_join_key_stats = Statistics {
+                num_rows: left_stats.num_rows,
+                total_byte_size: Precision::Absent,
+                column_statistics: left_col_stats,
+            };
+            let right_join_key_stats = Statistics {
+                num_rows: right_stats.num_rows,
+                total_byte_size: Precision::Absent,
+                column_statistics: right_col_stats,
+            };
+            let inputs_are_disjoint =
+                estimate_disjoint_inputs(&left_join_key_stats, &right_join_key_stats)
+                    .is_some();
             let ij_cardinality = estimate_inner_join_cardinality(
-                Statistics {
-                    num_rows: left_stats.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: left_col_stats,
-                },
-                Statistics {
-                    num_rows: right_stats.num_rows,
-                    total_byte_size: Precision::Absent,
-                    column_statistics: right_col_stats,
-                },
+                left_join_key_stats,
+                right_join_key_stats,
             )?;
 
             // The cardinality for inner join can also be used to estimate
@@ -544,11 +549,12 @@ fn estimate_join_cardinality(
                 // statistics which might yield subpar results (although it is
                 // true, esp regarding min/max). For a better estimation, we need
                 // filter selectivity analysis first.
-                column_statistics: left_stats
-                    .column_statistics
-                    .into_iter()
-                    .chain(right_stats.column_statistics)
-                    .collect(),
+                column_statistics: join_column_statistics_for_all_column_join(
+                    join_type,
+                    inputs_are_disjoint,
+                    left_stats,
+                    right_stats,
+                ),
             })
         }
 
@@ -617,6 +623,89 @@ fn estimate_join_cardinality(
             })
         }
     }
+}
+
+fn join_column_statistics_for_all_column_join(
+    join_type: &JoinType,
+    inputs_are_disjoint: bool,
+    left_stats: Statistics,
+    right_stats: Statistics,
+) -> Vec<ColumnStatistics> {
+    if !inputs_are_disjoint {
+        return left_stats
+            .column_statistics
+            .into_iter()
+            .chain(right_stats.column_statistics)
+            .collect();
+    }
+
+    match join_type {
+        JoinType::Left => {
+            let left_rows = left_stats.num_rows;
+            left_stats
+                .column_statistics
+                .into_iter()
+                .chain(all_null_column_statistics(
+                    right_stats.column_statistics.len(),
+                    left_rows,
+                ))
+                .collect()
+        }
+        JoinType::Right => {
+            let right_rows = right_stats.num_rows;
+            all_null_column_statistics(left_stats.column_statistics.len(), right_rows)
+                .chain(right_stats.column_statistics)
+                .collect()
+        }
+        JoinType::Full => {
+            let left_rows = left_stats.num_rows;
+            let right_rows = right_stats.num_rows;
+            left_stats
+                .column_statistics
+                .into_iter()
+                .map(|stats| add_padded_nulls(stats, right_rows))
+                .chain(
+                    right_stats
+                        .column_statistics
+                        .into_iter()
+                        .map(|stats| add_padded_nulls(stats, left_rows)),
+                )
+                .collect()
+        }
+        JoinType::Inner => left_stats
+            .column_statistics
+            .into_iter()
+            .chain(right_stats.column_statistics)
+            .collect(),
+        _ => unreachable!(),
+    }
+}
+
+fn all_null_column_statistics(
+    len: usize,
+    num_rows: Precision<usize>,
+) -> impl Iterator<Item = ColumnStatistics> {
+    std::iter::repeat_with(move || ColumnStatistics {
+        null_count: num_rows,
+        max_value: Precision::Absent,
+        min_value: Precision::Absent,
+        sum_value: Precision::Absent,
+        distinct_count: num_rows.map(|_| 0),
+        byte_size: num_rows.map(|_| 0),
+    })
+    .take(len)
+}
+
+fn add_padded_nulls(
+    mut stats: ColumnStatistics,
+    padded_rows: Precision<usize>,
+) -> ColumnStatistics {
+    stats.null_count = match (stats.null_count, padded_rows) {
+        (Precision::Absent, Precision::Exact(rows))
+        | (Precision::Absent, Precision::Inexact(rows)) => Precision::Inexact(rows),
+        (null_count, padded_rows) => null_count.add(&padded_rows),
+    };
+    stats
 }
 
 /// Estimate the inner join cardinality by using the basic building blocks of
@@ -2795,9 +2884,43 @@ mod tests {
             )
             .unwrap();
             assert_eq!(partial_join_stats.num_rows, expected_num_rows);
+
+            let all_null_stats = |rows| ColumnStatistics {
+                null_count: Exact(rows),
+                distinct_count: Exact(0),
+                byte_size: Exact(0),
+                ..ColumnStatistics::new_unknown()
+            };
+            let expected_column_statistics = match join_type {
+                JoinType::Inner => {
+                    [left_col_stats.clone(), right_col_stats.clone()].concat()
+                }
+                JoinType::Left => left_col_stats
+                    .clone()
+                    .into_iter()
+                    .chain(std::iter::repeat_with(|| all_null_stats(1000)).take(3))
+                    .collect(),
+                JoinType::Right => std::iter::repeat_with(|| all_null_stats(2000))
+                    .take(3)
+                    .chain(right_col_stats.clone())
+                    .collect(),
+                JoinType::Full => left_col_stats
+                    .clone()
+                    .into_iter()
+                    .map(|mut stats| {
+                        stats.null_count = Inexact(2000);
+                        stats
+                    })
+                    .chain(right_col_stats.clone().into_iter().map(|mut stats| {
+                        stats.null_count = Inexact(1000);
+                        stats
+                    }))
+                    .collect(),
+                _ => unreachable!(),
+            };
             assert_eq!(
-                partial_join_stats.column_statistics,
-                [left_col_stats.clone(), right_col_stats.clone()].concat()
+                partial_join_stats.column_statistics, expected_column_statistics,
+                "join_type={join_type:?}"
             );
         }
 

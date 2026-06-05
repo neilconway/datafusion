@@ -381,7 +381,12 @@ impl ExecutionPlan for SortPreservingMergeExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(None)
+        let Some(fetch) = self.fetch else {
+            return self.input.partition_statistics(None);
+        };
+
+        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+        Ok(Arc::new(stats.with_fetch(Some(fetch), 0, 1)?))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -433,7 +438,9 @@ mod tests {
     use crate::sorts::sort::SortExec;
     use crate::stream::RecordBatchReceiverStream;
     use crate::test::TestMemoryExec;
-    use crate::test::exec::{BlockingExec, assert_strong_count_converges_to_zero};
+    use crate::test::exec::{
+        BlockingExec, StatisticsExec, assert_strong_count_converges_to_zero,
+    };
     use crate::test::{self, assert_is_pending, make_partition};
     use crate::{collect, common};
 
@@ -443,8 +450,11 @@ mod tests {
     };
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
-    use datafusion_common::{assert_batches_eq, exec_err};
+    use datafusion_common::{
+        ColumnStatistics, ScalarValue, Statistics, assert_batches_eq, exec_err,
+    };
     use datafusion_common_runtime::SpawnedTask;
     use datafusion_execution::RecordBatchStream;
     use datafusion_execution::config::SessionConfig;
@@ -1049,6 +1059,60 @@ mod tests {
         | 2 | b |
         +---+---+
         ");
+    }
+
+    #[test]
+    fn test_sort_preserving_merge_statistics_with_fetch() -> Result<()> {
+        let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 7, 9, 3]));
+        let b: ArrayRef = Arc::new(StringArray::from(vec!["a", "b", "c", "d", "e"]));
+        let batch = RecordBatch::try_from_iter(vec![("a", a), ("b", b)])?;
+        let schema = batch.schema();
+
+        let sort = [PhysicalSortExpr {
+            expr: col("b", &schema)?,
+            options: SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+        }]
+        .into();
+        let exec = TestMemoryExec::try_new_exec(&[vec![batch]], schema, None)?;
+        let merge = SortPreservingMergeExec::new(sort, exec).with_fetch(Some(2));
+
+        assert_eq!(
+            merge.partition_statistics(None)?.num_rows,
+            Precision::Exact(2)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_sort_preserving_merge_statistics_without_fetch_is_passthrough() -> Result<()>
+    {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+        let input_stats = Statistics {
+            num_rows: Precision::Absent,
+            total_byte_size: Precision::Exact(1024),
+            column_statistics: vec![ColumnStatistics {
+                null_count: Precision::Exact(1),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(9))),
+                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                sum_value: Precision::Exact(ScalarValue::Int64(Some(10))),
+                distinct_count: Precision::Exact(2),
+                byte_size: Precision::Exact(512),
+            }],
+        };
+        let input: Arc<dyn ExecutionPlan> = Arc::new(StatisticsExec::new(
+            input_stats.clone(),
+            schema.as_ref().clone(),
+        ));
+        let sort = [PhysicalSortExpr::new_default(Arc::new(Column::new("a", 0)))].into();
+        let merge = SortPreservingMergeExec::new(sort, input);
+
+        assert_eq!(*merge.partition_statistics(None)?, input_stats);
+
+        Ok(())
     }
 
     #[tokio::test]

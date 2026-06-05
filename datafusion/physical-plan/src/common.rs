@@ -22,6 +22,7 @@ use std::fs::metadata;
 use std::sync::Arc;
 
 use super::SendableRecordBatchStream;
+use crate::execution_plan::ExecutionPlanProperties;
 use crate::expressions::{CastExpr, Column};
 use crate::projection::{ProjectionExec, ProjectionExpr};
 use crate::stream::RecordBatchReceiverStream;
@@ -42,6 +43,121 @@ pub(crate) type SharedMemoryReservation = Arc<MemoryReservation>;
 /// Create a vector of record batches from a stream
 pub async fn collect(stream: SendableRecordBatchStream) -> Result<Vec<RecordBatch>> {
     stream.try_collect::<Vec<_>>().await
+}
+
+/// Apply a per-partition fetch limit to an input plan's statistics.
+///
+/// For aggregate statistics, this limits each input partition independently and
+/// then merges the results, matching operators where `fetch` is enforced per
+/// output partition.
+pub fn apply_per_partition_fetch_statistics(
+    input: &Arc<dyn ExecutionPlan>,
+    partition: Option<usize>,
+    fetch: Option<usize>,
+) -> Result<Arc<Statistics>> {
+    let Some(fetch) = fetch else {
+        return input.partition_statistics(partition);
+    };
+
+    let aggregate_stats = Arc::unwrap_or_clone(input.partition_statistics(None)?);
+    let exact_aggregate_rows = match &aggregate_stats.num_rows {
+        Precision::Exact(rows) => Some(*rows),
+        _ => None,
+    };
+
+    let limit_partition = |partition| {
+        let stats = Arc::unwrap_or_clone(input.partition_statistics(Some(partition))?);
+        stats.with_fetch(Some(fetch), 0, 1)
+    };
+
+    match partition {
+        Some(partition) => {
+            let stats = limit_partition(partition)?;
+            Ok(Arc::new(clamp_statistics_to_row_cap(
+                stats,
+                exact_aggregate_rows.map(|rows| rows.min(fetch)),
+            )?))
+        }
+        None => {
+            let partition_count = input.output_partitioning().partition_count();
+            if partition_count == 0 {
+                return Ok(Arc::new(aggregate_stats.with_fetch(Some(fetch), 0, 0)?));
+            }
+
+            if exact_aggregate_rows.is_some_and(|rows| rows <= fetch) {
+                return Ok(Arc::new(aggregate_stats));
+            }
+
+            let partition_stats = (0..partition_count)
+                .map(limit_partition)
+                .collect::<Result<Vec<_>>>()?;
+            let stats = Statistics::try_merge_iter(
+                partition_stats.iter(),
+                input.schema().as_ref(),
+            )?;
+            let fetch_cap = fetch.checked_mul(partition_count);
+            let row_cap = match (fetch_cap, exact_aggregate_rows) {
+                (Some(fetch_cap), Some(rows)) => Some(fetch_cap.min(rows)),
+                (Some(fetch_cap), None) => Some(fetch_cap),
+                (None, Some(rows)) => Some(rows),
+                (None, None) => None,
+            };
+            Ok(Arc::new(clamp_statistics_to_row_cap(stats, row_cap)?))
+        }
+    }
+}
+
+fn clamp_statistics_to_row_cap(
+    stats: Statistics,
+    row_cap: Option<usize>,
+) -> Result<Statistics> {
+    let Some(row_cap) = row_cap else {
+        return Ok(stats);
+    };
+
+    let should_cap = match stats.num_rows.get_value() {
+        Some(rows) => *rows > row_cap,
+        None => true,
+    };
+
+    if should_cap {
+        stats.with_fetch(Some(row_cap), 0, 1)
+    } else {
+        Ok(stats)
+    }
+}
+
+/// Computes record batch statistics, applying `fetch` independently to each
+/// partition before merging aggregate statistics.
+pub fn compute_record_batch_statistics_with_fetch(
+    batches: &[Vec<RecordBatch>],
+    schema: &Schema,
+    projected_schema: &Schema,
+    projection: Option<Vec<usize>>,
+    fetch: Option<usize>,
+) -> Result<Statistics> {
+    if fetch.is_none() {
+        return Ok(compute_record_batch_statistics(batches, schema, projection));
+    }
+
+    if batches.is_empty() {
+        return compute_record_batch_statistics(batches, schema, projection)
+            .with_fetch(fetch, 0, 0);
+    }
+
+    let partition_stats = batches
+        .iter()
+        .map(|batches| {
+            compute_record_batch_statistics(
+                std::slice::from_ref(batches),
+                schema,
+                projection.clone(),
+            )
+            .with_fetch(fetch, 0, 1)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Statistics::try_merge_iter(partition_stats.iter(), projected_schema)
 }
 
 /// Recursively builds a list of files in a directory with a given extension

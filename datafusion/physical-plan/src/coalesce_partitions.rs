@@ -232,8 +232,12 @@ impl ExecutionPlan for CoalescePartitionsExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let Some(fetch) = self.fetch else {
+            return self.input.partition_statistics(None);
+        };
+
         let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        Ok(Arc::new(stats.with_fetch(Some(fetch), 0, 1)?))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -241,7 +245,11 @@ impl ExecutionPlan for CoalescePartitionsExec {
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
+        if self.fetch.is_none() {
+            CardinalityEffect::Equal
+        } else {
+            CardinalityEffect::LowerEqual
+        }
     }
 
     /// Tries to swap `projection` with its input, which is known to be a

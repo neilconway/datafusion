@@ -23,6 +23,7 @@ use std::task::{Context, Poll};
 
 use super::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use super::{DisplayAs, ExecutionPlanProperties, PlanProperties, Statistics};
+use crate::common::apply_per_partition_fetch_statistics;
 use crate::projection::ProjectionExec;
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
@@ -216,8 +217,11 @@ impl ExecutionPlan for CoalesceBatchesExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+        if self.fetch.is_some() {
+            apply_per_partition_fetch_statistics(&self.input, partition, self.fetch)
+        } else {
+            self.input.partition_statistics(partition)
+        }
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
@@ -235,7 +239,11 @@ impl ExecutionPlan for CoalesceBatchesExec {
     }
 
     fn cardinality_effect(&self) -> CardinalityEffect {
-        CardinalityEffect::Equal
+        if self.fetch.is_none() {
+            CardinalityEffect::Equal
+        } else {
+            CardinalityEffect::LowerEqual
+        }
     }
 
     fn try_swapping_with_projection(
@@ -365,5 +373,43 @@ impl CoalesceBatchesStream {
 impl RecordBatchStream for CoalesceBatchesStream {
     fn schema(&self) -> SchemaRef {
         self.coalescer.schema()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::{self, TestMemoryExec};
+
+    use datafusion_common::stats::Precision;
+
+    #[test]
+    #[expect(deprecated)]
+    fn test_statistics_with_fetch_limits_each_partition() -> Result<()> {
+        let batches = vec![
+            vec![test::make_partition(20)],
+            vec![test::make_partition(5)],
+        ];
+        let schema = batches[0][0].schema();
+        let input = Arc::new(
+            TestMemoryExec::try_new(&batches, schema, None)?
+                .with_partition_statistics(true),
+        );
+        let coalesce = CoalesceBatchesExec::new(input, 1024).with_fetch(Some(10));
+
+        assert_eq!(
+            coalesce.partition_statistics(Some(0))?.num_rows,
+            Precision::Exact(10)
+        );
+        assert_eq!(
+            coalesce.partition_statistics(Some(1))?.num_rows,
+            Precision::Exact(5)
+        );
+        assert_eq!(
+            coalesce.partition_statistics(None)?.num_rows,
+            Precision::Exact(15)
+        );
+
+        Ok(())
     }
 }

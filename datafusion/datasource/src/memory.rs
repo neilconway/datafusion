@@ -195,22 +195,30 @@ impl DataSource for MemorySourceConfig {
         if let Some(partition) = partition {
             // Compute statistics for a specific partition
             if let Some(batches) = self.partitions.get(partition) {
-                Ok(Arc::new(common::compute_record_batch_statistics(
+                let stats = common::compute_record_batch_statistics(
                     from_ref(batches),
                     &self.schema,
                     self.projection.clone(),
-                )))
+                );
+                if self.fetch.is_some() {
+                    Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+                } else {
+                    Ok(Arc::new(stats))
+                }
             } else {
                 // Invalid partition index
                 Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)))
             }
         } else {
-            // Compute statistics across all partitions
-            Ok(Arc::new(common::compute_record_batch_statistics(
-                &self.partitions,
-                &self.schema,
-                self.projection.clone(),
-            )))
+            Ok(Arc::new(
+                common::compute_record_batch_statistics_with_fetch(
+                    &self.partitions,
+                    &self.schema,
+                    &self.projected_schema,
+                    self.projection.clone(),
+                    self.fetch,
+                )?,
+            ))
         }
     }
 
@@ -879,6 +887,29 @@ mod tests {
             "+---+", "| i |", "+---+", "| 0 |", "| 1 |", "| 2 |", "| 3 |", "+---+",
         ];
         assert_batches_eq!(expected, &results);
+        Ok(())
+    }
+
+    #[test]
+    fn partition_statistics_with_fetch_limits_each_partition() -> Result<()> {
+        let batches = vec![vec![make_partition(20)], vec![make_partition(5)]];
+        let schema = batches[0][0].schema();
+        let source =
+            MemorySourceConfig::try_new(&batches, schema, None)?.with_limit(Some(10));
+
+        assert_eq!(
+            source.partition_statistics(Some(0))?.num_rows,
+            Precision::Exact(10)
+        );
+        assert_eq!(
+            source.partition_statistics(Some(1))?.num_rows,
+            Precision::Exact(5)
+        );
+        assert_eq!(
+            source.partition_statistics(None)?.num_rows,
+            Precision::Exact(15)
+        );
+
         Ok(())
     }
 

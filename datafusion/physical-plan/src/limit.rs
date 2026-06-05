@@ -26,6 +26,7 @@ use super::{
     DisplayAs, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
     SendableRecordBatchStream, Statistics,
 };
+use crate::common::apply_per_partition_fetch_statistics;
 use crate::execution_plan::{Boundedness, CardinalityEffect};
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
@@ -383,8 +384,7 @@ impl ExecutionPlan for LocalLimitExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let stats = Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
-        Ok(Arc::new(stats.with_fetch(Some(self.fetch), 0, 1)?))
+        apply_per_partition_fetch_statistics(&self.input, partition, Some(self.fetch))
     }
 
     fn fetch(&self) -> Option<usize> {
@@ -795,7 +795,50 @@ mod tests {
     #[tokio::test]
     async fn test_row_number_statistics_for_local_limit() -> Result<()> {
         let row_count = row_number_statistics_for_local_limit(4, 10).await?;
-        assert_eq!(row_count, Precision::Exact(10));
+        assert_eq!(row_count, Precision::Exact(40));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_local_limit_statistics_limits_each_partition() -> Result<()> {
+        let batches = vec![
+            vec![make_batch_no_column(20)],
+            vec![make_batch_no_column(5)],
+        ];
+        let schema = batches[0][0].schema();
+        let input = test::TestMemoryExec::try_new(&batches, schema, None)?
+            .with_partition_statistics(true);
+        let limit = LocalLimitExec::new(Arc::new(input), 10);
+
+        assert_eq!(
+            limit.partition_statistics(Some(0))?.num_rows,
+            Precision::Exact(10)
+        );
+        assert_eq!(
+            limit.partition_statistics(Some(1))?.num_rows,
+            Precision::Exact(5)
+        );
+        assert_eq!(
+            limit.partition_statistics(None)?.num_rows,
+            Precision::Exact(15)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_local_limit_statistics_uses_global_cap_when_partition_stats_unknown()
+    -> Result<()> {
+        let batches = vec![vec![make_batch_no_column(2)], vec![make_batch_no_column(3)]];
+        let schema = batches[0][0].schema();
+        let input = test::TestMemoryExec::try_new(&batches, schema, None)?;
+        let limit = LocalLimitExec::new(Arc::new(input), 10);
+
+        assert_eq!(
+            limit.partition_statistics(None)?.num_rows,
+            Precision::Exact(5)
+        );
 
         Ok(())
     }
@@ -859,7 +902,8 @@ mod tests {
         num_partitions: usize,
         fetch: usize,
     ) -> Result<Precision<usize>> {
-        let csv = test::scan_partitioned(num_partitions);
+        let csv: Arc<dyn ExecutionPlan> =
+            Arc::new(test::mem_exec(num_partitions).with_partition_statistics(true));
 
         assert_eq!(csv.output_partitioning().partition_count(), num_partitions);
 

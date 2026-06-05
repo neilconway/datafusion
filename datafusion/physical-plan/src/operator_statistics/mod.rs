@@ -46,7 +46,7 @@
 //! 3. [`PassthroughStatisticsProvider`] - passthrough for cardinality-preserving operators
 //! 4. [`AggregateStatisticsProvider`] - NDV-based GROUP BY cardinality estimation
 //! 5. [`JoinStatisticsProvider`] - NDV-based join output estimation (hash, sort-merge, cross)
-//! 6. [`LimitStatisticsProvider`] - caps output at the fetch limit (local and global)
+//! 6. [`LimitStatisticsProvider`] - caps GlobalLimitExec output at the fetch limit
 //! 7. [`UnionStatisticsProvider`] - sums input row counts
 //! 8. [`DefaultStatisticsProvider`] - fallback to `partition_statistics(None)`
 //!
@@ -868,8 +868,7 @@ impl StatisticsProvider for JoinStatisticsProvider {
     }
 }
 
-/// Statistics provider for [`LocalLimitExec`](crate::limit::LocalLimitExec) and
-/// [`GlobalLimitExec`](crate::limit::GlobalLimitExec).
+/// Statistics provider for [`GlobalLimitExec`](crate::limit::GlobalLimitExec).
 ///
 /// Caps output row count at the limit value, accounting for any leading skip offset
 /// in `GlobalLimitExec`.
@@ -888,9 +887,11 @@ impl StatisticsProvider for LimitStatisticsProvider {
             return Ok(StatisticsResult::Delegate);
         }
 
-        let (skip, fetch) = if let Some(limit) = plan.downcast_ref::<LocalLimitExec>() {
-            (0usize, Some(limit.fetch()))
-        } else if let Some(limit) = plan.downcast_ref::<GlobalLimitExec>() {
+        if plan.downcast_ref::<LocalLimitExec>().is_some() {
+            return Ok(StatisticsResult::Delegate);
+        }
+
+        let (skip, fetch) = if let Some(limit) = plan.downcast_ref::<GlobalLimitExec>() {
             (limit.skip(), limit.fetch())
         } else {
             return Ok(StatisticsResult::Delegate);
@@ -1023,6 +1024,7 @@ mod tests {
     use super::*;
     use crate::filter::FilterExec;
     use crate::projection::ProjectionExec;
+    use crate::test::{self, TestMemoryExec};
     use crate::{DisplayAs, DisplayFormatType, PlanProperties};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_common::stats::Precision;
@@ -2086,7 +2088,8 @@ mod tests {
     fn test_limit_provider_caps_output() -> Result<()> {
         // input > fetch -> capped at fetch
         let source = make_source(1000);
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 100));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(GlobalLimitExec::new(source, 0, Some(100)));
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2101,7 +2104,8 @@ mod tests {
     fn test_limit_provider_input_smaller_than_fetch() -> Result<()> {
         // input < fetch -> output = input
         let source = make_source(50);
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 200));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(GlobalLimitExec::new(source, 0, Some(200)));
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2149,7 +2153,8 @@ mod tests {
         // Inexact(1000) with fetch=100: result must stay Inexact, not Exact,
         // because the actual row count could be less than 100.
         let source = make_source_with_precision(Precision::Inexact(1000));
-        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 100));
+        let limit: Arc<dyn ExecutionPlan> =
+            Arc::new(GlobalLimitExec::new(source, 0, Some(100)));
 
         let registry = StatisticsRegistry::with_providers(vec![
             Arc::new(LimitStatisticsProvider),
@@ -2157,6 +2162,61 @@ mod tests {
         ]);
         let stats = registry.compute(limit.as_ref())?;
         assert_eq!(stats.base.num_rows, Precision::Inexact(100));
+        Ok(())
+    }
+
+    fn make_partitioned_test_source(
+        row_counts: &[i32],
+        partition_statistics: bool,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let partitions = row_counts
+            .iter()
+            .map(|row_count| vec![test::make_partition(*row_count)])
+            .collect::<Vec<_>>();
+        let schema = partitions[0][0].schema();
+        Ok(Arc::new(
+            TestMemoryExec::try_new(&partitions, schema, None)?
+                .with_partition_statistics(partition_statistics),
+        ))
+    }
+
+    #[test]
+    fn test_local_limit_registry_caps_each_partition() -> Result<()> {
+        let source = make_partitioned_test_source(&[20, 5], true)?;
+        let limit: Arc<dyn ExecutionPlan> = Arc::new(LocalLimitExec::new(source, 10));
+
+        let registry = StatisticsRegistry::default_with_builtin_providers();
+        let stats = registry.compute(limit.as_ref())?;
+        assert_eq!(stats.base.num_rows, Precision::Exact(15));
+        Ok(())
+    }
+
+    #[expect(deprecated)]
+    #[test]
+    fn test_coalesce_batches_registry_respects_fetch() -> Result<()> {
+        use crate::coalesce_batches::CoalesceBatchesExec;
+
+        let source = make_partitioned_test_source(&[20, 5], true)?;
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalesceBatchesExec::new(source, 1024).with_fetch(Some(10)));
+
+        let registry = StatisticsRegistry::default_with_builtin_providers();
+        let stats = registry.compute(coalesce.as_ref())?;
+        assert_eq!(stats.base.num_rows, Precision::Exact(15));
+        Ok(())
+    }
+
+    #[test]
+    fn test_coalesce_partitions_registry_respects_fetch() -> Result<()> {
+        use crate::coalesce_partitions::CoalescePartitionsExec;
+
+        let source = make_partitioned_test_source(&[20, 5], true)?;
+        let coalesce: Arc<dyn ExecutionPlan> =
+            Arc::new(CoalescePartitionsExec::new(source).with_fetch(Some(10)));
+
+        let registry = StatisticsRegistry::default_with_builtin_providers();
+        let stats = registry.compute(coalesce.as_ref())?;
+        assert_eq!(stats.base.num_rows, Precision::Exact(10));
         Ok(())
     }
 

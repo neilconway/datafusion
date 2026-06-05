@@ -56,6 +56,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use crate::common::apply_per_partition_fetch_statistics;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
 use crate::sorts::sort::sort_batch;
 use crate::stream::EmptyRecordBatchStream;
@@ -335,7 +336,17 @@ impl ExecutionPlan for PartialSortExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        match (self.fetch, self.preserve_partitioning) {
+            (Some(_), true) => {
+                apply_per_partition_fetch_statistics(&self.input, partition, self.fetch)
+            }
+            (Some(fetch), false) => {
+                let stats = Arc::unwrap_or_clone(self.input.partition_statistics(None)?);
+                Ok(Arc::new(stats.with_fetch(Some(fetch), 0, 1)?))
+            }
+            (None, true) => self.input.partition_statistics(partition),
+            (None, false) => self.input.partition_statistics(None),
+        }
     }
 }
 
@@ -497,6 +508,7 @@ mod tests {
     use arrow::array::*;
     use arrow::compute::SortOptions;
     use arrow::datatypes::*;
+    use datafusion_common::stats::Precision;
     use datafusion_common::test_util::batches_to_string;
     use futures::FutureExt;
     use insta::allow_duplicates;
@@ -641,6 +653,92 @@ mod tests {
                 "The sort should have returned all memory used back to the memory manager"
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partial_sort_statistics_with_fetch_single_output() -> Result<()> {
+        let source = test::build_table_scan_i32(
+            ("a", &vec![0, 0, 1, 1, 1]),
+            ("b", &vec![1, 2, 2, 3, 3]),
+            ("c", &vec![4, 3, 2, 1, 0]),
+        );
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+            Field::new("c", DataType::Int32, false),
+        ]);
+        let sort_options = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+
+        let partial_sort_exec = PartialSortExec::new(
+            [
+                PhysicalSortExpr {
+                    expr: col("a", &schema)?,
+                    options: sort_options,
+                },
+                PhysicalSortExpr {
+                    expr: col("b", &schema)?,
+                    options: sort_options,
+                },
+            ]
+            .into(),
+            source,
+            1,
+        )
+        .with_fetch(Some(4));
+
+        assert_eq!(
+            partial_sort_exec.partition_statistics(None)?.num_rows,
+            Precision::Exact(4)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_partial_sort_statistics_with_fetch_preserve_partitioning() -> Result<()> {
+        let batches = vec![
+            vec![test::make_partition(20)],
+            vec![test::make_partition(5)],
+        ];
+        let schema = batches[0][0].schema();
+        let source = Arc::new(
+            TestMemoryExec::try_new(&batches, Arc::clone(&schema), None)?
+                .with_partition_statistics(true),
+        );
+        let sort_options = SortOptions {
+            descending: false,
+            nulls_first: false,
+        };
+
+        let partial_sort_exec = PartialSortExec::new(
+            [PhysicalSortExpr {
+                expr: col("i", schema.as_ref())?,
+                options: sort_options,
+            }]
+            .into(),
+            source,
+            1,
+        )
+        .with_preserve_partitioning(true)
+        .with_fetch(Some(10));
+
+        assert_eq!(
+            partial_sort_exec.partition_statistics(Some(0))?.num_rows,
+            Precision::Exact(10)
+        );
+        assert_eq!(
+            partial_sort_exec.partition_statistics(Some(1))?.num_rows,
+            Precision::Exact(5)
+        );
+        assert_eq!(
+            partial_sort_exec.partition_statistics(None)?.num_rows,
+            Precision::Exact(15)
+        );
 
         Ok(())
     }

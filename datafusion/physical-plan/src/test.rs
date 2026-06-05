@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::pin::Pin;
+use std::slice::from_ref;
 use std::sync::Arc;
 use std::task::Context;
 
@@ -74,6 +75,8 @@ pub struct TestMemoryExec {
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     fetch: Option<usize>,
+    /// Whether to return partition-specific statistics.
+    partition_statistics: bool,
     cache: Arc<PlanProperties>,
 }
 
@@ -165,10 +168,35 @@ impl ExecutionPlan for TestMemoryExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        if partition.is_some() {
-            Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+        if let Some(partition) = partition {
+            if !self.partition_statistics {
+                return Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)));
+            }
+
+            if let Some(batches) = self.partitions.get(partition) {
+                let stats = common::compute_record_batch_statistics(
+                    from_ref(batches),
+                    &self.schema,
+                    self.projection.clone(),
+                );
+                if self.fetch.is_some() {
+                    Ok(Arc::new(stats.with_fetch(self.fetch, 0, 1)?))
+                } else {
+                    Ok(Arc::new(stats))
+                }
+            } else {
+                Ok(Arc::new(Statistics::new_unknown(&self.projected_schema)))
+            }
         } else {
-            Ok(Arc::new(self.statistics_inner()?))
+            Ok(Arc::new(
+                common::compute_record_batch_statistics_with_fetch(
+                    &self.partitions,
+                    &self.schema,
+                    &self.projected_schema,
+                    self.projection.clone(),
+                    self.fetch,
+                )?,
+            ))
         }
     }
 
@@ -213,14 +241,6 @@ impl TestMemoryExec {
         )
     }
 
-    fn statistics_inner(&self) -> Result<Statistics> {
-        Ok(common::compute_record_batch_statistics(
-            &self.partitions,
-            &self.schema,
-            self.projection.clone(),
-        ))
-    }
-
     pub fn try_new(
         partitions: &[Vec<RecordBatch>],
         schema: SchemaRef,
@@ -244,6 +264,7 @@ impl TestMemoryExec {
             sort_information: vec![],
             show_sizes: true,
             fetch: None,
+            partition_statistics: false,
         })
     }
 
@@ -271,6 +292,12 @@ impl TestMemoryExec {
     /// Set the limit of the files
     pub fn with_limit(mut self, limit: Option<usize>) -> Self {
         self.fetch = limit;
+        self
+    }
+
+    /// Set whether this test source returns partition-specific statistics.
+    pub fn with_partition_statistics(mut self, partition_statistics: bool) -> Self {
+        self.partition_statistics = partition_statistics;
         self
     }
 

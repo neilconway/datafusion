@@ -137,6 +137,98 @@ fn do_hash_join(
     })
 }
 
+/// Like [`do_hash_join`] but joins on the named columns (supports multi-column
+/// keys), used by the `equal_rows_arr` verify-path benchmarks.
+fn do_hash_join_on(
+    left: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+    right: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+    on_names: &[&str],
+    join_type: JoinType,
+    rt: &Runtime,
+) -> usize {
+    let on: JoinOn = on_names
+        .iter()
+        .map(|name| {
+            (
+                col(name, &left.schema()).unwrap(),
+                col(name, &right.schema()).unwrap(),
+            )
+        })
+        .collect();
+    let join = HashJoinExec::try_new(
+        left,
+        right,
+        on,
+        None,
+        &join_type,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )
+    .unwrap();
+
+    let task_ctx = Arc::new(TaskContext::default());
+    rt.block_on(async {
+        let batches = collect(Arc::new(join), task_ctx).await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum()
+    })
+}
+
+fn slice_batches(batch: RecordBatch) -> Vec<RecordBatch> {
+    let batch_size = 8192;
+    let mut batches = Vec::new();
+    let mut offset = 0;
+    while offset < batch.num_rows() {
+        let len = (batch.num_rows() - offset).min(batch_size);
+        batches.push(batch.slice(offset, len));
+        offset += len;
+    }
+    batches
+}
+
+/// Batches with two Int32 join keys (`k1`, `k2`) plus a payload. `k1 == k2`, so
+/// rows are unique on `(k1, k2)` when `key_mod` covers `num_rows`.
+fn two_int_key_batches(num_rows: usize, key_mod: usize) -> (Vec<RecordBatch>, SchemaRef) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("k1", DataType::Int32, false),
+        Field::new("k2", DataType::Int32, false),
+        Field::new("payload", DataType::Int32, false),
+    ]));
+    let k: Vec<i32> = (0..num_rows).map(|i| (i % key_mod) as i32).collect();
+    let payload: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(Int32Array::from(k.clone())),
+            Arc::new(Int32Array::from(k)),
+            Arc::new(Int32Array::from(payload)),
+        ],
+    )
+    .unwrap();
+    (slice_batches(batch), schema)
+}
+
+/// Batches with a single Utf8 join key plus a payload.
+fn string_key_batches(num_rows: usize, key_mod: usize) -> (Vec<RecordBatch>, SchemaRef) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("payload", DataType::Int32, false),
+    ]));
+    let keys: Vec<String> =
+        (0..num_rows).map(|i| format!("key_{}", i % key_mod)).collect();
+    let payload: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(keys)),
+            Arc::new(Int32Array::from(payload)),
+        ],
+    )
+    .unwrap();
+    (slice_batches(batch), schema)
+}
+
 /// Build batches with sparse keys (key = row_index % key_mod * multiplier + key_offset).
 /// The `multiplier` controls density: 1 = 100%, 2 = 50%, 10 = 10%.
 fn build_batches_sparse(
@@ -356,6 +448,43 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
                 let left = make_exec(&left_batches, &s);
                 let right = make_exec(&right_batches, &s);
                 do_hash_join(left, right, JoinType::RightAnti, &rt)
+            })
+        });
+    }
+
+    // =========================================================================
+    // equal_rows_arr verify-path benchmarks (#12131)
+    //
+    // RightAnti at 100% hit rate: every probe row matches, so the anti output is
+    // empty and `equal_rows_arr` (key-equality verification of the ~probe_rows
+    // candidate pairs) dominates the runtime with minimal output-materialization
+    // noise. The single-column i32 case is covered by `right_anti_d100_h100`
+    // above; here we add the shapes where the kernel path allocates the most
+    // intermediate `take` arrays: two-column and string keys.
+    // =========================================================================
+
+    // Two Int32 key columns.
+    {
+        let (left, sch) = two_int_key_batches(build_rows, build_rows);
+        let (right, _) = two_int_key_batches(probe_rows, build_rows);
+        group.bench_function(BenchmarkId::new("verify_2col_i32", probe_rows), |b| {
+            b.iter(|| {
+                let l = make_exec(&left, &sch);
+                let r = make_exec(&right, &sch);
+                do_hash_join_on(l, r, &["k1", "k2"], JoinType::RightAnti, &rt)
+            })
+        });
+    }
+
+    // Single Utf8 key column.
+    {
+        let (left, sch) = string_key_batches(build_rows, build_rows);
+        let (right, _) = string_key_batches(probe_rows, build_rows);
+        group.bench_function(BenchmarkId::new("verify_strkey", probe_rows), |b| {
+            b.iter(|| {
+                let l = make_exec(&left, &sch);
+                let r = make_exec(&right, &sch);
+                do_hash_join_on(l, r, &["key"], JoinType::RightAnti, &rt)
             })
         });
     }

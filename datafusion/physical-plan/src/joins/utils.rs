@@ -1897,7 +1897,81 @@ pub fn update_hash(
     Ok(())
 }
 
+/// Returns `true` when the lexicographic [`JoinKeyComparator`] yields the same
+/// equality result as `eq_dyn_null` (the kernel path) for `data_type`, so the
+/// allocation-free comparator path in [`equal_rows_arr`] is safe to use.
+///
+/// Nested types are excluded: their equality goes through `compare_op_for_nested`
+/// (`eq` does not support nested types), which the comparator does not replicate.
+/// Dictionaries defer to their value type. Floating point is *not* excluded —
+/// arrow's `eq` kernel and `make_comparator` both use total-order float
+/// comparison (e.g. `NaN == NaN`), so they agree.
+fn comparator_matches_eq_semantics(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value) => comparator_matches_eq_semantics(value),
+        dt => !dt.is_nested(),
+    }
+}
+
+/// Filters candidate `(build, probe)` index pairs (matched by hash, so possibly
+/// containing hash collisions) down to those whose join keys are actually equal.
 pub(super) fn equal_rows_arr(
+    indices_left: &UInt64Array,
+    indices_right: &UInt32Array,
+    left_arrays: &[ArrayRef],
+    right_arrays: &[ArrayRef],
+    null_equality: NullEquality,
+) -> Result<(UInt64Array, UInt32Array)> {
+    if left_arrays.is_empty() {
+        return Ok((Vec::<u64>::new().into(), Vec::<u32>::new().into()));
+    }
+
+    // Fast path: verify each candidate pair in place with a per-column
+    // comparator, avoiding the intermediate `take`-ed key arrays and boolean
+    // masks the kernel path allocates on every probe batch (#12131). Limited to
+    // key types whose comparator equality matches `eq_dyn_null`; for anything
+    // else, or any type `make_comparator` cannot build, fall back to the kernel
+    // path. The candidate index arrays never contain nulls (they come straight
+    // from the hash-map walk), so `values()` is sufficient.
+    if left_arrays
+        .iter()
+        .all(|a| comparator_matches_eq_semantics(a.data_type()))
+    {
+        let sort_options = vec![SortOptions::default(); left_arrays.len()];
+        if let Ok(cmp) = JoinKeyComparator::new(
+            left_arrays,
+            right_arrays,
+            &sort_options,
+            null_equality,
+        ) {
+            let left = indices_left.values();
+            let right = indices_right.values();
+            let mut out_left = Vec::with_capacity(left.len());
+            let mut out_right = Vec::with_capacity(right.len());
+            for (&l, &r) in left.iter().zip(right.iter()) {
+                if cmp.is_equal(l as usize, r as usize) {
+                    out_left.push(l);
+                    out_right.push(r);
+                }
+            }
+            return Ok((out_left.into(), out_right.into()));
+        }
+    }
+
+    equal_rows_arr_kernel(
+        indices_left,
+        indices_right,
+        left_arrays,
+        right_arrays,
+        null_equality,
+    )
+}
+
+/// Kernel-based fallback for [`equal_rows_arr`]: gathers the candidate key values
+/// with `take`, compares them with `eq_dyn_null`, and filters the index pairs.
+/// Used for key types where the comparator fast path is unavailable or has
+/// different equality semantics (nested types, floating point).
+fn equal_rows_arr_kernel(
     indices_left: &UInt64Array,
     indices_right: &UInt32Array,
     left_arrays: &[ArrayRef],
@@ -3621,6 +3695,103 @@ mod tests {
         assert_eq!(cmp.compare(0, 0), Ordering::Greater);
         // left[3]=2 vs right[3]=2 -> Equal
         assert_eq!(cmp.compare(3, 3), Ordering::Equal);
+    }
+
+    /// The comparator fast path in `equal_rows_arr` must produce exactly the same
+    /// filtered pairs as the kernel fallback across single/multi-column keys,
+    /// hash collisions, and both null-equality modes.
+    #[test]
+    fn equal_rows_arr_comparator_matches_kernel() {
+        fn assert_parity(
+            li: &UInt64Array,
+            ri: &UInt32Array,
+            left: &[ArrayRef],
+            right: &[ArrayRef],
+            ne: NullEquality,
+        ) {
+            let fast = equal_rows_arr(li, ri, left, right, ne).unwrap();
+            let kernel = equal_rows_arr_kernel(li, ri, left, right, ne).unwrap();
+            assert_eq!(fast.0, kernel.0, "build indices differ");
+            assert_eq!(fast.1, kernel.1, "probe indices differ");
+        }
+
+        let li = UInt64Array::from(vec![0u64, 1, 2, 2, 3]);
+        let ri = UInt32Array::from(vec![0u32, 1, 2, 3, 1]);
+
+        // Single Int32 column, mix of matching and colliding (non-matching) pairs.
+        {
+            let l: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 40]));
+            let r: ArrayRef = Arc::new(Int32Array::from(vec![10, 99, 30, 30]));
+            assert_parity(
+                &li,
+                &ri,
+                &[Arc::clone(&l)],
+                &[Arc::clone(&r)],
+                NullEquality::NullEqualsNothing,
+            );
+            assert_parity(&li, &ri, &[l], &[r], NullEquality::NullEqualsNull);
+        }
+
+        // Two columns (Int32, Utf8): exercises the first-column-equal,
+        // second-column-differs short circuit.
+        {
+            let la: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 30]));
+            let lb: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z", "w"]));
+            let ra: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30, 30]));
+            let rb: ArrayRef = Arc::new(StringArray::from(vec!["x", "y", "z", "w"]));
+            let li2 = UInt64Array::from(vec![0u64, 2, 3, 2]);
+            let ri2 = UInt32Array::from(vec![0u32, 2, 3, 3]);
+            assert_parity(
+                &li2,
+                &ri2,
+                &[la, lb],
+                &[ra, rb],
+                NullEquality::NullEqualsNothing,
+            );
+        }
+
+        // Nulls, both modes.
+        {
+            let l: ArrayRef =
+                Arc::new(Int32Array::from(vec![Some(1), None, Some(3), None]));
+            let r: ArrayRef =
+                Arc::new(Int32Array::from(vec![Some(1), None, None, Some(3)]));
+            let li3 = UInt64Array::from(vec![0u64, 1, 1, 3, 2]);
+            let ri3 = UInt32Array::from(vec![0u32, 1, 3, 1, 3]);
+            assert_parity(
+                &li3,
+                &ri3,
+                &[Arc::clone(&l)],
+                &[Arc::clone(&r)],
+                NullEquality::NullEqualsNothing,
+            );
+            assert_parity(&li3, &ri3, &[l], &[r], NullEquality::NullEqualsNull);
+        }
+    }
+
+    /// Float keys use the comparator fast path; both paths use total-order float
+    /// comparison, so the comparator and kernel must agree on the tricky values
+    /// (`NaN`, `-0.0`/`0.0`).
+    #[test]
+    fn equal_rows_arr_float_matches_kernel() {
+        let nan = f64::NAN;
+        let l: ArrayRef = Arc::new(Float64Array::from(vec![1.0, nan, 3.0, -0.0]));
+        let r: ArrayRef = Arc::new(Float64Array::from(vec![1.0, nan, 3.0, 0.0]));
+        let li = UInt64Array::from(vec![0u64, 1, 2, 3]);
+        let ri = UInt32Array::from(vec![0u32, 1, 2, 3]);
+        let fast = equal_rows_arr(
+            &li,
+            &ri,
+            &[Arc::clone(&l)],
+            &[Arc::clone(&r)],
+            NullEquality::NullEqualsNothing,
+        )
+        .unwrap();
+        let kernel =
+            equal_rows_arr_kernel(&li, &ri, &[l], &[r], NullEquality::NullEqualsNothing)
+                .unwrap();
+        assert_eq!(fast.0, kernel.0, "build indices differ");
+        assert_eq!(fast.1, kernel.1, "probe indices differ");
     }
 
     #[test]

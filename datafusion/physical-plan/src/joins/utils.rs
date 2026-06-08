@@ -1464,8 +1464,14 @@ pub(crate) fn adjust_indices_by_join_type(
             Ok((left_indices, right_indices))
         }
         JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
-            // matched or unmatched left row will be produced in the end of loop
-            // When visit the right batch, we can output the matched left row and don't need to wait the end of loop
+            // These join types output build-side rows. Instead of emitting
+            // during probing, each matched build row is recorded in the shared
+            // visited bitmap; the output is produced from that bitmap once the
+            // probe side is exhausted. Deferring this way emits each build row
+            // exactly once across all probe partitions. It is also necessary
+            // for anti rows, whose unmatched status is only known after the
+            // whole probe side has been seen. The probe phase contributes no
+            // rows here, so empty indices are returned.
             Ok((
                 UInt64Array::from_iter_values(vec![]),
                 UInt32Array::from_iter_values(vec![]),

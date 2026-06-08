@@ -27,7 +27,7 @@ use crate::joins::join_hash_map::{
     contain_hashes, get_matched_indices, get_matched_indices_with_limit_offset,
     update_from_iter,
 };
-use crate::joins::utils::{JoinFilter, JoinHashMapType};
+use crate::joins::utils::{JoinFilter, JoinHashMapType, JoinKeyComparator};
 use crate::metrics::{
     BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricCategory,
 };
@@ -95,6 +95,19 @@ impl JoinHashMapType for PruningJoinHashMap {
             offset,
             input_indices,
             match_indices,
+        )
+    }
+
+    fn get_probe_indices_with_any_match(
+        &self,
+        _hash_values: &[u64],
+        _range: std::ops::Range<usize>,
+        _comparator: &JoinKeyComparator,
+        _probe_indices: &mut Vec<u32>,
+    ) {
+        unreachable!(
+            "PruningJoinHashMap does not support get_probe_indices_with_any_match; \
+             symmetric hash join must use get_matched_indices with deleted_offset"
         )
     }
 

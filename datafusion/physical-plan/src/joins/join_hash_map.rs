@@ -20,6 +20,7 @@
 //! ["on" values] to a list of indices with this key's value.
 
 use std::fmt::{self, Debug};
+use std::ops::Range;
 use std::ops::Sub;
 
 use arrow::array::BooleanArray;
@@ -27,6 +28,8 @@ use arrow::buffer::BooleanBuffer;
 use arrow::datatypes::ArrowNativeType;
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
+
+use crate::joins::utils::JoinKeyComparator;
 
 /// Maps a `u64` hash value based on the build side ["on" values] to a list of indices with this key's value.
 ///
@@ -126,6 +129,20 @@ pub trait JoinHashMapType: Send + Sync {
         match_indices: &mut Vec<u64>,
     ) -> Option<MapOffset>;
 
+    /// Scans probe rows in `range` and appends each matching probe index at most once.
+    ///
+    /// `comparator` is consulted for each candidate build/probe pair that has a
+    /// matching hash value. Once it reports equal join keys for a probe row,
+    /// that probe index is appended and the remaining build-side chain for that
+    /// probe row is skipped.
+    fn get_probe_indices_with_any_match(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        comparator: &JoinKeyComparator,
+        probe_indices: &mut Vec<u32>,
+    );
+
     /// Returns a BooleanArray indicating which of the provided hashes exist in the map.
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray;
 
@@ -198,6 +215,25 @@ impl JoinHashMapType for JoinHashMapU32 {
             offset,
             input_indices,
             match_indices,
+        )
+    }
+
+    fn get_probe_indices_with_any_match(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        comparator: &JoinKeyComparator,
+        probe_indices: &mut Vec<u32>,
+    ) {
+        get_probe_indices_with_any_match(
+            &self.map,
+            &self.next,
+            hash_values,
+            range,
+            |build_idx, probe_idx| {
+                comparator.is_equal(build_idx as usize, probe_idx as usize)
+            },
+            probe_indices,
         )
     }
 
@@ -276,6 +312,25 @@ impl JoinHashMapType for JoinHashMapU64 {
             offset,
             input_indices,
             match_indices,
+        )
+    }
+
+    fn get_probe_indices_with_any_match(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        comparator: &JoinKeyComparator,
+        probe_indices: &mut Vec<u32>,
+    ) {
+        get_probe_indices_with_any_match(
+            &self.map,
+            &self.next,
+            hash_values,
+            range,
+            |build_idx, probe_idx| {
+                comparator.is_equal(build_idx as usize, probe_idx as usize)
+            },
+            probe_indices,
         )
     }
 
@@ -464,6 +519,50 @@ where
     None
 }
 
+pub fn get_probe_indices_with_any_match<T, F>(
+    map: &HashTable<(u64, T)>,
+    next_chain: &[T],
+    hash_values: &[u64],
+    range: Range<usize>,
+    mut predicate: F,
+    probe_indices: &mut Vec<u32>,
+) where
+    T: Copy + TryFrom<usize> + PartialOrd + Into<u64> + Sub<Output = T>,
+    <T as TryFrom<usize>>::Error: Debug,
+    F: FnMut(u64, u32) -> bool,
+{
+    probe_indices.clear();
+
+    let end = range.end.min(hash_values.len());
+    if range.start >= end {
+        return;
+    }
+
+    let zero = T::try_from(0).unwrap();
+    let one = T::try_from(1).unwrap();
+
+    for (probe_idx, &hash) in hash_values.iter().enumerate().take(end).skip(range.start) {
+        let Some((_, index)) = map.find(hash, |(h, _)| hash == *h) else {
+            continue;
+        };
+
+        let mut build_idx = *index - one;
+        loop {
+            let build_idx_u64 = build_idx.into();
+            if predicate(build_idx_u64, probe_idx as u32) {
+                probe_indices.push(probe_idx as u32);
+                break;
+            }
+
+            let next = next_chain[build_idx_u64 as usize];
+            if next == zero {
+                break;
+            }
+            build_idx = next - one;
+        }
+    }
+}
+
 pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> BooleanArray {
     let buffer = BooleanBuffer::collect_bool(hash_values.len(), |i| {
         let hash = hash_values[i];
@@ -475,6 +574,7 @@ pub fn contain_hashes<T>(map: &HashTable<(u64, T)>, hash_values: &[u64]) -> Bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion_common::Result;
 
     #[test]
     fn test_contain_hashes() {
@@ -493,5 +593,72 @@ mod tests {
                 assert!(!array.value(i), "Hash {hash} should NOT exist in the map");
             }
         }
+    }
+
+    #[test]
+    fn probe_indices_with_any_match_are_sorted_and_unique() -> Result<()> {
+        let mut hash_map = JoinHashMapU32::with_capacity(5);
+        hash_map
+            .update_from_iter(Box::new([10u64, 10, 20, 30, 10].iter().enumerate()), 0);
+
+        let probe_hashes = vec![10, 11, 20, 10, 30, 40];
+        let mut probe_indices = vec![];
+        get_probe_indices_with_any_match(
+            &hash_map.map,
+            &hash_map.next,
+            &probe_hashes,
+            0..probe_hashes.len(),
+            |_build_idx, _probe_idx| true,
+            &mut probe_indices,
+        );
+
+        assert_eq!(probe_indices, vec![0, 2, 3, 4]);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_indices_with_any_match_continue_after_false_predicate() -> Result<()> {
+        let mut hash_map = JoinHashMapU32::with_capacity(2);
+        hash_map.update_from_iter(Box::new([10u64, 10].iter().enumerate()), 0);
+
+        let probe_hashes = vec![10];
+        let mut visited_build_indices = vec![];
+        let mut probe_indices = vec![];
+        get_probe_indices_with_any_match(
+            &hash_map.map,
+            &hash_map.next,
+            &probe_hashes,
+            0..probe_hashes.len(),
+            |build_idx, _probe_idx| {
+                visited_build_indices.push(build_idx);
+                build_idx == 0
+            },
+            &mut probe_indices,
+        );
+
+        assert_eq!(visited_build_indices, vec![1, 0]);
+        assert_eq!(probe_indices, vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_indices_with_any_match_u64_matches_and_omits_no_match_probes() -> Result<()>
+    {
+        let mut hash_map = JoinHashMapU64::with_capacity(2);
+        hash_map.update_from_iter(Box::new([10u64, 20].iter().enumerate()), 0);
+
+        let probe_hashes = vec![30, 10, 40, 20];
+        let mut probe_indices = vec![99];
+        get_probe_indices_with_any_match(
+            &hash_map.map,
+            &hash_map.next,
+            &probe_hashes,
+            0..probe_hashes.len(),
+            |_build_idx, _probe_idx| true,
+            &mut probe_indices,
+        );
+
+        assert_eq!(probe_indices, vec![1, 3]);
+        Ok(())
     }
 }

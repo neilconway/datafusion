@@ -44,14 +44,19 @@ use std::sync::Arc;
 
 use arrow::array::{Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::measurement::WallTime;
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, criterion_group, criterion_main,
+};
 use datafusion_common::{JoinType, NullEquality};
 use datafusion_execution::TaskContext;
 use datafusion_physical_expr::expressions::col;
-use datafusion_physical_plan::collect;
 use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode, utils::JoinOn};
 use datafusion_physical_plan::test::TestMemoryExec;
+use datafusion_physical_plan::{ExecutionPlan, collect};
 use tokio::runtime::Runtime;
+
+const ARRAY_MAP_CREATED_COUNT_METRIC_NAME: &str = "array_map_created_count";
 
 /// Build RecordBatches with Int32 keys.
 ///
@@ -65,37 +70,10 @@ fn build_batches(
     key_offset: i32,
     schema: &SchemaRef,
 ) -> Vec<RecordBatch> {
-    let keys: Vec<i32> = (0..num_rows)
-        .map(|i| ((i % key_mod) as i32) + key_offset)
-        .collect();
-    let data: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
-    let payload: Vec<String> = data.iter().map(|d| format!("val_{d}")).collect();
-
-    let batch = RecordBatch::try_new(
-        Arc::clone(schema),
-        vec![
-            Arc::new(Int32Array::from(keys)),
-            Arc::new(Int32Array::from(data)),
-            Arc::new(StringArray::from(payload)),
-        ],
-    )
-    .unwrap();
-
-    let batch_size = 8192;
-    let mut batches = Vec::new();
-    let mut offset = 0;
-    while offset < batch.num_rows() {
-        let len = (batch.num_rows() - offset).min(batch_size);
-        batches.push(batch.slice(offset, len));
-        offset += len;
-    }
-    batches
+    build_batches_from_key_fn(num_rows, schema, |i| ((i % key_mod) as i32) + key_offset)
 }
 
-fn make_exec(
-    batches: &[RecordBatch],
-    schema: &SchemaRef,
-) -> Arc<dyn datafusion_physical_plan::ExecutionPlan> {
+fn make_exec(batches: &[RecordBatch], schema: &SchemaRef) -> Arc<dyn ExecutionPlan> {
     TestMemoryExec::try_new_exec(&[batches.to_vec()], Arc::clone(schema), None).unwrap()
 }
 
@@ -108,33 +86,122 @@ fn schema() -> SchemaRef {
 }
 
 fn do_hash_join(
-    left: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
-    right: Arc<dyn datafusion_physical_plan::ExecutionPlan>,
+    left: Arc<dyn ExecutionPlan>,
+    right: Arc<dyn ExecutionPlan>,
     join_type: JoinType,
     rt: &Runtime,
-) -> usize {
+) -> HashJoinRun {
     let on: JoinOn = vec![(
         col("key", &left.schema()).unwrap(),
         col("key", &right.schema()).unwrap(),
     )];
-    let join = HashJoinExec::try_new(
-        left,
-        right,
-        on,
-        None,
-        &join_type,
-        None,
-        PartitionMode::CollectLeft,
-        NullEquality::NullEqualsNothing,
-        false,
-    )
-    .unwrap();
+    let join = Arc::new(
+        HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &join_type,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap(),
+    );
 
     let task_ctx = Arc::new(TaskContext::default());
-    rt.block_on(async {
-        let batches = collect(Arc::new(join), task_ctx).await.unwrap();
-        batches.iter().map(|b| b.num_rows()).sum()
-    })
+    let output_rows = rt.block_on(async {
+        let batches = collect(join.clone(), task_ctx).await.unwrap();
+        batches.iter().map(|b| b.num_rows()).sum::<usize>()
+    });
+    let metrics = join.metrics().unwrap();
+    let array_map_created_count = metrics
+        .sum_by_name(ARRAY_MAP_CREATED_COUNT_METRIC_NAME)
+        .map(|v| v.as_usize())
+        .unwrap_or(0);
+
+    HashJoinRun {
+        output_rows,
+        array_map_created_count,
+    }
+}
+
+struct HashJoinRun {
+    output_rows: usize,
+    array_map_created_count: usize,
+}
+
+#[derive(Clone, Copy)]
+struct CaseExpectation {
+    output_rows: usize,
+    uses_array_map: bool,
+}
+
+struct BenchCase {
+    name: &'static str,
+    probe_rows: usize,
+    left_batches: Vec<RecordBatch>,
+    right_batches: Vec<RecordBatch>,
+    join_type: JoinType,
+    expected: CaseExpectation,
+}
+
+fn validate_hash_join_case(
+    name: &str,
+    left_batches: &[RecordBatch],
+    right_batches: &[RecordBatch],
+    schema: &SchemaRef,
+    join_type: JoinType,
+    expected: CaseExpectation,
+    rt: &Runtime,
+) {
+    let left = make_exec(left_batches, schema);
+    let right = make_exec(right_batches, schema);
+    let run = do_hash_join(left, right, join_type, rt);
+    assert_eq!(
+        run.output_rows, expected.output_rows,
+        "unexpected output row count for {name}"
+    );
+    assert_eq!(
+        run.array_map_created_count > 0,
+        expected.uses_array_map,
+        "unexpected map strategy for {name}"
+    );
+}
+
+fn bench_hash_join_case(
+    group: &mut BenchmarkGroup<'_, WallTime>,
+    schema: &SchemaRef,
+    rt: &Runtime,
+    case: BenchCase,
+) {
+    let BenchCase {
+        name,
+        probe_rows,
+        left_batches,
+        right_batches,
+        join_type,
+        expected,
+    } = case;
+
+    validate_hash_join_case(
+        name,
+        &left_batches,
+        &right_batches,
+        schema,
+        join_type,
+        expected,
+        rt,
+    );
+
+    group.bench_function(BenchmarkId::new(name, probe_rows), |b| {
+        b.iter(|| {
+            let left = make_exec(&left_batches, schema);
+            let right = make_exec(&right_batches, schema);
+            do_hash_join(left, right, join_type, rt).output_rows
+        })
+    });
 }
 
 /// Build batches with sparse keys (key = row_index % key_mod * multiplier + key_offset).
@@ -146,9 +213,21 @@ fn build_batches_sparse(
     multiplier: i32,
     schema: &SchemaRef,
 ) -> Vec<RecordBatch> {
-    let keys: Vec<i32> = (0..num_rows)
-        .map(|i| ((i % key_mod) as i32) * multiplier + key_offset)
-        .collect();
+    build_batches_from_key_fn(num_rows, schema, |i| {
+        ((i % key_mod) as i32) * multiplier + key_offset
+    })
+}
+
+/// Build batches from an arbitrary deterministic key generator.
+fn build_batches_from_key_fn<F>(
+    num_rows: usize,
+    schema: &SchemaRef,
+    mut key_fn: F,
+) -> Vec<RecordBatch>
+where
+    F: FnMut(usize) -> i32,
+{
+    let keys: Vec<i32> = (0..num_rows).map(&mut key_fn).collect();
     let data: Vec<i32> = (0..num_rows).map(|i| i as i32).collect();
     let payload: Vec<String> = data.iter().map(|d| format!("val_{d}")).collect();
 
@@ -171,6 +250,22 @@ fn build_batches_sparse(
         offset += len;
     }
     batches
+}
+
+/// Skewed 50%-hit key generator for a sparse (HashMap) build side whose keys are
+/// spaced by 10. Matching keys land on multiples of 10; misses are offset by 1.
+fn skewed_h50_hashmap_key(row: usize, build_rows: usize, hot_keys: usize) -> i32 {
+    let logical_row = row / 2;
+    if row.is_multiple_of(2) {
+        let key = if logical_row % 10 < 8 {
+            logical_row % hot_keys
+        } else {
+            hot_keys + logical_row % (build_rows - hot_keys)
+        };
+        (key as i32) * 10
+    } else {
+        ((logical_row % build_rows) as i32) * 10 + 1
+    }
 }
 
 fn bench_hash_join_semi_anti(c: &mut Criterion) {
@@ -193,13 +288,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches(build_rows, build_rows, 0, &s);
         let right_batches = build_batches(probe_rows, build_rows, 0, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d100_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d100_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightSemi - 100% Density, 10% hit rate
@@ -207,13 +311,45 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches(build_rows, build_rows, 0, &s);
         let right_batches = build_batches(probe_rows, build_rows * 10, 0, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d100_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d100_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: build_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightSemi - 100% Density, 50% hit rate
+    // Keys: 0..100K contiguous, half of probe rows find a match.
+    {
+        let left_batches = build_batches(build_rows, build_rows, 0, &s);
+        let right_batches = build_batches(probe_rows, build_rows * 2, 0, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d100_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightSemi - 50% Density, 100% hit rate
@@ -221,13 +357,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 2, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows, 0, 2, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d50_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d50_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightSemi - 50% Density, 10% hit rate
@@ -235,13 +380,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 2, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows * 10, 0, 2, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d50_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d50_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: build_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightSemi - 10% Density, 100% hit rate
@@ -249,13 +403,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows, 0, 10, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d10_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d10_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows,
+                    uses_array_map: false,
+                },
+            },
+        );
     }
 
     // RightSemi - 10% Density, 10% hit rate
@@ -263,13 +426,45 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows * 10, 0, 10, &s);
-        group.bench_function(BenchmarkId::new("right_semi_d10_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightSemi, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d10_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: build_rows,
+                    uses_array_map: false,
+                },
+            },
+        );
+    }
+
+    // RightSemi - 10% Density, 50% hit rate
+    // Sparse build keys force the HashMap path while avoiding all-match/no-match extremes.
+    {
+        let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
+        let right_batches = build_batches_sparse(probe_rows, build_rows * 2, 0, 10, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_d10_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
+            },
+        );
     }
 
     // RightSemi - 100% Density, ~1% hit rate, fanout ~100
@@ -280,14 +475,96 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
         let fanout_keys = 1_000;
         let left_batches = build_batches(build_rows, fanout_keys, 0, &s);
         let right_batches = build_batches(probe_rows, build_rows, 0, &s);
-        group.bench_function(
-            BenchmarkId::new("right_semi_fanout100_h1", probe_rows),
-            |b| {
-                b.iter(|| {
-                    let left = make_exec(&left_batches, &s);
-                    let right = make_exec(&right_batches, &s);
-                    do_hash_join(left, right, JoinType::RightSemi, &rt)
-                })
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_fanout100_h1",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 100,
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightSemi - 100% Density, 50% hit rate, fanout ~10
+    // This is a moderate duplicate-heavy case: enough fanout to stress pair
+    // materialization, without relying on a tiny match rate.
+    {
+        let fanout_keys = 10_000;
+        let left_batches = build_batches(build_rows, fanout_keys, 0, &s);
+        let right_batches = build_batches(probe_rows, fanout_keys * 2, 0, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_fanout10_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightSemi - HashMap path, 50% hit rate, fanout ~10
+    // A large sparse key range prevents ArrayMap selection while preserving the
+    // same moderate fanout and hit-rate shape.
+    {
+        let fanout_keys = 10_000;
+        let left_batches = build_batches_sparse(build_rows, fanout_keys, 0, 1000, &s);
+        let right_batches =
+            build_batches_sparse(probe_rows, fanout_keys * 2, 0, 1000, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_fanout10_h50_hashmap",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
+            },
+        );
+    }
+
+    // RightSemi - HashMap path, skewed 50% hit rate
+    {
+        let hot_keys = 1_000;
+        let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
+        let right_batches = build_batches_from_key_fn(probe_rows, &s, |row| {
+            skewed_h50_hashmap_key(row, build_rows, hot_keys)
+        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_semi_skewed_h50_hashmap",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightSemi,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
             },
         );
     }
@@ -301,13 +578,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches(build_rows, build_rows, 0, &s);
         let right_batches = build_batches(probe_rows, build_rows, 0, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d100_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d100_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: 0,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightAnti - 100% Density, 10% hit rate (90% output)
@@ -315,13 +601,45 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches(build_rows, build_rows, 0, &s);
         let right_batches = build_batches(probe_rows, build_rows * 10, 0, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d100_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d100_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows - build_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightAnti - 100% Density, 50% hit rate
+    // Keys: 0..100K contiguous, half of probe rows find a match.
+    {
+        let left_batches = build_batches(build_rows, build_rows, 0, &s);
+        let right_batches = build_batches(probe_rows, build_rows * 2, 0, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d100_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightAnti - 50% Density, 100% hit rate (no output)
@@ -329,13 +647,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 2, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows, 0, 2, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d50_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d50_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: 0,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightAnti - 50% Density, 10% hit rate (90% output)
@@ -343,13 +670,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 2, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows * 10, 0, 2, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d50_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d50_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows - build_rows,
+                    uses_array_map: true,
+                },
+            },
+        );
     }
 
     // RightAnti - 10% Density, 100% hit rate (no output)
@@ -357,13 +693,22 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows, 0, 10, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d10_h100", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
-        });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d10_h100",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: 0,
+                    uses_array_map: false,
+                },
+            },
+        );
     }
 
     // RightAnti - 10% Density, 10% hit rate (90% output)
@@ -371,13 +716,143 @@ fn bench_hash_join_semi_anti(c: &mut Criterion) {
     {
         let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
         let right_batches = build_batches_sparse(probe_rows, build_rows * 10, 0, 10, &s);
-        group.bench_function(BenchmarkId::new("right_anti_d10_h10", probe_rows), |b| {
-            b.iter(|| {
-                let left = make_exec(&left_batches, &s);
-                let right = make_exec(&right_batches, &s);
-                do_hash_join(left, right, JoinType::RightAnti, &rt)
-            })
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d10_h10",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows - build_rows,
+                    uses_array_map: false,
+                },
+            },
+        );
+    }
+
+    // RightAnti - 10% Density, 50% hit rate
+    // Sparse build keys force the HashMap path while avoiding all-match/no-match extremes.
+    {
+        let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
+        let right_batches = build_batches_sparse(probe_rows, build_rows * 2, 0, 10, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_d10_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
+            },
+        );
+    }
+
+    // RightAnti - 100% Density, ~1% hit rate, fanout ~100
+    // Build keys are duplicated: 100K rows over 1K distinct keys. Matching
+    // probe rows produce many duplicate probe indices before RightAnti
+    // computes the unmatched probe rows.
+    {
+        let fanout_keys = 1_000;
+        let left_batches = build_batches(build_rows, fanout_keys, 0, &s);
+        let right_batches = build_batches(probe_rows, build_rows, 0, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_fanout100_h1",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows - (probe_rows / 100),
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightAnti - 100% Density, 50% hit rate, fanout ~10
+    {
+        let fanout_keys = 10_000;
+        let left_batches = build_batches(build_rows, fanout_keys, 0, &s);
+        let right_batches = build_batches(probe_rows, fanout_keys * 2, 0, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_fanout10_h50",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: true,
+                },
+            },
+        );
+    }
+
+    // RightAnti - HashMap path, 50% hit rate, fanout ~10
+    {
+        let fanout_keys = 10_000;
+        let left_batches = build_batches_sparse(build_rows, fanout_keys, 0, 1000, &s);
+        let right_batches =
+            build_batches_sparse(probe_rows, fanout_keys * 2, 0, 1000, &s);
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_fanout10_h50_hashmap",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
+            },
+        );
+    }
+
+    // RightAnti - HashMap path, skewed 50% hit rate
+    {
+        let hot_keys = 1_000;
+        let left_batches = build_batches_sparse(build_rows, build_rows, 0, 10, &s);
+        let right_batches = build_batches_from_key_fn(probe_rows, &s, |row| {
+            skewed_h50_hashmap_key(row, build_rows, hot_keys)
         });
+        bench_hash_join_case(
+            &mut group,
+            &s,
+            &rt,
+            BenchCase {
+                name: "right_anti_skewed_h50_hashmap",
+                probe_rows,
+                left_batches,
+                right_batches,
+                join_type: JoinType::RightAnti,
+                expected: CaseExpectation {
+                    output_rows: probe_rows / 2,
+                    uses_array_map: false,
+                },
+            },
+        );
     }
 
     group.finish();

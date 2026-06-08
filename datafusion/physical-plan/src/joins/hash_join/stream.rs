@@ -33,7 +33,8 @@ use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
 use crate::joins::utils::{
-    OnceFut, equal_rows_arr, get_final_indices_from_shared_bitmap,
+    JoinKeyComparator, OnceFut, equal_rows_arr, get_anti_indices,
+    get_final_indices_from_shared_bitmap,
 };
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
@@ -50,6 +51,7 @@ use crate::{
 use arrow::array::{Array, ArrayRef, UInt32Array, UInt64Array};
 use arrow::datatypes::{Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
+use arrow_schema::SortOptions;
 use datafusion_common::{
     JoinSide, JoinType, NullEquality, Result, internal_datafusion_err, internal_err,
 };
@@ -92,15 +94,6 @@ impl BuildSide {
     /// Tries to extract BuildSideReadyState from BuildSide enum.
     /// Returns an error if state is not Ready.
     fn try_as_ready(&self) -> Result<&BuildSideReadyState> {
-        match self {
-            BuildSide::Ready(state) => Ok(state),
-            _ => internal_err!("Expected build side in ready state"),
-        }
-    }
-
-    /// Tries to extract BuildSideReadyState from BuildSide enum.
-    /// Returns an error if state is not Ready.
-    fn try_as_ready_mut(&mut self) -> Result<&mut BuildSideReadyState> {
         match self {
             BuildSide::Ready(state) => Ok(state),
             _ => internal_err!("Expected build side in ready state"),
@@ -510,6 +503,121 @@ impl HashJoinStream {
         }
     }
 
+    /// Try the existence-probe fast path for a probe-batch chunk.
+    ///
+    /// RightSemi and RightAnti joins only need to know whether each probe row
+    /// has at least one equal build row. For those joins, when there is no join
+    /// filter, this path scans a range of probe rows and emits each probe row
+    /// at most once, stopping the hash-chain search after the first match.
+    ///
+    /// Returns true if this path produced output and advanced stream state.
+    /// Returns false when the path is ineligible and the caller should fall
+    /// back to the general pair-producing path.
+    fn try_existence_probe_batch(&mut self) -> Result<bool> {
+        let state = self.state.try_as_process_probe_batch_mut()?;
+        let build_side = self.build_side.try_as_ready()?;
+        let probe_batch_num_rows = state.batch.num_rows();
+
+        if !matches!(self.join_type, JoinType::RightSemi | JoinType::RightAnti)
+            || self.filter.is_some()
+        {
+            return Ok(false);
+        }
+
+        let timer = self.join_metrics.join_time.timer();
+
+        let probe_range_start = state.offset.0;
+        let probe_range_end =
+            (probe_range_start + self.batch_size).min(probe_batch_num_rows);
+        let probe_range = probe_range_start..probe_range_end;
+
+        match build_side.left_data.map() {
+            Map::HashMap(map) => {
+                let sort_options = vec![SortOptions::default(); state.values.len()];
+                if let Ok(comparator) = JoinKeyComparator::new(
+                    build_side.left_data.values(),
+                    &state.values,
+                    &sort_options,
+                    self.null_equality,
+                ) {
+                    map.get_probe_indices_with_any_match(
+                        &self.hashes_buffer,
+                        probe_range.clone(),
+                        &comparator,
+                        &mut self.probe_indices_buffer,
+                    );
+                } else {
+                    // No comparator available for the key types, so fall back
+                    // to general probe path.
+                    timer.done();
+                    return Ok(false);
+                }
+            }
+            Map::ArrayMap(array_map) => {
+                array_map.get_probe_indices_with_any_match(
+                    &state.values,
+                    probe_range.clone(),
+                    &mut self.probe_indices_buffer,
+                )?;
+            }
+        }
+
+        let matched_probe_indices =
+            UInt32Array::from(std::mem::take(&mut self.probe_indices_buffer));
+        let matched_probe_count = matched_probe_indices.len();
+
+        // The existence path stops after the first equal build row for each
+        // probe row, so exact fanout cannot be determined.  Leave avg_fanout as
+        // N/A for this path.
+        self.join_metrics
+            .probe_hit_rate
+            .add_total(probe_range.len());
+        self.join_metrics
+            .probe_hit_rate
+            .add_part(matched_probe_count);
+
+        let right_indices = match self.join_type {
+            JoinType::RightSemi => matched_probe_indices,
+            JoinType::RightAnti => {
+                get_anti_indices(probe_range.clone(), &matched_probe_indices)
+            }
+            _ => {
+                unreachable!("existence probe only runs for right semi/anti")
+            }
+        };
+        let left_indices = UInt64Array::from(Vec::<u64>::new());
+
+        let batch = build_batch_from_indices(
+            &self.schema,
+            build_side.left_data.batch(),
+            &state.batch,
+            &left_indices,
+            &right_indices,
+            &self.column_indices,
+            JoinSide::Left,
+            self.join_type,
+        )?;
+
+        let push_status = self.output_buffer.push_batch(batch)?;
+
+        self.probe_indices_buffer = right_indices.into_parts().1.into();
+
+        timer.done();
+
+        if probe_range_end == probe_batch_num_rows {
+            self.state = HashJoinStreamState::FetchProbeBatch;
+        } else {
+            state.advance((probe_range_end, None), None);
+        }
+
+        if push_status == PushBatchStatus::LimitReached {
+            self.output_buffer.finish()?;
+            self.state = HashJoinStreamState::Completed;
+        }
+
+        Ok(true)
+    }
+
     /// Returns the next state after the build side has been fully collected
     /// and any required build-side coordination has completed.
     fn state_after_build_ready(
@@ -712,8 +820,13 @@ impl HashJoinStream {
     fn process_probe_batch(
         &mut self,
     ) -> Result<StatefulStreamResult<Option<RecordBatch>>> {
+        if self.try_existence_probe_batch()? {
+            return Ok(StatefulStreamResult::Continue);
+        }
+
         let state = self.state.try_as_process_probe_batch_mut()?;
-        let build_side = self.build_side.try_as_ready_mut()?;
+        let build_side = self.build_side.try_as_ready()?;
+        let is_empty = build_side.left_data.map().is_empty();
 
         self.join_metrics
             .probe_hit_rate
@@ -759,10 +872,6 @@ impl HashJoinStream {
             }
         }
 
-        // If the build side is empty, this stream only reaches ProcessProbeBatch for
-        // join types whose output still depends on probe rows.
-        let is_empty = build_side.left_data.map().is_empty();
-
         if is_empty {
             // Invariant: state_after_build_ready should have already completed
             // join types whose result is fixed to empty when the build side is empty.
@@ -781,7 +890,9 @@ impl HashJoinStream {
             return Ok(StatefulStreamResult::Continue);
         }
 
-        // get the matched by join keys indices
+        // Find build/probe row pairs with equal join keys, bounded by
+        // `batch_size`. `next_offset` identifies where to resume if the
+        // candidate scan needs another output batch.
         let (left_indices, right_indices, next_offset) = match build_side.left_data.map()
         {
             Map::HashMap(map) => lookup_join_hashmap(
@@ -823,7 +934,7 @@ impl HashJoinStream {
             .avg_fanout
             .add_total(distinct_right_indices_count);
 
-        // apply join filter if exists
+        // apply join filter, if any
         let (left_indices, right_indices) = if let Some(filter) = &self.filter {
             apply_join_filter_to_indices(
                 build_side.left_data.batch(),

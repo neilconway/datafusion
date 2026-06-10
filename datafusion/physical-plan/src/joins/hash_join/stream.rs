@@ -20,6 +20,7 @@
 //! This module implements [`HashJoinStream`], the streaming engine for
 //! [`super::HashJoinExec`]. See comments in [`HashJoinStream`] for more details.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
@@ -32,6 +33,7 @@ use crate::joins::hash_join::exec::JoinLeftData;
 use crate::joins::hash_join::shared_bounds::{
     PartitionBounds, PartitionBuildData, SharedBuildAccumulator,
 };
+use crate::joins::join_hash_map::SingleKeyEquality;
 use crate::joins::utils::{
     JoinKeyComparator, OnceFut, equal_rows_arr, get_anti_indices,
     get_final_indices_from_shared_bitmap,
@@ -451,6 +453,51 @@ fn count_distinct_sorted_indices(indices: &UInt32Array) -> usize {
     count
 }
 
+fn contiguous_probe_index_range(indices: &UInt32Array) -> Option<Range<usize>> {
+    if indices.is_empty() {
+        return Some(0..0);
+    }
+
+    let start = indices.value(0) as usize;
+    for (offset, &idx) in indices.values().iter().enumerate() {
+        if idx as usize != start + offset {
+            return None;
+        }
+    }
+
+    Some(start..start + indices.len())
+}
+
+fn try_build_contiguous_probe_output(
+    schema: &Arc<Schema>,
+    column_indices: &[ColumnIndex],
+    join_type: JoinType,
+    probe_batch: &RecordBatch,
+    probe_indices: &UInt32Array,
+) -> Result<Option<RecordBatch>> {
+    if !matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+        || schema.fields().is_empty()
+        || probe_indices.null_count() != 0
+    {
+        return Ok(None);
+    }
+
+    let Some(range) = contiguous_probe_index_range(probe_indices) else {
+        return Ok(None);
+    };
+
+    let probe_slice = probe_batch.slice(range.start, range.len());
+    let mut columns = Vec::with_capacity(column_indices.len());
+    for column_index in column_indices {
+        if column_index.side != JoinSide::Right {
+            return Ok(None);
+        }
+        columns.push(Arc::clone(probe_slice.column(column_index.index)));
+    }
+
+    Ok(Some(RecordBatch::try_new(Arc::clone(schema), columns)?))
+}
+
 impl HashJoinStream {
     #[expect(clippy::too_many_arguments)]
     pub(super) fn new(
@@ -531,27 +578,63 @@ impl HashJoinStream {
             (probe_range_start + self.batch_size).min(probe_batch_num_rows);
         let probe_range = probe_range_start..probe_range_end;
 
-        match build_side.left_data.map() {
-            Map::HashMap(map) => {
-                let sort_options = vec![SortOptions::default(); state.values.len()];
-                if let Ok(comparator) = JoinKeyComparator::new(
+        let matched_probe_indices = match build_side.left_data.map() {
+            Map::HashMap(map) if map.has_unique_hashes() => {
+                let (_left_indices, right_indices, next_offset) = lookup_join_hashmap(
+                    map.as_ref(),
                     build_side.left_data.values(),
                     &state.values,
-                    &sort_options,
+                    self.null_equality,
+                    &self.hashes_buffer,
+                    probe_range.len(),
+                    (probe_range.start, None),
+                    &mut self.probe_indices_buffer,
+                    &mut self.build_indices_buffer,
+                )?;
+                debug_assert_eq!(
+                    next_offset,
+                    if probe_range.end == probe_batch_num_rows {
+                        None
+                    } else {
+                        Some((probe_range.end, None))
+                    }
+                );
+                right_indices
+            }
+            Map::HashMap(map) => {
+                if let Some(key_eq) = SingleKeyEquality::try_new(
+                    build_side.left_data.values(),
+                    &state.values,
                     self.null_equality,
                 ) {
-                    map.get_probe_indices_with_any_match(
+                    map.get_probe_indices_with_any_match_using_key_eq(
                         &self.hashes_buffer,
                         probe_range.clone(),
-                        &comparator,
+                        &key_eq,
                         &mut self.probe_indices_buffer,
                     );
                 } else {
-                    // No comparator available for the key types, so fall back
-                    // to general probe path.
-                    timer.done();
-                    return Ok(false);
+                    let sort_options = vec![SortOptions::default(); state.values.len()];
+                    if let Ok(comparator) = JoinKeyComparator::new(
+                        build_side.left_data.values(),
+                        &state.values,
+                        &sort_options,
+                        self.null_equality,
+                    ) {
+                        map.get_probe_indices_with_any_match(
+                            &self.hashes_buffer,
+                            probe_range.clone(),
+                            &comparator,
+                            &mut self.probe_indices_buffer,
+                        );
+                    } else {
+                        // No comparator available for the key types, so fall back
+                        // to general probe path.
+                        timer.done();
+                        return Ok(false);
+                    }
                 }
+                UInt32Array::from(std::mem::take(&mut self.probe_indices_buffer))
             }
             Map::ArrayMap(array_map) => {
                 array_map.get_probe_indices_with_any_match(
@@ -559,11 +642,9 @@ impl HashJoinStream {
                     probe_range.clone(),
                     &mut self.probe_indices_buffer,
                 )?;
+                UInt32Array::from(std::mem::take(&mut self.probe_indices_buffer))
             }
-        }
-
-        let matched_probe_indices =
-            UInt32Array::from(std::mem::take(&mut self.probe_indices_buffer));
+        };
         let matched_probe_count = matched_probe_indices.len();
 
         // The existence path stops after the first equal build row for each
@@ -577,7 +658,7 @@ impl HashJoinStream {
             .add_part(matched_probe_count);
 
         let right_indices = match self.join_type {
-            JoinType::RightSemi => matched_probe_indices,
+            JoinType::RightSemi => matched_probe_indices.clone(),
             JoinType::RightAnti => {
                 get_anti_indices(probe_range.clone(), &matched_probe_indices)
             }
@@ -585,18 +666,42 @@ impl HashJoinStream {
                 unreachable!("existence probe only runs for right semi/anti")
             }
         };
+
+        if right_indices.is_empty() {
+            self.probe_indices_buffer = matched_probe_indices.into_parts().1.into();
+            timer.done();
+
+            if probe_range_end == probe_batch_num_rows {
+                self.state = HashJoinStreamState::FetchProbeBatch;
+            } else {
+                state.advance((probe_range_end, None), None);
+            }
+
+            return Ok(true);
+        }
+
         let left_indices = UInt64Array::from(Vec::<u64>::new());
 
-        let batch = build_batch_from_indices(
+        let batch = if let Some(batch) = try_build_contiguous_probe_output(
             &self.schema,
-            build_side.left_data.batch(),
-            &state.batch,
-            &left_indices,
-            &right_indices,
             &self.column_indices,
-            JoinSide::Left,
             self.join_type,
-        )?;
+            &state.batch,
+            &right_indices,
+        )? {
+            batch
+        } else {
+            build_batch_from_indices(
+                &self.schema,
+                build_side.left_data.batch(),
+                &state.batch,
+                &left_indices,
+                &right_indices,
+                &self.column_indices,
+                JoinSide::Left,
+                self.join_type,
+            )?
+        };
 
         let push_status = self.output_buffer.push_batch(batch)?;
 

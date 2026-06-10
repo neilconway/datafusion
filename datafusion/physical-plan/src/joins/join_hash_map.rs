@@ -23,9 +23,13 @@ use std::fmt::{self, Debug};
 use std::ops::Range;
 use std::ops::Sub;
 
-use arrow::array::BooleanArray;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, PrimitiveArray};
 use arrow::buffer::BooleanBuffer;
-use arrow::datatypes::ArrowNativeType;
+use arrow::datatypes::{
+    ArrowNativeType, ArrowPrimitiveType, DataType, Int8Type, Int16Type, Int32Type,
+    Int64Type, UInt8Type, UInt16Type, UInt32Type, UInt64Type,
+};
+use datafusion_common::NullEquality;
 use hashbrown::HashTable;
 use hashbrown::hash_table::Entry::{Occupied, Vacant};
 
@@ -143,14 +147,210 @@ pub trait JoinHashMapType: Send + Sync {
         probe_indices: &mut Vec<u32>,
     );
 
+    fn get_probe_indices_with_any_match_using_key_eq(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        key_eq: &SingleKeyEquality<'_>,
+        probe_indices: &mut Vec<u32>,
+    );
+
     /// Returns a BooleanArray indicating which of the provided hashes exist in the map.
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray;
 
     /// Returns `true` if the join hash map contains no entries.
     fn is_empty(&self) -> bool;
 
+    /// Returns `true` if every hash table entry has exactly one build row.
+    fn has_unique_hashes(&self) -> bool {
+        false
+    }
+
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+}
+
+pub struct PrimitiveKeyEquality<'a, T: ArrowPrimitiveType> {
+    build: &'a PrimitiveArray<T>,
+    probe: &'a PrimitiveArray<T>,
+    null_equality: NullEquality,
+    has_nulls: bool,
+}
+
+impl<'a, T> PrimitiveKeyEquality<'a, T>
+where
+    T: ArrowPrimitiveType,
+    T::Native: PartialEq,
+{
+    fn new(
+        build: &'a PrimitiveArray<T>,
+        probe: &'a PrimitiveArray<T>,
+        null_equality: NullEquality,
+    ) -> Self {
+        Self {
+            build,
+            probe,
+            null_equality,
+            has_nulls: build.null_count() > 0 || probe.null_count() > 0,
+        }
+    }
+
+    #[inline]
+    fn is_equal(&self, build_idx: usize, probe_idx: usize) -> bool {
+        if self.has_nulls {
+            match (self.build.is_null(build_idx), self.probe.is_null(probe_idx)) {
+                (false, false) => {}
+                (true, true) => {
+                    return self.null_equality == NullEquality::NullEqualsNull;
+                }
+                _ => return false,
+            }
+        }
+
+        // SAFETY: indices come from the hash-map chain and the probe row range.
+        unsafe {
+            self.build.value_unchecked(build_idx) == self.probe.value_unchecked(probe_idx)
+        }
+    }
+}
+
+pub enum SingleKeyEquality<'a> {
+    Int8(PrimitiveKeyEquality<'a, Int8Type>),
+    Int16(PrimitiveKeyEquality<'a, Int16Type>),
+    Int32(PrimitiveKeyEquality<'a, Int32Type>),
+    Int64(PrimitiveKeyEquality<'a, Int64Type>),
+    UInt8(PrimitiveKeyEquality<'a, UInt8Type>),
+    UInt16(PrimitiveKeyEquality<'a, UInt16Type>),
+    UInt32(PrimitiveKeyEquality<'a, UInt32Type>),
+    UInt64(PrimitiveKeyEquality<'a, UInt64Type>),
+}
+
+impl<'a> SingleKeyEquality<'a> {
+    pub(crate) fn try_new(
+        build_values: &'a [ArrayRef],
+        probe_values: &'a [ArrayRef],
+        null_equality: NullEquality,
+    ) -> Option<Self> {
+        let [build] = build_values else {
+            return None;
+        };
+        let [probe] = probe_values else {
+            return None;
+        };
+
+        if build.data_type() != probe.data_type() {
+            return None;
+        }
+
+        macro_rules! primitive_key_eq {
+            ($ARRAY_TYPE:ident, $VARIANT:ident) => {
+                Some(Self::$VARIANT(PrimitiveKeyEquality::new(
+                    build.as_primitive::<$ARRAY_TYPE>(),
+                    probe.as_primitive::<$ARRAY_TYPE>(),
+                    null_equality,
+                )))
+            };
+        }
+
+        match build.data_type() {
+            DataType::Int8 => primitive_key_eq!(Int8Type, Int8),
+            DataType::Int16 => primitive_key_eq!(Int16Type, Int16),
+            DataType::Int32 => primitive_key_eq!(Int32Type, Int32),
+            DataType::Int64 => primitive_key_eq!(Int64Type, Int64),
+            DataType::UInt8 => primitive_key_eq!(UInt8Type, UInt8),
+            DataType::UInt16 => primitive_key_eq!(UInt16Type, UInt16),
+            DataType::UInt32 => primitive_key_eq!(UInt32Type, UInt32),
+            DataType::UInt64 => primitive_key_eq!(UInt64Type, UInt64),
+            _ => None,
+        }
+    }
+}
+
+macro_rules! probe_indices_with_key_eq {
+    ($map:expr, $next:expr, $hash_values:expr, $range:expr, $key_eq:expr, $probe_indices:expr) => {
+        match $key_eq {
+            SingleKeyEquality::Int8(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::Int16(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::Int32(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::Int64(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::UInt8(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::UInt16(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::UInt32(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+            SingleKeyEquality::UInt64(eq) => get_probe_indices_with_any_match(
+                $map,
+                $next,
+                $hash_values,
+                $range,
+                |build_idx, probe_idx| {
+                    eq.is_equal(build_idx as usize, probe_idx as usize)
+                },
+                $probe_indices,
+            ),
+        }
+    };
 }
 
 pub struct JoinHashMapU32 {
@@ -237,12 +437,33 @@ impl JoinHashMapType for JoinHashMapU32 {
         )
     }
 
+    fn get_probe_indices_with_any_match_using_key_eq(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        key_eq: &SingleKeyEquality<'_>,
+        probe_indices: &mut Vec<u32>,
+    ) {
+        probe_indices_with_key_eq!(
+            &self.map,
+            &self.next,
+            hash_values,
+            range,
+            key_eq,
+            probe_indices
+        )
+    }
+
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
         contain_hashes(&self.map, hash_values)
     }
 
     fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    fn has_unique_hashes(&self) -> bool {
+        self.map.len() == self.next.len()
     }
 
     fn len(&self) -> usize {
@@ -334,12 +555,33 @@ impl JoinHashMapType for JoinHashMapU64 {
         )
     }
 
+    fn get_probe_indices_with_any_match_using_key_eq(
+        &self,
+        hash_values: &[u64],
+        range: Range<usize>,
+        key_eq: &SingleKeyEquality<'_>,
+        probe_indices: &mut Vec<u32>,
+    ) {
+        probe_indices_with_key_eq!(
+            &self.map,
+            &self.next,
+            hash_values,
+            range,
+            key_eq,
+            probe_indices
+        )
+    }
+
     fn contain_hashes(&self, hash_values: &[u64]) -> BooleanArray {
         contain_hashes(&self.map, hash_values)
     }
 
     fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    fn has_unique_hashes(&self) -> bool {
+        self.map.len() == self.next.len()
     }
 
     fn len(&self) -> usize {

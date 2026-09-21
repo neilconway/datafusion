@@ -175,14 +175,14 @@ fn general_array_scale<O: OffsetSizeTrait>(
     let mut new_offsets = Vec::<O>::with_capacity(list_array.len() + 1);
     new_offsets.push(O::zero());
 
-    for row in 0..list_array.len() {
+    for (row, window) in offsets.windows(2).enumerate() {
         if row_nulls.as_ref().is_some_and(|nb| nb.is_null(row)) {
             new_offsets.push(new_offsets[row]);
             continue;
         }
 
-        let start = offsets[row].as_usize();
-        let end = offsets[row + 1].as_usize();
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
         let len = end - start;
         let scalar_val = scalar_array.value(row);
 

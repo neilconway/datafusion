@@ -930,13 +930,13 @@ fn array_has_any_string_inner<'a, C: StringArrayType<'a> + Copy>(
     let num_rows = col_offsets.len() - 1;
     let mut result = BooleanBufferBuilder::new(num_rows);
 
-    for i in 0..num_rows {
+    for (i, window) in col_offsets.windows(2).enumerate() {
         if col_nulls.is_some_and(|v| v.is_null(i)) {
             result.append(false);
             continue;
         }
-        let start = col_offsets[i];
-        let end = col_offsets[i + 1];
+        let start = window[0];
+        let end = window[1];
         let found = (start..end).any(|j| {
             if col_strings.is_null(j) {
                 has_null_scalar

@@ -141,14 +141,14 @@ fn general_array_avg<O: OffsetSizeTrait>(array: &ArrayRef) -> Result<ArrayRef> {
 
     let mut builder = Float64Array::builder(list_array.len());
 
-    for row in 0..list_array.len() {
+    for (row, window) in offsets.windows(2).enumerate() {
         if list_array.is_null(row) {
             builder.append_null();
             continue;
         }
 
-        let start = offsets[row].as_usize();
-        let end = offsets[row + 1].as_usize();
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
 
         // Skip NULL elements per SQL aggregate convention (matches PostgreSQL
         // AVG, DuckDB list_avg, Spark aggregate). Empty arrays and all-NULL

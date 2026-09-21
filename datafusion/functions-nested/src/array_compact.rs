@@ -156,14 +156,14 @@ fn compact_list<O: OffsetSizeTrait>(
         Capacities::Array(capacity),
     );
 
-    for row_index in 0..list_array.len() {
+    for (row_index, window) in list_offsets.windows(2).enumerate() {
         if list_nulls.is_some_and(|n| n.is_null(row_index)) {
             offsets.push(offsets[row_index]);
             continue;
         }
 
-        let start = list_offsets[row_index].as_usize();
-        let end = list_offsets[row_index + 1].as_usize();
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
         let row_null_count = values_nulls.slice(start, end - start).null_count();
         let kept = (end - start) - row_null_count;
 

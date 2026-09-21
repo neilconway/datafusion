@@ -416,16 +416,20 @@ where
     let mut out_offsets = Vec::<O>::with_capacity(lhs.len() + 1);
     out_offsets.push(O::zero());
 
-    for row in 0..lhs.len() {
+    for (row, (lhs_window, rhs_window)) in lhs_offsets
+        .windows(2)
+        .zip(rhs_offsets.windows(2))
+        .enumerate()
+    {
         if row_nulls.as_ref().is_some_and(|nb| nb.is_null(row)) {
             out_offsets.push(out_offsets[row]);
             continue;
         }
 
-        let start1 = lhs_offsets[row].as_usize();
-        let len1 = lhs.value_length(row).as_usize();
-        let start2 = rhs_offsets[row].as_usize();
-        let len2 = rhs.value_length(row).as_usize();
+        let start1 = lhs_window[0].as_usize();
+        let len1 = (lhs_window[1] - lhs_window[0]).as_usize();
+        let start2 = rhs_window[0].as_usize();
+        let len2 = (rhs_window[1] - rhs_window[0]).as_usize();
 
         if len1 != len2 {
             return exec_err!(

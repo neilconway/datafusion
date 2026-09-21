@@ -139,9 +139,9 @@ fn generic_list_row_has_nulls<O: OffsetSizeTrait>(
             let validity = nulls.inner();
             let offsets = list.offsets();
             let mut builder = BooleanBufferBuilder::new(list.len());
-            for i in 0..list.len() {
-                let s = offsets[i].as_usize();
-                let len = offsets[i + 1].as_usize() - s;
+            for window in offsets.windows(2) {
+                let s = window[0].as_usize();
+                let len = window[1].as_usize() - s;
                 builder.append(validity.slice(s, len).count_set_bits() < len);
             }
             builder.finish()

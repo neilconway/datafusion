@@ -236,11 +236,10 @@ fn filter_list_values<O: OffsetSizeTrait>(
     predicate: &BooleanArray,
     offsets: &OffsetBuffer<O>,
 ) -> Result<(ArrayRef, OffsetBuffer<O>)> {
-    let num_sublists = offsets.len().saturating_sub(1);
     let has_nulls = predicate.null_count() > 0;
-    let new_offsets = OffsetBuffer::<O>::from_lengths((0..num_sublists).map(|i| {
-        let start = offsets[i].as_usize();
-        let end = offsets[i + 1].as_usize();
+    let new_offsets = OffsetBuffer::<O>::from_lengths(offsets.windows(2).map(|window| {
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
         if has_nulls {
             (start..end)
                 .filter(|&j| predicate.is_valid(j) && predicate.value(j))

@@ -145,14 +145,14 @@ fn general_array_product<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> Result<Arra
 
     let mut builder = Float64Array::builder(list_array.len());
 
-    for row in 0..list_array.len() {
+    for (row, window) in offsets.windows(2).enumerate() {
         if list_array.is_null(row) {
             builder.append_null();
             continue;
         }
 
-        let start = offsets[row].as_usize();
-        let end = offsets[row + 1].as_usize();
+        let start = window[0].as_usize();
+        let end = window[1].as_usize();
 
         let mut prod = 1.0_f64;
         let mut any_valid = false;

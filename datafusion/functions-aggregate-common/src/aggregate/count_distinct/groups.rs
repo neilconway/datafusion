@@ -193,9 +193,9 @@ where
         let inner_values = inner.values();
         let offsets = list_array.offsets();
 
-        for (row_idx, &group_idx) in group_indices.iter().enumerate() {
-            let start = offsets[row_idx] as usize;
-            let end = offsets[row_idx + 1] as usize;
+        for (window, &group_idx) in offsets.windows(2).zip(group_indices) {
+            let start = window[0] as usize;
+            let end = window[1] as usize;
             for &value in &inner_values[start..end] {
                 if self.seen.insert((group_idx, value)) {
                     self.counts[group_idx] += 1;

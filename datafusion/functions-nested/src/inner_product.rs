@@ -174,16 +174,18 @@ fn general_inner_product<O: OffsetSizeTrait>(arrays: &[ArrayRef]) -> Result<Arra
     let offsets2 = list_array2.value_offsets();
 
     let mut builder = Float64Array::builder(list_array1.len());
-    for row in 0..list_array1.len() {
+    for (row, (window1, window2)) in
+        offsets1.windows(2).zip(offsets2.windows(2)).enumerate()
+    {
         if list_array1.is_null(row) || list_array2.is_null(row) {
             builder.append_null();
             continue;
         }
 
-        let start1 = offsets1[row].as_usize();
-        let end1 = offsets1[row + 1].as_usize();
-        let start2 = offsets2[row].as_usize();
-        let end2 = offsets2[row + 1].as_usize();
+        let start1 = window1[0].as_usize();
+        let end1 = window1[1].as_usize();
+        let start2 = window2[0].as_usize();
+        let end2 = window2[1].as_usize();
         let len1 = end1 - start1;
         let len2 = end2 - start2;
 
